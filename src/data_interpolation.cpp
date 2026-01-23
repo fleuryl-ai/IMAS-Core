@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <limits>
+#include <complex>
 
 DataInterpolation::DataInterpolation()
 {
@@ -36,7 +37,7 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
 
         const double default_value = -9.e40;
 
-        for (size_t i = time_vector.size() - 1; i >= 0; i--)
+        for (int i = time_vector.size() - 1; i >= 0; i--)
         {
 
             if (time_vector[i] != default_value && time_vector[i] <= tmax)
@@ -72,10 +73,15 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
         }
 
         if (dtime.size() == 1) {
-            *range = round((tmax - tmin) / dtime[0]);
-            double t = ((*range) * dtime[0] + tmin);
-            if (t <= tmax)
-                *range = *range + 1;
+            if (dtime[0] <= 0) {
+                *range = 0;
+            } else {
+                // Add a small epsilon to handle floating point inaccuracies at the boundary
+                // e.g. (0.95-0.55)/0.2 could be 1.99999... which floor would truncate to 1.
+                // The new logic correctly computes the number of points in the interval.
+                double epsilon = 1e-9; 
+                *range = static_cast<int>(floor((tmax - tmin) / dtime[0] + epsilon)) + 1;
+            }
         }
         else {
             size_t max_index = dtime.size() - 1;
@@ -213,6 +219,13 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
             *result = data_str;
             break;
         }
+
+        case alconst::complex_data:
+        {
+            std::complex<double> *data_cplx = (std::complex<double> *)y_slices[SLICE_INF];
+            *result = data_cplx;
+            break;
+        }
         }
         return;
     }
@@ -275,7 +288,7 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
         *result = (void *)data_double;
         break;
     }
-
+ 
     case alconst::char_data:
     {
         char *data_str = (char *)y_slices[SLICE_INF];
@@ -286,6 +299,19 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
         }
         char* p = (char*) *result;
         p = data_str;
+        break;
+    }
+
+    case alconst::complex_data:
+    {
+        std::complex<double> *data_cplx = (std::complex<double> *)y_slices[SLICE_INF];
+        std::complex<double> *next_slice_data_cplx = (std::complex<double> *)y_slices[SLICE_SUP];
+        if (interpolation_factor != 0)
+        {
+            for (size_t i = 0; i < shape; i++)
+                data_cplx[i] = data_cplx[i] + (next_slice_data_cplx[i] - data_cplx[i]) * interpolation_factor;
+        }
+        *result = (void *)data_cplx;
         break;
     }
     }
@@ -403,6 +429,14 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
         slice1 = (char *)malloc(time_slice_shape);
         if (interp == LINEAR_INTERP)
             slice2 = (char *)malloc(time_slice_shape);
+        break;
+    }
+
+    case alconst::complex_data:
+    {
+        slice1 = (std::complex<double> *)malloc(time_slice_shape * sizeof(std::complex<double>));
+        if (interp == LINEAR_INTERP)
+            slice2 = (std::complex<double> *)malloc(time_slice_shape * sizeof(std::complex<double>));
         break;
     }
     }
@@ -540,6 +574,32 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             interpolation_result = (char*) malloc(sizeof(char)*time_slice_shape);
             break;
         }
+
+        case alconst::complex_data:
+        {
+            int offset = requested_index - start;
+            if (offset < 0) {
+                throw ALBackendException("Unexpected offset<0 when interpolating with resampling", LOG); 
+            }
+            int n = time_slice_shape;
+            std::complex<double> *data_cplx = (std::complex<double> *)data;
+            memcpy(slice1, data_cplx + offset * n, n * sizeof(std::complex<double>));
+            y_slices[SLICE_INF] = slice1;
+
+            if (interp == LINEAR_INTERP)
+            {
+                if (offset < time_vector.size()) {
+                    memcpy(slice2, data_cplx + (offset + 1) * n, n * sizeof(std::complex<double>));
+                    y_slices[SLICE_SUP] = slice2;
+                }
+                else {
+                    y_slices[SLICE_SUP] = slice1;
+                }
+            }
+
+            interpolation_result = (std::complex<double>*) malloc(sizeof(std::complex<double>)*time_slice_shape);
+            break;
+        }
         }
 
         void *interpolation_result_tmp;
@@ -549,7 +609,13 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             double *p = (double*)interpolation_result_tmp;
             printf("interpolation_result[%d] = %f\n", j, p[j]);
          }*/
-        memcpy(interpolation_result, interpolation_result_tmp, time_slice_shape*sizeof(double));
+        size_t element_size = sizeof(double);
+        if (datatype == alconst::integer_data) element_size = sizeof(int);
+        else if (datatype == alconst::char_data) element_size = sizeof(char);
+        else if (datatype == alconst::complex_data) element_size = sizeof(std::complex<double>);
+
+        memcpy(interpolation_result, interpolation_result_tmp, time_slice_shape*element_size);
+
         interpolation_results.push_back(interpolation_result);
         nb_slices++;
 
@@ -601,6 +667,18 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             char *q = (char *)interpolation_results[i];
             char *r = (char *)*result;
             memcpy(r + i * time_slice_shape, q, time_slice_shape * sizeof(char));
+            free(q);
+        }
+    }
+    else if (datatype == alconst::complex_data)
+    {
+
+        *result = (void *)malloc(sizeof(std::complex<double>) * interpolation_results.size() * time_slice_shape);
+        for (int i = 0; i < interpolation_results.size(); i++)
+        {
+            std::complex<double> *q = (std::complex<double> *)interpolation_results[i];
+            std::complex<double> *r = (std::complex<double> *)*result;
+            memcpy(r + i * time_slice_shape, q, time_slice_shape * sizeof(std::complex<double>));
             free(q);
         }
     }
