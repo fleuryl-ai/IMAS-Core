@@ -1,5 +1,6 @@
 #include "panzerdb.h"
 #include "data_interpolation.h"
+#include "al_defs.h"
 #include <iostream>
 #include <numeric>
 #include <algorithm>
@@ -86,14 +87,14 @@ PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_emp
     }
     H5Pclose(fapl);
 
-    if (file_id < 0) throw std::runtime_error("Failed to open or create file: " + filename);
+    if (file_id < 0) throw ALBackendException("Failed to open or create file: " + filename, LOG);
     init(mode);
 }
 
 PanzerDB::PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty, bool close_loc_id_on_exit)
     : file_id(loc_id), preserve_empty_nodes(preserve_empty), should_close_loc_id(close_loc_id_on_exit)
 {
-    if (file_id < 0) throw std::runtime_error("Invalid loc_id provided to constructor.");
+    if (file_id < 0) throw ALBackendException("Invalid loc_id provided to constructor.", LOG);
     // In this case, file_id is actually a loc_id (group)
     init(mode);
 }
@@ -214,7 +215,7 @@ void PanzerDB::init(OpenMode mode) {
         data_buffer_c128.reserve(chunk_config.data_chunk_c128);
         
     } else { // OpenMode::READ
-        if (file_id < 0) throw std::runtime_error("Failed to open file for reading");
+        if (file_id < 0) throw ALBackendException("Failed to open file for reading", LOG);
         if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) index_dset = H5Dopen2(file_id, "index", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) data_dset_f64 = H5Dopen2(file_id, "data_raw_f64", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) data_dset_i32 = H5Dopen2(file_id, "data_raw_i32", H5P_DEFAULT);
@@ -487,7 +488,7 @@ void PanzerDB::setChunkingHint(const std::string& hint) {
 
 void PanzerDB::setCompressionLevel(int level) {
     if (level < 0 || level > 9) {
-        throw std::invalid_argument("Compression level must be 0-9");
+        throw ALBackendException("Compression level must be 0-9", LOG);
     }
     chunk_config.compression_level = level;
     chunk_config.enable_compression = (level > 0);
@@ -816,11 +817,11 @@ void PanzerDB::flush() {
         H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
         H5Sclose(filespace);
 
+        hsize_t data_offset[1] = {current_data_dims[0]};
         hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
         H5Dset_extent(data_dset_c128, new_data_dims);
 
         filespace = H5Dget_space(data_dset_c128);
-        hsize_t data_offset[1] = {current_data_dims[0]};
         H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
         memspace = H5Screate_simple(1, &n_new_data, NULL);
 
@@ -1242,7 +1243,7 @@ void PanzerDB::beginArray(const std::string& name, const std::string& timebase) 
     if (level.is_dynamic) {
         // ✅ Only one dynamic AOS allowed
         if (!dynamic_level.empty()) {
-            throw std::runtime_error("Only one dynamic AOS allowed in hierarchy");
+            throw ALBackendException("Only one dynamic AOS allowed in hierarchy", LOG);
         }
         dynamic_level = name;
         
@@ -1265,7 +1266,7 @@ void PanzerDB::beginArray(const std::string& name, const std::string& timebase) 
 void PanzerDB::beginArray(ArrayLevel& level) {
     const auto& name = level.name;
     if (level.is_dynamic) {
-        if (!dynamic_level.empty() && dynamic_level != name) throw std::runtime_error("Only one dynamic level allowed");
+        if (!dynamic_level.empty() && dynamic_level != name) throw ALBackendException("Only one dynamic level allowed", LOG);
         dynamic_level = name;
     }
 
@@ -1462,7 +1463,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
 
 template<typename T>
 void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
-    if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
+    if (leaf.is_empty) throw ALBackendException("Leaf is empty", LOG);
 
     DataType type = static_cast<DataType>(leaf.flags >> 4); // Type is encoded in upper bits of flag
     hid_t dset_id = -1;
@@ -1478,10 +1479,10 @@ void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
         dset_id = data_dset_c128;
         mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, new hsize_t[1]{2});
     } else {
-        throw std::runtime_error("Unsupported data type for readTensor");
+        throw ALBackendException("Unsupported data type for readTensor", LOG);
     }
 
-    if (dset_id < 0) throw std::runtime_error("Dataset for this type is not open");
+    if (dset_id < 0) throw ALBackendException("Dataset for this type is not open", LOG);
 
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
@@ -1505,13 +1506,13 @@ template void PanzerDB::readTensor<std::complex<double>>(const Leaf& leaf, std::
 
 template<>
 void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const {
-    if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
+    if (leaf.is_empty) throw ALBackendException("Leaf is empty", LOG);
     if (static_cast<DataType>(leaf.flags >> 4) != DataType::STRING) {
-        throw std::runtime_error("Mismatched data type for readTensor<std::string>");
+        throw ALBackendException("Mismatched data type for readTensor<std::string>", LOG);
     }
 
     hid_t dset_id = data_dset_str;
-    if (dset_id < 0) throw std::runtime_error("Dataset for string type is not open");
+    if (dset_id < 0) throw ALBackendException("Dataset for string type is not open", LOG);
 
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
@@ -1579,7 +1580,7 @@ void PanzerDB::writeDataImpl(const std::string& name,
                               std::vector<T>& buffer) {
     // ✅ ASSERT: timebase must be empty (static data only)
     if (!timebase.empty()) {
-        throw std::runtime_error("writeData with timebase not allowed, use writeDataSlices");
+        throw ALBackendException("writeData with timebase not allowed, use writeDataSlices", LOG);
     }
     
     last_level_had_write = true;
@@ -1715,7 +1716,7 @@ void PanzerDB::writeData<char>(const std::string& name,
                          size_t count,      // count should be == shape[0]
                          const std::string& timebase) {
     if (!timebase.empty()) {
-        throw std::runtime_error("writeData with timebase not allowed, use writeDataSlices");
+        throw ALBackendException("writeData with timebase not allowed, use writeDataSlices", LOG);
     }
     
     last_level_had_write = true;
@@ -3057,7 +3058,7 @@ void PanzerDB::advanceTimeForAOS(const std::string& aos_path, uint64_t delta) {
 void PanzerDB::advanceTimebase(const std::string& timebase_name, uint64_t n_steps) {
     std::string dynamic_aos_path = getDynamicAOSPath();
     if (dynamic_aos_path.empty()) {
-        throw std::runtime_error("advanceTimebase called outside of a dynamic AOS");
+        throw ALBackendException("advanceTimebase called outside of a dynamic AOS", LOG);
     }
     advanceTimeForAOS(dynamic_aos_path, n_steps);
 }
@@ -3117,7 +3118,7 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
 void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
                                      const std::vector<int>& indices) {
     if (aos_names.size() != indices.size()) {
-        throw std::runtime_error("synchronizeArrayStack: aos_names and indices must have the same size");
+        throw ALBackendException("synchronizeArrayStack: aos_names and indices must have the same size", LOG);
     }
     
     if (aos_names.empty()) return;
