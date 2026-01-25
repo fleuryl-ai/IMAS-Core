@@ -10,7 +10,7 @@
 #include "hdf5_utils.h"
 
 
-// Macro de debug
+// Debug macro
 #ifdef DEBUG_HDF5_READER_V2
 #define DEBUG_PRINT(msg) \
   std::cerr << "[DEBUG " << __func__ << "] " << msg << std::endl
@@ -58,10 +58,10 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
         throw ALBackendException("Unkwown operation context range mode", LOG);
     }
 
-    // ✅ OPTIMISATION: Vider le cache de chemin de contexte car on change de groupe/stratégie
-    // read_strategy->clearContextPathCache(); // -> Méthode à ajouter dans IReadStrategy
+    // ✅ OPTIMIZATION: Clear context path cache because group/strategy changed
+    // read_strategy->clearContextPathCache(); // -> Method to add in IReadStrategy
 
-    // L'appel à build_path_index() est maintenant dans le constructeur de IReadStrategy.
+    // The call to build_path_index() is now in the IReadStrategy constructor.
 }
 
 void HDF5Reader_v2::close_group(OperationContext *ctx)
@@ -82,10 +82,10 @@ void HDF5Reader_v2::endAction(Context *ctx)
 
 }
 
-// Délégation de la méthode read_ND_Data à la stratégie de lecture
+// Delegation of the read_ND_Data method to the read strategy
 int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                  int *datatype, void **data, int *dim, int *size) {
-    // La logique de lecture est maintenant déléguée à l'objet de stratégie
+    // The read logic is now delegated to the strategy object
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
 

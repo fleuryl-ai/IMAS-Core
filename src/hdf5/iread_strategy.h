@@ -16,7 +16,7 @@
 // Forward declarations
 class Context;
 
-// Macro de debug
+// Debug macro definition
 #ifdef DEBUG_HDF5_READER_V2
 #define DEBUG_PRINT(msg) \
   std::cerr << "[DEBUG " << __func__ << "] " << msg << std::endl
@@ -26,33 +26,94 @@ class Context;
   } while (0)
 #endif
 
+/**
+ * @class IReadStrategy
+ * @brief Abstract base class defining the strategy for reading data from HDF5 via PanzerDB.
+ * 
+ * This class provides the common infrastructure for different reading strategies
+ * (Global, Slice, TimeRange) used by the HDF5 backend.
+ */
 class IReadStrategy {
 
 protected:
-    // OPTIMISATION : Cache pour accès rapide chemin -> feuilles
-    // Clé : Chemin complet (string)
-    // Valeur : Vecteur de pointeurs vers les feuilles partageant ce chemin (différents time_index)
+    // =================================================================================
+    //                                  Members
+    // =================================================================================
+
+    /**
+     * @brief Cache for fast access path -> leaves.
+     * Key: Full path (string view).
+     * Value: Vector of pointers to leaves sharing this path (different time_index).
+     */
     std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> path_cache;
-    // ✅ OPTIMISATION CRITIQUE: Cache pour les chemins de contexte
-    // Évite de reconstruire le chemin du parent à chaque appel de read_ND_Data
-    // Clé: Pointeur vers le contexte
-    // Valeur: Chemin pré-calculé
+
+    /**
+     * @brief Cache for context paths to avoid rebuilding the parent path on every read call.
+     * Key: Pointer to context.
+     * Value: Pre-calculated path string.
+     */
     mutable std::unordered_map<Context*, std::string> context_path_cache;
+
+    /**
+     * @brief Pointer to the PanzerDB instance handling low-level HDF5 operations.
+     */
     std::unique_ptr<PanzerDB> panzer_db_ptr;
 
 public:
+    // =================================================================================
+    //                            Constructor / Destructor
+    // =================================================================================
+
+    /**
+     * @brief Constructor. Initializes PanzerDB in READ mode and builds the path index.
+     * @param loc_id HDF5 location ID (group or file).
+     */
     IReadStrategy(hid_t loc_id) {
         panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::READ);
-        build_path_index(); // Construire l'index juste après l'initialisation de PanzerDB
+        build_path_index(); // Build the index just after PanzerDB initialization
     } 
-    virtual void beginReadArraystructAction(ArraystructContext * ctx, int *size) = 0;
-    virtual void endAction(Context * ctx) = 0;
+
     virtual ~IReadStrategy() = default;
 
-    //virtual void build_path_index();
+    // =================================================================================
+    //                            Virtual Interface
+    // =================================================================================
+
+    /**
+     * @brief Prepares reading an Array of Structures (AoS).
+     * @param ctx The array structure context.
+     * @param size Output pointer to store the size of the array.
+     */
+    virtual void beginReadArraystructAction(ArraystructContext * ctx, int *size) = 0;
+
+    /**
+     * @brief Finalizes an action on a context.
+     * @param ctx The context to close/finalize.
+     */
+    virtual void endAction(Context * ctx) = 0;
+
+    /**
+     * @brief Reads N-Dimensional data.
+     * @param ctx Current context.
+     * @param dataset_name Name of the dataset.
+     * @param timebasename Name of the timebase (if dynamic).
+     * @param datatype Output pointer for data type.
+     * @param data Output pointer for data buffer.
+     * @param dim Output pointer for number of dimensions.
+     * @param size Output pointer for dimensions sizes.
+     * @return 0 on failure, 1 on success.
+     */
     virtual int read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                              int* datatype, void **data, int *dim, int *size) = 0;
 
+    // =================================================================================
+    //                            Time Management
+    // =================================================================================
+
+    /**
+     * @brief Retrieves the homogeneous time status from ids_properties.
+     * @return 1 if homogeneous, 0 otherwise (or -1 on error/default).
+     */
     int getHomogeneousTime() {
         if (!panzer_db_ptr) return -1;
         int homogeneous_time = 1;
@@ -63,40 +124,294 @@ public:
         return homogeneous_time;
     }
 
+    /**
+     * @brief Retrieves time values associated with a context.
+     * @param ctx The context.
+     * @param homogeneous_time Flag indicating if time is homogeneous.
+     * @return Vector of time values.
+     */
+    std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
+        std::vector<double> time_values;
+
+        if (homogeneous_time == 1) {
+            time_values = panzer_db_ptr->getWholeDynamicSignal("time");
+            return time_values;
+        }
+
+        // --- Logic for homogeneous_time == 0 ---
+
+        if (ctx == nullptr) {
+            return time_values; // Return empty vector
+        }
+
+        ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
+        if (!arrCtx) { // Case where context is OperationContext
+            time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback for root time
+            return time_values;
+        }
+
+        // Look for "timed" parent to build the timebase path
+        ArraystructContext* timed_ctx = arrCtx;
+        while(timed_ctx != nullptr && !timed_ctx->getTimed()) {
+            timed_ctx = timed_ctx->getParent();
+        }
+        if (!timed_ctx) return {}; // No timebase found
+
+        std::string full_timebase_path = getPath(timed_ctx, false); // false = no final index
+        if (!full_timebase_path.empty()) {
+            full_timebase_path += "/";
+        }
+        full_timebase_path += timed_ctx->getTimebasePath();
+
+        auto leaves = panzer_db_ptr->getLeaves();
+
+        // Filter to keep ONLY leaves matching the exact path
+        std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
+
+        for (const auto& leaf : leaves) {
+            // EXACT match of the full path
+            if (leaf.path == full_timebase_path && !leaf.is_empty) {
+                time_leaves_map[leaf.time_index] = &leaf;
+            }
+        }
+
+        // Read values in time_index order
+        for (const auto& [time_idx, leaf_ptr] : time_leaves_map) {
+            if (leaf_ptr->count > 0) {
+                std::vector<double> temp_data(leaf_ptr->count);
+                panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
+                time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
+            }
+        }
+
+        return time_values;
+    }
+
+    // =================================================================================
+    //                            Path & Indexing
+    // =================================================================================
+
+    /**
+     * @brief Builds an in-memory index of paths to leaves for fast lookup.
+     */
     void build_path_index() {
         path_cache.clear();
         if (!panzer_db_ptr) return;
 
         const auto& leaves = panzer_db_ptr->getLeaves();
         
-        // On pré-réserve pour éviter les réallocations
+        // Pre-reserve to avoid reallocations
         path_cache.reserve(leaves.size());
 
         for (const auto& leaf : leaves) {
-            // On stocke le pointeur vers la feuille dans la map
+            // Store the pointer to the leaf in the map
             path_cache[leaf.path].push_back(&leaf);
         }
         
         DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths.");
     }
 
-
+    /**
+     * @brief Finds a specific leaf in the PanzerDB index for a given context and dataset.
+     * @param ctx The current context.
+     * @param dataset_name The name of the dataset.
+     * @param timebasename The timebase name (used to determine if dynamic).
+     * @param homogeneous_time Homogeneous time flag.
+     * @return Pointer to the Leaf, or nullptr if not found.
+     */
     const PanzerDB::Leaf* find_leaf_for_context(Context* ctx, std::string_view dataset_name, std::string_view timebasename, int homogeneous_time) {
-    DEBUG_PRINT("Searching for dataset '" << dataset_name << "' with timebasename='" << timebasename << "' and homogeneous_time=" << homogeneous_time);
+        DEBUG_PRINT("Searching for dataset '" << dataset_name << "' with timebasename='" << timebasename << "' and homogeneous_time=" << homogeneous_time);
 
-    // --- Reconstruction du chemin AVEC le chemin parent COMPLET ---
-    std::vector<std::string> path_segments;
-    std::vector<int> indices;
-    Context* curr = ctx;
-    
-    // ✅ FIX: Remonter jusqu'à OperationContext pour capturer le chemin complet
-    while (curr != nullptr) {
-        if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
-            std::string full_path = arr->getPath();  // Ex: "core_sources/source"
+        // --- Path reconstruction WITH FULL parent path ---
+        std::vector<std::string> path_segments;
+        std::vector<int> indices;
+        Context* curr = ctx;
+        
+        // Go up to OperationContext to capture the full path
+        while (curr != nullptr) {
+            if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
+                std::string full_path = arr->getPath();  // Ex: "core_sources/source"
+                
+                std::string node_name;
+                Context* parent = arr->getParent();
+                if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                    ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
+                    std::string parent_path = parent_arr->getPath();
+                    if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
+                        node_name = full_path.substr(parent_path.size() + 1);
+                    } else {
+                        node_name = full_path;
+                    }
+                } else {
+                    node_name = full_path;
+                }
+                std::replace(node_name.begin(), node_name.end(), '/', '&');
+                
+                path_segments.insert(path_segments.begin(), node_name);
+                indices.insert(indices.begin(), arr->getIndex());
+                curr = arr->getParent();
+            }
+            else if (curr->getType() == CTX_OPERATION_TYPE) {
+                curr = nullptr;
+            }
+            else {
+                curr = nullptr;
+            }
+        }
+
+        std::string clean_ds_name(dataset_name);
+        std::replace(clean_ds_name.begin(), clean_ds_name.end(), '/', '&');
+
+        // Build FULL path with indices
+        // Use string reserve instead of stringstream for optimization
+        std::string strict_target_path;
+        size_t estimated_len = clean_ds_name.size() + path_segments.size() * 10; 
+        strict_target_path.reserve(estimated_len);
+
+        for (size_t i = 0; i < path_segments.size(); ++i) {
+            if (i > 0) strict_target_path += "/";
+            strict_target_path += path_segments[i];
+            strict_target_path += "/";
+            strict_target_path += std::to_string(indices[i]);
+        }
+        
+        // Calculate context_prefix (path without the final dataset)
+        std::string context_prefix = strict_target_path;
+        if (!path_segments.empty()) context_prefix += "/";
+        
+        // Add the dataset to get the full path
+        if (!path_segments.empty()) strict_target_path += "/";
+        strict_target_path += clean_ds_name;
+        
+        // Ex: "core_sources/source/0/species&neutral&state&vibrational_level"
+
+        DEBUG_PRINT("Reconstructed strict_target_path: '" << strict_target_path << "'");
+        DEBUG_PRINT("Context prefix: '" << context_prefix << "'");
+
+        int64_t target_time = -1;
+        if (!timebasename.empty()) {
+            target_time = 0;
+        }
+
+        // --- OPTIMIZED PASS 1: Search via Hash Map (O(1)) ---
+        auto it = path_cache.find(strict_target_path);
+        if (it != path_cache.end()) {
+            const std::vector<const PanzerDB::Leaf*>& candidates = it->second;
+            for (const auto* leaf : candidates) {
+                DEBUG_PRINT("  -> Candidate from cache: " << leaf->path << " (time_index: " << leaf->time_index << ")");
+                if (target_time == -1 || leaf->time_index == static_cast<uint64_t>(target_time)) {
+                    return leaf;
+                }
+            }
+        }
+
+        // --- PASS 2: Fallback (Linear scan) ---
+        DEBUG_PRINT("[WARN] Optimized search failed. Falling back to linear scan for: " << clean_ds_name);
+        const auto& leaves = panzer_db_ptr->getLeaves();
+        for (const auto& leaf : leaves) {
+            if (target_time != -1 && leaf.time_index != static_cast<uint64_t>(target_time)) continue;
             
+            // Enforce context prefix constraint
+            if (!context_prefix.empty()) {
+                if (leaf.path.size() < context_prefix.size() || leaf.path.compare(0, context_prefix.size(), context_prefix) != 0) {
+                    continue;
+                }
+            }
+
+            if (leaf.path == clean_ds_name) return &leaf;
+            if (leaf.path.size() > clean_ds_name.size() && leaf.path.compare(leaf.path.size() - clean_ds_name.size(), clean_ds_name.size(), clean_ds_name) == 0) {
+                if (leaf.path[leaf.path.size() - clean_ds_name.size() - 1] == '/') return &leaf;
+            }
+        }
+
+        DEBUG_PRINT("Leaf not found for path: '" << strict_target_path << "' and time_index: " << target_time);
+        return nullptr;
+    }
+
+protected: 
+    // =================================================================================
+    //                            Path Construction Helpers
+    // =================================================================================
+
+    /**
+     * @brief Constructs the path string for an ArraystructContext.
+     * @param ctx The array structure context.
+     * @param include_self_index Whether to include the index of the current context in the path.
+     * @return The constructed path string.
+     */
+    std::string getPath(ArraystructContext *ctx, bool include_self_index = true) {
+        if (!ctx) return "";
+
+        std::vector<std::pair<std::string, int>> segments;
+        Context* current_ctx = ctx;
+
+        while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+            ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
+            
+            // 1. Get full path (e.g. "static_aos/dynamic_aos")
+            std::string full_path = arr_ctx->getPath();
             std::string node_name;
-            Context* parent = arr->getParent();
+            
+            // 2. Extract local node name relative to parent
+            Context* parent = arr_ctx->getParent();
+            if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
+                std::string parent_path = parent_arr->getPath();
+                if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
+                    node_name = full_path.substr(parent_path.size() + 1); // +1 for '/'
+                } else {
+                    node_name = full_path; // Should not happen
+                }
+            } else {
+                node_name = full_path;
+            }
+            
+            std::replace(node_name.begin(), node_name.end(), '/', '&');
+            
+            segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
+            
+            current_ctx = arr_ctx->getParent();
+        }
+
+        std::stringstream path_stream;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            path_stream << segments[i].first; // Append node name (e.g., "A", then "B")
+
+            bool is_last_segment = (i == segments.size() - 1);
+
+            if (!is_last_segment) {
+                // For non-last segments, always add index and separator. e.g., "A/0/"
+                path_stream << "/" << segments[i].second << "/";
+            } else { // For the last segment
+                if (include_self_index) {
+                    path_stream << "/" << segments[i].second;
+                }
+            }
+        }
+        return path_stream.str();
+    }
+
+    /**
+     * @brief Builds the full hierarchical path to a dataset inside nested AoS.
+     *        The path is formatted as "AOS1/index1/AOS2/index2/.../dataset".
+     * 
+     * @param ctx The current context, must be an ArraystructContext or one of its children.
+     * @param dataset_name The name of the final dataset.
+     * @return std::string The full path, e.g., "A/0/B/0/data".
+     */
+    std::string buildFullPath(Context* ctx, const std::string& dataset_name) {
+        std::vector<std::pair<std::string, int>> segments;
+        Context* current_ctx = ctx;
+
+        // Go up the context hierarchy to collect AoS names and indices
+        while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+            ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
+            
+            std::string full_path = arr_ctx->getPath();
+            std::string node_name;
+            
+            Context* parent = arr_ctx->getParent();
             if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
                 ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
                 std::string parent_path = parent_arr->getPath();
@@ -108,250 +423,33 @@ public:
             } else {
                 node_name = full_path;
             }
+            
             std::replace(node_name.begin(), node_name.end(), '/', '&');
             
-            path_segments.insert(path_segments.begin(), node_name);
-            indices.insert(indices.begin(), arr->getIndex());
-            curr = arr->getParent();
-        }
-        else if (curr->getType() == CTX_OPERATION_TYPE) {
-            curr = nullptr;
-        }
-        else {
-            curr = nullptr;
-        }
-    }
-
-    std::string clean_ds_name(dataset_name);
-    std::replace(clean_ds_name.begin(), clean_ds_name.end(), '/', '&');
-
-    // ✅ Construire le chemin COMPLET avec indices
-    // OPTIMIZATION: Use string reserve instead of stringstream
-    std::string strict_target_path;
-    size_t estimated_len = clean_ds_name.size() + path_segments.size() * 10; 
-    strict_target_path.reserve(estimated_len);
-
-    for (size_t i = 0; i < path_segments.size(); ++i) {
-        if (i > 0) strict_target_path += "/";
-        strict_target_path += path_segments[i];
-        strict_target_path += "/";
-        strict_target_path += std::to_string(indices[i]);
-    }
-    
-    // ✅ Calculer context_prefix (chemin sans le dataset final)
-    std::string context_prefix = strict_target_path;
-    if (!path_segments.empty()) context_prefix += "/";
-    
-    // ✅ Ajouter le dataset pour obtenir le chemin complet
-    if (!path_segments.empty()) strict_target_path += "/";
-    strict_target_path += clean_ds_name;
-    
-    // Ex: "core_sources/source/0/species&neutral&state&vibrational_level"
-
-    DEBUG_PRINT("Reconstructed strict_target_path: '" << strict_target_path << "'");
-    DEBUG_PRINT("Context prefix: '" << context_prefix << "'");
-
-    int64_t target_time = -1;
-    if (!timebasename.empty()) {
-        target_time = 0;
-    }
-
-    // --- PASSE 1 OPTIMISÉE : Recherche via Hash Map (O(1)) ---
-    auto it = path_cache.find(strict_target_path);
-    if (it != path_cache.end()) {
-        const std::vector<const PanzerDB::Leaf*>& candidates = it->second;
-        for (const auto* leaf : candidates) {
-            DEBUG_PRINT("  -> Candidate from cache: " << leaf->path << " (time_index: " << leaf->time_index << ")");
-            if (target_time == -1 || leaf->time_index == static_cast<uint64_t>(target_time)) {
-                return leaf;
-            }
-        }
-    }
-
-    // --- PASSE 2 : Fallback (Recherche linéaire) ---
-    DEBUG_PRINT("[WARN] Optimized search failed. Falling back to linear scan for: " << clean_ds_name);
-    const auto& leaves = panzer_db_ptr->getLeaves();
-    for (const auto& leaf : leaves) {
-        if (target_time != -1 && leaf.time_index != static_cast<uint64_t>(target_time)) continue;
-        
-        // ✅ FIX: Enforce context prefix constraint
-        if (!context_prefix.empty()) {
-            if (leaf.path.size() < context_prefix.size() || leaf.path.compare(0, context_prefix.size(), context_prefix) != 0) {
-                continue;
-            }
+            segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
+            
+            current_ctx = arr_ctx->getParent();
         }
 
-        if (leaf.path == clean_ds_name) return &leaf;
-        if (leaf.path.size() > clean_ds_name.size() && leaf.path.compare(leaf.path.size() - clean_ds_name.size(), clean_ds_name.size(), clean_ds_name) == 0) {
-            if (leaf.path[leaf.path.size() - clean_ds_name.size() - 1] == '/') return &leaf;
-        }
-    }
-
-    DEBUG_PRINT("Leaf not found for path: '" << strict_target_path << "' and time_index: " << target_time);
-    return nullptr;
-}
-
-  // Dans slice_read_strategy.cpp, remplacer la fonction getTimeValues par :
-
-std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
-    std::vector<double> time_values;
-
-    if (homogeneous_time == 1) {
-        time_values = panzer_db_ptr->getWholeDynamicSignal("time");
-        return time_values;
-    }
-
-    // --- Logique pour homogeneous_time == 0 ---
-
-    if (ctx == nullptr) {
-        return time_values; // Return empty vector
-    }
-
-    ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
-    if (!arrCtx) { // Cas où le contexte est OperationContext
-        time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback pour le temps racine
-        return time_values;
-    }
-
-    // On cherche le parent "timed" pour construire le chemin de la base de temps
-    ArraystructContext* timed_ctx = arrCtx;
-    while(timed_ctx != nullptr && !timed_ctx->getTimed()) {
-        timed_ctx = timed_ctx->getParent();
-    }
-    if (!timed_ctx) return {}; // Pas de base de temps trouvée
-
-    std::string full_timebase_path = getPath(timed_ctx, false); // false = pas d'index final
-    if (!full_timebase_path.empty()) {
-        full_timebase_path += "/";
-    }
-    full_timebase_path += timed_ctx->getTimebasePath();
-
-    auto leaves = panzer_db_ptr->getLeaves();
-
-    // ✅ Filtrer pour ne garder QUE les feuilles correspondant au chemin exact
-    std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
-
-    for (const auto& leaf : leaves) {
-        // Correspondance EXACTE du chemin complet
-        if (leaf.path == full_timebase_path && !leaf.is_empty) {
-            time_leaves_map[leaf.time_index] = &leaf;
-        }
-    }
-
-    // Lire les valeurs dans l'ordre des time_index
-    for (const auto& [time_idx, leaf_ptr] : time_leaves_map) {
-        if (leaf_ptr->count > 0) {
-            std::vector<double> temp_data(leaf_ptr->count);
-            panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
-            time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
-        }
-    }
-
-    return time_values;
-}
-
-   protected: // La méthode est `protected` pour être accessible par les classes filles
-    std::string getPath(ArraystructContext *ctx, bool include_self_index = true) {
-    if (!ctx) return "";
-
-    std::vector<std::pair<std::string, int>> segments;
-    Context* current_ctx = ctx;
-
-    while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
-        
-        // 1. Get full path (e.g. "static_aos/dynamic_aos")
-        std::string full_path = arr_ctx->getPath();
-        std::string node_name;
-        
-        // 2. Extract local node name relative to parent
-        Context* parent = arr_ctx->getParent();
-        if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-            std::string parent_path = parent_arr->getPath();
-            if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                node_name = full_path.substr(parent_path.size() + 1); // +1 for '/'
-            } else {
-                node_name = full_path; // Should not happen
-            }
-        } else {
-            node_name = full_path;
+        std::stringstream path_stream;
+        for (const auto& segment : segments) {
+            path_stream << segment.first << "/" << segment.second << "/";
         }
         
-        std::replace(node_name.begin(), node_name.end(), '/', '&');
+        path_stream << dataset_name;
         
-        segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
-        
-        current_ctx = arr_ctx->getParent();
+        return path_stream.str();
     }
 
-    std::stringstream path_stream;
-    for (size_t i = 0; i < segments.size(); ++i) {
-        path_stream << segments[i].first; // Append node name (e.g., "A", then "B")
+    // =================================================================================
+    //                            Context Utilities
+    // =================================================================================
 
-        bool is_last_segment = (i == segments.size() - 1);
-
-        if (!is_last_segment) {
-            // For non-last segments, always add index and separator. e.g., "A/0/"
-            path_stream << "/" << segments[i].second << "/";
-        } else { // For the last segment
-            if (include_self_index) {
-                path_stream << "/" << segments[i].second;
-            }
-        }
-    }
-    return path_stream.str();
-}
-
-   /**
-    * @brief Construit le chemin hiérarchique complet vers un dataset à l'intérieur d'AoS imbriqués.
-    *        Le chemin est formaté comme "AOS1/index1/AOS2/index2/.../dataset".
-    * 
-    * @param ctx Le contexte actuel, doit être un ArraystructContext ou un de ses enfants.
-    * @param dataset_name Le nom du dataset final.
-    * @return std::string Le chemin complet, par exemple "A/0/B/0/data".
-    */
-   std::string buildFullPath(Context* ctx, const std::string& dataset_name) {
-       std::vector<std::pair<std::string, int>> segments;
-       Context* current_ctx = ctx;
-
-       // Remonte la hiérarchie des contextes pour collecter les noms et indices des AoS.
-       while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-           ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
-           
-           std::string full_path = arr_ctx->getPath();
-           std::string node_name;
-           
-           Context* parent = arr_ctx->getParent();
-           if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-               ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-               std::string parent_path = parent_arr->getPath();
-               if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                   node_name = full_path.substr(parent_path.size() + 1);
-               } else {
-                   node_name = full_path;
-               }
-           } else {
-               node_name = full_path;
-           }
-           
-           std::replace(node_name.begin(), node_name.end(), '/', '&');
-           
-           segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
-           
-           current_ctx = arr_ctx->getParent();
-       }
-
-       std::stringstream path_stream;
-       for (const auto& segment : segments) {
-           path_stream << segment.first << "/" << segment.second << "/";
-       }
-       
-       path_stream << dataset_name;
-       
-       return path_stream.str();
-   }
-
+    /**
+     * @brief Checks if a context or any of its parents is timed.
+     * @param ctx The context to check.
+     * @return True if timed, false otherwise.
+     */
     bool isTimedContext(Context *ctx) {
         if (!ctx || ctx->getType() != CTX_ARRAYSTRUCT_TYPE) {
             return false;
@@ -367,7 +465,19 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         return false;
     }
     
-   protected: // La méthode est `protected` pour être accessible par les classes filles
+    // =================================================================================
+    //                            Data Reading Helpers
+    // =================================================================================
+
+    /**
+     * @brief Reads data from a specific PanzerDB leaf.
+     * @param leaf Pointer to the leaf to read.
+     * @param datatype Expected data type.
+     * @param data Output pointer for the data buffer.
+     * @param dim Output pointer for dimensions count.
+     * @param size Output pointer for dimensions sizes.
+     * @return 1 on success, 0 on failure.
+     */
     int readLeafData(const PanzerDB::Leaf* leaf, int datatype, void **data, int *dim, int *size) {
         if (!panzer_db_ptr) {
             throw ALBackendException("PanzerDB not initialized", LOG);
@@ -387,7 +497,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
                 *data = new std::complex<double>[leaf->count];
                 panzer_db_ptr->readTensor<std::complex<double>>(*leaf, static_cast<std::complex<double>*>(*data));
             } else if (datatype == alconst::char_data) {
-                if (leaf->shape.size() <= 1) { // Liste 1D ou Scalaire
+                if (leaf->shape.size() <= 1) { // 1D List or Scalar
                     std::vector<std::string> str_list(leaf->count);
                     panzer_db_ptr->readTensor<std::string>(*leaf, str_list.data());
                     
@@ -405,20 +515,29 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
                 throw ALBackendException("HDF5Reader_v2: Unknown datatype", LOG);
             }
 
-            // Mettre à jour les dimensions de sortie
+            // Update output dimensions
             *dim = leaf->shape.size();
             for (size_t i = 0; i < leaf->shape.size(); ++i) {
                 size[i] = leaf->shape[i];
             }
 
-            return 1; // Succès
+            return 1; // Success
         } catch (const std::exception& e) {
             throw ALBackendException(std::string("PanzerDB read error: ") + e.what(), LOG);
         }
     }
 
-    // Méthode commune pour lire un dataset entier (toutes les tranches temporelles concaténées)
-    // Refactorisé depuis GlobalReadStrategy pour être utilisé par TimeRangeReadStrategy
+    /**
+     * @brief Reads a whole dataset globally (concatenating all time slices).
+     *        Refactored from GlobalReadStrategy to be used by TimeRangeReadStrategy.
+     * @param ctx The context.
+     * @param dataset_name The dataset name.
+     * @param datatype Output pointer for data type.
+     * @param data Output pointer for data buffer.
+     * @param dim Output pointer for dimensions count.
+     * @param size Output pointer for dimensions sizes.
+     * @return 1 on success, 0 on failure.
+     */
     int read_dataset_globally(Context *ctx, std::string &dataset_name, int* datatype, void **data, int *dim, int *size) {
         DEBUG_PRINT("--> Entering read_dataset_globally for dataset: " << dataset_name);
 
@@ -426,21 +545,17 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
             throw ALBackendException("PanzerDB not initialized", LOG);
         }
 
-        // ✅ OPTIMISATION: Utiliser le cache de chemin de contexte
+        // Use context path cache for optimization
         std::string context_prefix;
         auto cache_it = context_path_cache.find(ctx);
         if (cache_it != context_path_cache.end()) {
             context_prefix = cache_it->second;
         } else {
-            // Le chemin n'est pas en cache, on le construit et on le stocke
-            std::stringstream ss_prefix;
-            // ... (la logique de construction du chemin reste ici)
-            // Après la construction, stocker dans le cache :
-            // context_path_cache[ctx] = ss_prefix.str();
-            // Pour l'instant, on va intégrer la logique directement ci-dessous.
+            // Path is not in cache, build it and store it
+            // (Logic integrated below)
         }
 
-        // 1. Reconstruction du chemin
+        // 1. Path reconstruction
         std::vector<std::string> path_segments;
         std::vector<int> indices;
         std::vector<bool> is_dynamic_level;
@@ -486,14 +601,13 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         std::string clean_ds_name = dataset_name;
         std::replace(clean_ds_name.begin(), clean_ds_name.end(), '/', '&');
 
-        // 2. Construction du chemin complet et récupération des feuilles
-        // (Intégration de la logique de cache ici)
+        // 2. Full path construction and leaf retrieval
         std::stringstream ss_specific;
         for (size_t i = 0; i < path_segments.size(); ++i) {
             ss_specific << path_segments[i] << "/" << indices[i] << "/";
         }
         context_prefix = ss_specific.str();
-        context_path_cache[ctx] = context_prefix; // Mise en cache
+        context_path_cache[ctx] = context_prefix; // Caching
 
         ss_specific << clean_ds_name;
         std::string specific_path = ss_specific.str();
@@ -504,7 +618,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         auto it = path_cache.find(specific_path);
         if (it != path_cache.end() && !it->second.empty()) {
             DEBUG_PRINT("Found specific path: " << specific_path);
-            // FIX: Always filter by time index if in a dynamic context,
+            // Always filter by time index if in a dynamic context,
             // even for a specific path. This handles cases where multiple time
             // slices might be associated with the same path string in the cache.
             if (target_time_index != -1) {
@@ -550,9 +664,9 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         }
 
         if (!found || sorted_leaves.empty()) {
-            // Fallback : Recherche linéaire pour les signaux dynamiques lus depuis un parent
-            // (ex: lire "profiles_1d/signal" depuis la racine)
-            // Note: Ce cas est rare si on utilise correctement les contextes.
+            // Fallback: Linear search for dynamic signals read from a parent
+            // (e.g., read "profiles_1d/signal" from root)
+            // Note: This case is rare if contexts are used correctly.
             DEBUG_PRINT("Leaf not found for: " << specific_path << " or generic variant");
             return 0;
         }
@@ -569,7 +683,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         
         const PanzerDB::Leaf* first_leaf = sorted_leaves[0];
         
-        // FIX: Handle multiple static writes for scalars (overwrites).
+        // Handle multiple static writes for scalars (overwrites).
         // A scalar leaf is one with count=1 (for strings) or an empty shape (for numerics).
         PanzerDB::DataType first_leaf_type = static_cast<PanzerDB::DataType>(first_leaf->flags >> 4);
         bool is_numeric_scalar_leaf = (first_leaf_type != PanzerDB::DataType::STRING && first_leaf->shape.empty());
@@ -589,7 +703,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
              }
         }
 
-        // Déterminer le type réel à partir des flags de la feuille
+        // Determine real type from leaf flags
         PanzerDB::DataType actual_type_enum = static_cast<PanzerDB::DataType>(first_leaf->flags >> 4);
         int actual_datatype = 0;
         switch(actual_type_enum) {
@@ -599,13 +713,13 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
             case PanzerDB::DataType::COMPLEX128: actual_datatype = alconst::complex_data; break;
             default:
                 DEBUG_PRINT("Unknown data type in leaf flags: " << (first_leaf->flags >> 4));
-                return 0; // Type inconnu
+                return 0; // Unknown type
         }
 
         size_t leaf_rank = first_leaf->shape.size();
 
-        // 3. Traitement CHAR / STRING
-        // On lit toujours avec le type réel du fichier. La conversion sera faite par al_lowlevel.
+        // 3. CHAR / STRING Processing
+        // Always read with the actual file type. Conversion will be done by al_lowlevel.
         if (actual_datatype == alconst::char_data) {
              std::vector<std::string> temp_buffer;
              temp_buffer.reserve(total_elements);
@@ -643,23 +757,22 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
                  *data = char_buffer;
              }
  
-             *datatype = actual_datatype; // On retourne le type qui a été lu
+             *datatype = actual_datatype; // Return the type that was read
              return 1;
         }
 
-        // 4. Traitement NUMÉRIQUE
-        // 4. Traitement NUMÉRIQUE
+        // 4. NUMERIC Processing
         if (leaf_rank == 0) {
-            // Signal 0D (scalaire) → devient 1D avec dimension temporelle
+            // 0D Signal (scalar) -> becomes 1D with time dimension
             if (total_elements > 1) { 
                 *dim = 1; 
                 size[0] = (int)total_elements; 
             } else { 
                 *dim = 0; 
-                // size[0] = 1; // Implicite pour un scalaire
+                // size[0] = 1; // Implicit for a scalar
             }
         } else {
-            // Signal N-D → Ajouter dimension temporelle SI plusieurs tranches
+            // N-D Signal -> Add time dimension IF multiple slices
             size_t spatial_product = 1;
             for (size_t i = 0; i < leaf_rank; ++i) { 
                 size[i] = (int)first_leaf->shape[i]; 
@@ -669,10 +782,10 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
             size_t n_time_slices = (spatial_product > 0) ? (total_elements / spatial_product) : 1;
             
             if (n_time_slices > 1) {
-                *dim = (int)(leaf_rank + 1); // ✅ +1 pour dimension temporelle
+                *dim = (int)(leaf_rank + 1); // +1 for time dimension
                 size[leaf_rank] = (int)n_time_slices;
             } else {
-                *dim = (int)leaf_rank; // Pas de dimension temporelle si 1 seule slice
+                *dim = (int)leaf_rank; // No time dimension if only 1 slice
             }
         }
 
@@ -682,11 +795,11 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
         else if (actual_datatype == alconst::complex_data) *data = malloc(total_elements * sizeof(std::complex<double>));
         else return 0;
 
-        // OPTIMISATION: Lecture groupée (Hyperslab Union)
+        // Use grouped read (Hyperslab Union) for optimization
         int res = panzer_db_ptr->readLeavesUnion(sorted_leaves, *data, actual_type_enum);
         if (res < 0) return 0;
 
-        *datatype = actual_datatype; // On retourne le type qui a été lu
+        *datatype = actual_datatype; // Return the type that was read
         return 1;
     }
     

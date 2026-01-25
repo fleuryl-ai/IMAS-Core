@@ -134,7 +134,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
     bool is_dynamic = timebasename.compare("") != 0 ? true : false;
     std::vector<int> ctx_indices;
-        // On récupère les indices sans forcer l'index temporel (il sera géré par readInterpolatedData)
+        // Retrieve indices without forcing the time index (it will be handled by readInterpolatedData)
     int dynamic_index = -1;
     ctx_indices = getIndices(ctx, &dynamic_index);
 
