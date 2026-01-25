@@ -9,6 +9,11 @@
 #include <sstream>
 #include "hdf5_utils.h"
 
+// Include all read strategies
+#include "global_read_strategy.h"
+#include "slice_read_strategy.h"
+#include "timerange_read_strategy.h"
+
 
 // Debug macro
 #ifdef DEBUG_HDF5_READER_V2

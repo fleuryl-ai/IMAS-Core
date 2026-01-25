@@ -9,7 +9,7 @@ public:
     void beginReadArraystructAction(ArraystructContext * ctx, int *size) override;
     void endAction(Context * ctx) override;
     int read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
-                     int *datatype, void **data, int *dim, int *size) override;
+                     int* datatype, void **data, int *dim, int *size) override;
 };
 
 #endif // GLOBAL_READ_STRATEGY_H

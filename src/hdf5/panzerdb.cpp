@@ -1544,6 +1544,29 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
 
 template void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const;
 
+template<typename T>
+T PanzerDB::readScalar(const std::string& path, int *status) const {
+    const auto& leaves = getLeaves();
+    auto it = leaf_lookup.find(path);
+    
+    if (it != leaf_lookup.end() && !it->second.empty()) {
+        const Leaf& leaf = leaves[it->second[0]];
+        if (leaf.count > 0) {
+            std::vector<T> buffer(leaf.count);
+            try {
+                readTensor(leaf, buffer.data());
+                if (status) *status = 0;
+                return buffer[0];
+            } catch (...) {}
+        }
+    }
+    if (status) *status = -1;
+    return T();
+}
+
+template int PanzerDB::readScalar<int>(const std::string&, int*) const;
+template double PanzerDB::readScalar<double>(const std::string&, int*) const;
+
 // Private helper function to avoid duplication
 template<typename T>
 void PanzerDB::writeDataImpl(const std::string& name,

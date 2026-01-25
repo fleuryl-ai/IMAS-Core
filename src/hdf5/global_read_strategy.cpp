@@ -1,57 +1,31 @@
 #include "global_read_strategy.h"
-#include "al_backend.h"
-#include "al_defs.h"
-#include <vector>
-#include <cstring>
-#include <complex>
-#include <sstream>
-
-#define HOMOGENEOUS_TIME_FIELD_NAME "ids_properties&homogeneous_time"
-#define HOMOGENEOUS_TIME_BASIS_FIELD_NAME "time"
-
-// Macro de debug
-#ifdef DEBUG_HDF5_READER_V2
-#define DEBUG_PRINT(msg) \
-  std::cerr << "[DEBUG " << __func__ << "] " << msg << std::endl
-#else
-#define DEBUG_PRINT(msg) \
-  do {                   \
-  } while (0)
-#endif
+#include "al_context.h"
 
 GlobalReadStrategy::GlobalReadStrategy(hid_t loc_id)
     : IReadStrategy(loc_id) {}
 
-
-
 void GlobalReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
-
-
+    // For a global read, we need the full size of the Array of Structures.
+    // The getPath method constructs the path to the AoS meta-node.
+    // We pass 'false' to exclude the index of the context itself, giving us the path to the array, not an element.
     std::string aos_path_token = getPath(ctx, false);
-    DEBUG_PRINT("Preparing AOS for path: " << aos_path_token);
     auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);
-    if (!shapes.empty()) {
-      DEBUG_PRINT("AOS retrieved with " << shapes[0] << " elements.");
-    } 
-    *size = shapes.empty() ? 0 : shapes[0]; 
-
+    *size = shapes.empty() ? 0 : shapes[0];
 }
 
 void GlobalReadStrategy::endAction(Context *ctx) {
-    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
-    } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
-        if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
+    // The end of an OperationContext signifies the end of the entire read operation for this IDS.
+    // We can close the PanzerDB instance to release file handles.
+    if (ctx->getType() == CTX_OPERATION_TYPE) {
+        if (panzer_db_ptr) {
+            panzer_db_ptr->close();
+        }
     }
-  else{
-  }
 }
 
 int GlobalReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
-                                     int *datatype, void **data, int *dim, int *size) {
-
-    // Utilisation de la méthode commune définie dans IReadStrategy
+                                     int* datatype, void **data, int *dim, int *size) {
+    // The global strategy is to read the entire dataset, concatenating all time slices.
+    // This is exactly what the refactored `read_dataset_globally` helper method does.
     return read_dataset_globally(ctx, dataset_name, datatype, data, dim, size);
 }
