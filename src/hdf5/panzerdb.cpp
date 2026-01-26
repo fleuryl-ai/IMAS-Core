@@ -2303,6 +2303,23 @@ bool PanzerDB::isTimeInLeaf(const Leaf& leaf, int64_t time_index) const {
             static_cast<uint64_t>(time_index) < (leaf.time_index + n_steps));
 }
 
+namespace {
+    void set_output_shape(const PanzerDB::Leaf& leaf, uint64_t* ndim_out, uint64_t shape_out[6], uint64_t total_count) {
+        size_t slice_vol = 1;
+        for(auto s : leaf.shape) if(s > 0) slice_vol *= s;
+        if (slice_vol == 0) slice_vol = 1;
+
+        if (total_count > slice_vol && slice_vol > 0) { // Time dimension exists
+            *ndim_out = leaf.shape.size() + 1;
+            for (size_t i = 0; i < leaf.shape.size(); ++i) shape_out[i] = leaf.shape[i];
+            shape_out[*ndim_out - 1] = total_count / slice_vol;
+        } else { // Static data
+            *ndim_out = leaf.shape.size();
+            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+        }
+    }
+}
+
 int PanzerDB::pz_readData_by_index(
                          const char* full_data_path,
                          int64_t time_index,
@@ -2339,18 +2356,7 @@ int PanzerDB::pz_readData_by_index(
         // Simple case: single leaf
         if (matches.size() == 1) {
             const Leaf& leaf = *matches[0];
-            
-            size_t slice_vol = 1;
-            for(auto s : leaf.shape) if(s > 0) slice_vol *= s;
-            
-            if (leaf.count > slice_vol) {
-                *ndim_out = leaf.shape.size() + 1;
-                for (size_t i = 0; i < leaf.shape.size(); ++i) shape_out[i] = leaf.shape[i];
-                shape_out[*ndim_out - 1] = leaf.count / slice_vol;
-            } else {
-                *ndim_out = leaf.shape.size();
-                for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
-            }
+            set_output_shape(leaf, ndim_out, shape_out, leaf.count);
             
             *data_out = (double*)malloc(leaf.count * sizeof(double));
             this->readTensor(leaf, *data_out);
@@ -2373,13 +2379,7 @@ int PanzerDB::pz_readData_by_index(
             }
         }
 
-        *ndim_out = first.shape.size() + 1;
-        for(size_t i=0; i<first.shape.size(); ++i) shape_out[i] = first.shape[i];
-        
-        size_t slice_vol = 1;
-        for(auto s : first.shape) if(s > 0) slice_vol *= s;
-        shape_out[*ndim_out - 1] = total_count / slice_vol;
-
+        set_output_shape(first, ndim_out, shape_out, total_count);
         //printf("    [pz_readData_by_index] Aggregated %zu matches, ndim_out=%llu\n", 
         //       matches.size(), *ndim_out);
 
