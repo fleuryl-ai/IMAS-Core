@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iomanip>
 #include <string_view>
+#include <cstdio>
 
 /*
  * ###############################################################################
@@ -2447,64 +2448,63 @@ int PanzerDB::pz_readData_by_index(
                                         : std::string_view();
 
                 // STRATEGY 1: Generic Path
-                std::string generic_path;
-                generic_path.reserve(aos_view.size() + suffix.size());
-                generic_path.append(aos_view);
-                generic_path.append(suffix);
-
-                //printf("    [pz_readData_by_index] Trying generic path: '%s' with time_index: %lld\n", 
-                //       generic_path.c_str(), (long long)time_index);
-
-                auto it_gen = leaf_lookup.find(generic_path);
-                if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
-                        const auto& leaf = leaves[idx];
-                        if (isTimeInLeaf(leaf, time_index)) {
-                            size_t slice_volume = 1;
-                            for (auto s : leaf.shape) if(s > 0) slice_volume *= s;
-                            if (slice_volume == 0) slice_volume = 1;
-                            
-                            *data_out = (double*)malloc(slice_volume * sizeof(double));
-                            if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
-                                free(*data_out);
-                                return -1;
+                char path_buf[PATH_MAX_LEN];
+                int len = snprintf(path_buf, PATH_MAX_LEN, "%.*s%.*s", 
+                                   (int)aos_view.size(), aos_view.data(), 
+                                   (int)suffix.size(), suffix.data());
+                
+                if (len > 0 && len < PATH_MAX_LEN) {
+                    auto it_gen = leaf_lookup.find(std::string_view(path_buf, len));
+                    if (it_gen != leaf_lookup.end()) {
+                        for (size_t idx : it_gen->second) {
+                            const auto& leaf = leaves[idx];
+                            if (isTimeInLeaf(leaf, time_index)) {
+                                size_t slice_volume = 1;
+                                for (auto s : leaf.shape) if(s > 0) slice_volume *= s;
+                                if (slice_volume == 0) slice_volume = 1;
+                                
+                                *data_out = (double*)malloc(slice_volume * sizeof(double));
+                                if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
+                                    free(*data_out);
+                                    return -1;
+                                }
+                                
+                                *ndim_out = leaf.shape.size();
+                                for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                                
+                                return 0;
                             }
-                            
-                            *ndim_out = leaf.shape.size();
-                            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
-                            
-                            return 0;
                         }
                     }
                 }
 
                 // STRATEGY 2: Substituted Path
-                std::string substituted_path;
-                substituted_path.reserve(aos_view.size() + 25 + suffix.size());
-                substituted_path.append(aos_view);
-                substituted_path.push_back('/');
-                substituted_path.append(std::to_string(time_index));
-                substituted_path.append(suffix);
+                len = snprintf(path_buf, PATH_MAX_LEN, "%.*s/%lld%.*s", 
+                               (int)aos_view.size(), aos_view.data(), 
+                               (long long)time_index, 
+                               (int)suffix.size(), suffix.data());
 
-                auto it_sub = leaf_lookup.find(substituted_path);
-                if (it_sub != leaf_lookup.end()) {
-                    for (size_t idx : it_sub->second) {
-                        const auto& leaf = leaves[idx];
-                        if (isTimeInLeaf(leaf, time_index)) {
-                            size_t slice_volume = 1;
-                            for (auto s : leaf.shape) if(s > 0) slice_volume *= s;
-                            if (slice_volume == 0) slice_volume = 1;
-                            
-                            *data_out = (double*)malloc(slice_volume * sizeof(double));
-                            if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
-                                free(*data_out);
-                                return -1;
+                if (len > 0 && len < PATH_MAX_LEN) {
+                    auto it_sub = leaf_lookup.find(std::string_view(path_buf, len));
+                    if (it_sub != leaf_lookup.end()) {
+                        for (size_t idx : it_sub->second) {
+                            const auto& leaf = leaves[idx];
+                            if (isTimeInLeaf(leaf, time_index)) {
+                                size_t slice_volume = 1;
+                                for (auto s : leaf.shape) if(s > 0) slice_volume *= s;
+                                if (slice_volume == 0) slice_volume = 1;
+                                
+                                *data_out = (double*)malloc(slice_volume * sizeof(double));
+                                if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
+                                    free(*data_out);
+                                    return -1;
+                                }
+                                
+                                *ndim_out = leaf.shape.size();
+                                for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                                
+                                return 0;
                             }
-                            
-                            *ndim_out = leaf.shape.size();
-                            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
-                            
-                            return 0;
                         }
                     }
                 }
@@ -2615,37 +2615,41 @@ int PanzerDB::pz_readStringData_by_index(
                 size_t first_slash = suffix.find('/');
                 
                 // STRATEGY 1: Generic Path
-                std::string generic_path = dynamic_aos_path;
-                if (first_slash != std::string::npos) {
-                    generic_path.append(suffix.substr(first_slash));
-                } else {
-                    generic_path.append("/").append(suffix);
-                }
-                //printf("    [pz_readStringData_by_index] Trying generic path: '%s' with time_index: %lld\n", generic_path.c_str(), (long long)time_index);
+                char path_buf[PATH_MAX_LEN];
+                int len = 0;
 
-                auto it_gen = leaf_lookup.find(generic_path);
-                if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
-                        if (isTimeInLeaf(leaves[idx], time_index)) {
-                            target_leaf = &leaves[idx];
-                            break;
+                if (first_slash != std::string::npos) {
+                    std::string_view s = suffix.substr(first_slash);
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (int)s.size(), s.data());
+                } else {
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s/%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (int)suffix.size(), suffix.data());
+                }
+                
+                if (len > 0 && len < PATH_MAX_LEN) {
+                    auto it_gen = leaf_lookup.find(std::string_view(path_buf, len));
+                    if (it_gen != leaf_lookup.end()) {
+                        for (size_t idx : it_gen->second) {
+                            if (isTimeInLeaf(leaves[idx], time_index)) {
+                                target_leaf = &leaves[idx];
+                                break;
+                            }
                         }
                     }
                 }
 
                 // STRATEGY 2: Substituted Path
                 if (!target_leaf) {
-                    std::string substituted_path = dynamic_aos_path + "/" + std::to_string(time_index);
-                    if (first_slash != std::string::npos) {
-                        substituted_path.append(suffix.substr(first_slash));
-                    }
-                    //printf("    [pz_readStringData_by_index] Trying substituted path: '%s' with time_index: %lld\n", substituted_path.c_str(), (long long)time_index);
-                    auto it_sub = leaf_lookup.find(substituted_path);
-                    if (it_sub != leaf_lookup.end()) {
-                        for (size_t idx : it_sub->second) {
-                            if (isTimeInLeaf(leaves[idx], time_index)) {
-                                target_leaf = &leaves[idx];
-                                break;
+                    std::string_view s_suffix = (first_slash != std::string::npos) ? suffix.substr(first_slash) : std::string_view();
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s/%lld%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (long long)time_index, (int)s_suffix.size(), s_suffix.data());
+
+                    if (len > 0 && len < PATH_MAX_LEN) {
+                        auto it_sub = leaf_lookup.find(std::string_view(path_buf, len));
+                        if (it_sub != leaf_lookup.end()) {
+                            for (size_t idx : it_sub->second) {
+                                if (isTimeInLeaf(leaves[idx], time_index)) {
+                                    target_leaf = &leaves[idx];
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2832,36 +2836,41 @@ int PanzerDB::pz_readComplexData_by_index(
                 size_t first_slash = suffix.find('/');
 
                 // STRATEGY 1: Generic Path
-                std::string generic_path = dynamic_aos_path;
+                char path_buf[PATH_MAX_LEN];
+                int len = 0;
+
                 if (first_slash != std::string::npos) {
-                    generic_path.append(suffix.substr(first_slash));
+                    std::string_view s = suffix.substr(first_slash);
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (int)s.size(), s.data());
                 } else {
-                    generic_path.append("/").append(suffix);
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s/%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (int)suffix.size(), suffix.data());
                 }
-                //printf("    [pz_readComplexData_by_index] Trying generic path: '%s' with time_index: %lld\n", generic_path.c_str(), (long long)time_index);
-                auto it_gen = leaf_lookup.find(generic_path);
-                if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
-                        if (isTimeInLeaf(leaves[idx], time_index)) {
-                            target_leaf = &leaves[idx];
-                            break;
+
+                if (len > 0 && len < PATH_MAX_LEN) {
+                    auto it_gen = leaf_lookup.find(std::string_view(path_buf, len));
+                    if (it_gen != leaf_lookup.end()) {
+                        for (size_t idx : it_gen->second) {
+                            if (isTimeInLeaf(leaves[idx], time_index)) {
+                                target_leaf = &leaves[idx];
+                                break;
+                            }
                         }
                     }
                 }
 
                 // STRATEGY 2: Substituted Path
                 if (!target_leaf) {
-                    std::string substituted_path = dynamic_aos_path + "/" + std::to_string(time_index);
-                    if (first_slash != std::string::npos) {
-                        substituted_path.append(suffix.substr(first_slash));
-                    }
-                    //printf("    [pz_readComplexData_by_index] Trying substituted path: '%s' with time_index: %lld\n", substituted_path.c_str(), (long long)time_index);
-                    auto it_sub = leaf_lookup.find(substituted_path);
-                    if (it_sub != leaf_lookup.end()) {
-                        for (size_t idx : it_sub->second) {
-                            if (isTimeInLeaf(leaves[idx], time_index)) {
-                                target_leaf = &leaves[idx];
-                                break;
+                    std::string_view s_suffix = (first_slash != std::string::npos) ? suffix.substr(first_slash) : std::string_view();
+                    len = snprintf(path_buf, PATH_MAX_LEN, "%.*s/%lld%.*s", (int)dynamic_aos_path.size(), dynamic_aos_path.c_str(), (long long)time_index, (int)s_suffix.size(), s_suffix.data());
+
+                    if (len > 0 && len < PATH_MAX_LEN) {
+                        auto it_sub = leaf_lookup.find(std::string_view(path_buf, len));
+                        if (it_sub != leaf_lookup.end()) {
+                            for (size_t idx : it_sub->second) {
+                                if (isTimeInLeaf(leaves[idx], time_index)) {
+                                    target_leaf = &leaves[idx];
+                                    break;
+                                }
                             }
                         }
                     }
