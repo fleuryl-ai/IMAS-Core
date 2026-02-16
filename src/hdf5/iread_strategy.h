@@ -193,12 +193,24 @@ public:
 
   // Dans slice_read_strategy.cpp, remplacer la fonction getTimeValues par :
 
-std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
+std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
     std::vector<double> time_values;
 
     if (homogeneous_time == 1) {
         time_values = panzer_db_ptr->getWholeDynamicSignal("time");
         return time_values;
+    }
+
+    // 1. Try explicit timebase if provided (handles nested time vectors in static AoS)
+    if (!timebasename.empty()) {
+        const PanzerDB::Leaf* leaf = find_leaf_for_context(ctx, timebasename, "", 0);
+        if (leaf && leaf->count > 0) {
+            time_values.resize(leaf->count);
+            panzer_db_ptr->readTensor(*leaf, time_values.data());
+            return time_values;
+        }
+        // If explicit timebase provided but not found, we could return empty or try fallback.
+        // Let's try fallback to be safe, though usually explicit path should win.
     }
 
     // --- Logique pour homogeneous_time == 0 ---

@@ -65,7 +65,7 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         return status;  
      }                                  
 
-    std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time);
+    std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
 
     double time;
     int interp;
