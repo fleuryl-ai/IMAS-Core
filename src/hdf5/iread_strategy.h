@@ -619,12 +619,15 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time) {
              for (const auto& s : temp_buffer) if (s.size() > max_str_len) max_str_len = s.size();
              max_str_len += 1; // Null terminator
 
-             // Heuristic: Scalar vs List
-             // For strings, a scalar is a single string (total_elements == 1 after the static overwrite fix).
-             // A list of 1 string will also be treated as a scalar here, which is an acceptable simplification for global read.
-             bool is_scalar = (total_elements == 1);
+             // Heuristic: Scalar vs List (Corrected)
+             // Use the shape of the first leaf to determine if it was written as a scalar or an array.
+             // Scalar string: shape is empty (rank 0).
+             // List of strings: shape has rank 1.
+             bool is_scalar_leaf = (first_leaf->shape.empty());
+             
+             bool return_as_scalar = (is_scalar_leaf && total_elements == 1);
 
-             if (is_scalar) {
+             if (return_as_scalar) {
                  *dim = 1;
                  size[0] = (int)temp_buffer[0].size(); // Length excluding null
                  *data = new char[size[0] + 1];
