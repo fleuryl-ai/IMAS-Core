@@ -2621,7 +2621,7 @@ int PanzerDB::pz_readStringData_by_index(
         
         size_t start_idx = local_step * element_size;
         
-        bool is_scalar = (element_size == 1);
+        bool is_scalar = target_leaf->shape.empty();
 
         if (is_scalar) {
             const std::string& s = scratch_str[start_idx];
