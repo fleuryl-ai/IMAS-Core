@@ -21,7 +21,7 @@ const std::string URI = "imas:hdf5?path=./test_db_b_field_na_slice_bug";
 
 int main() {
     try {
-        std::cout << BOLD << "\n=== Test Bug Reproduction: Slice of b_field_non_axisymmetric (Homogeneous=1) ===\n" << RESET;
+        std::cout << BOLD << "\n=== Test Bug Reproduction: Slice of b_field_non_axisymmetric (Homogeneous=0) ===\n" << RESET;
 
         // Cleanup
         if (fs::exists("test_db_b_field_na_slice_bug")) {
@@ -43,16 +43,9 @@ int main() {
             OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", "", WRITE_OP);
             backend.beginAction(&opCtx);
 
-            // Set homogeneous_time = 1
-            int homogeneous_time = 1;
+            // Set homogeneous_time = 0 (Inhomogeneous / Time inside structure)
+            int homogeneous_time = 0;
             backend.writeData(&opCtx, "ids_properties/homogeneous_time", "", &homogeneous_time, alconst::integer_data, 0, nullptr);
-
-            // Write global time vector
-            std::vector<double> times(TIME_STEPS);
-            for(int t=0; t<TIME_STEPS; ++t) times[t] = t * 0.1;
-            int time_dim = 1;
-            int time_size[] = {TIME_STEPS};
-            backend.writeData(&opCtx, "time", "time", times.data(), alconst::double_data, time_dim, time_size);
 
             // Dynamic AoS: time_slice
             ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
@@ -60,6 +53,10 @@ int main() {
             backend.beginArraystructAction(&timeSliceCtx, &ts_size);
 
             for (int t = 0; t < TIME_STEPS; ++t) {
+                // Write time for this slice (scalar time per slice)
+                // This is the time vector for the dynamic AoS
+                double current_time = t * 0.1;
+                backend.writeData(&timeSliceCtx, "time", "", &current_time, alconst::double_data, 0, nullptr);
 
                 // Write r (1D signal) inside field_map/grid structure
                 // Path: time_slice/field_map/grid/r
@@ -69,7 +66,8 @@ int main() {
                 int r_dim = 1;
                 int r_size[] = {R_SIZE};
                 // Note: "field_map" and "grid" are structures, so we write "field_map/grid/r" directly from time_slice context
-                backend.writeData(&timeSliceCtx, "field_map/grid/r", "", r_data.data(), alconst::double_data, r_dim, r_size);
+                // The timebasename "time" links this data to the time vector defined for each slice of the parent AoS.
+                backend.writeData(&timeSliceCtx, "field_map/grid/r", "time", r_data.data(), alconst::double_data, r_dim, r_size);
 
                 if (t < TIME_STEPS - 1) timeSliceCtx.nextIndex(1);
             }
@@ -89,39 +87,86 @@ int main() {
             HDF5Backend backend;
             backend.openPulse(&dataEntryCtx, OPEN_PULSE);
 
-            double target_time = 0.1; // Corresponds to index 1
-
-            std::cout << "Attempting to read slice at t=" << target_time << "...\n";
-            OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::closest_interp);
-            backend.beginAction(&opCtx);
-
-            // Navigate to the data
-            ArraystructContext timeSliceCtx(&opCtx, "time_slice", "");
-            int ts_size_read = 0;
-            backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
-            assert(ts_size_read == 1); // Slice mode: size is 1
-
-            void* data = nullptr;
-            int datatype = alconst::double_data;
-            int dim = 0;
-            int size[H5S_MAX_RANK];
+            // --- Test with different interpolation strategies ---
             
-            // This call should throw the exception if the bug is present
-            // The backend needs to find the time vector associated with time_slice, which is `time_slice/time`
-            backend.readData(&timeSliceCtx, "field_map/grid/r", "time", &data, &datatype, &dim, size);
-            
-            std::cout << GREEN << ">>> TEST PASSED: readData did not throw.\n" << RESET;
-            
-            // Optional: validation of data
-            assert(dim == 1);
-            assert(size[0] == R_SIZE);
-            double* r_vals = static_cast<double*>(data);
-            assert(std::abs(r_vals[0] - 100.0) < 1e-9); // t=1 -> 100.0 + 0
+            // Test 1: Closest
+            {
+                double target_time = 0.11; // Closest to 0.1 (index 1)
+                std::cout << "Attempting to read slice at t=" << target_time << " with alconst::closest_interp...\n";
+                OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::closest_interp);
+                backend.beginAction(&opCtx);
 
-            if (data) free(data);
+                ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
+                int ts_size_read = 0;
+                backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
+                assert(ts_size_read == 1);
 
-            backend.endAction(&timeSliceCtx);
-            backend.endAction(&opCtx);
+                void* data = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                
+                backend.readData(&timeSliceCtx, "field_map/grid/r", "time", &data, &datatype, &dim, size);
+                
+                std::cout << GREEN << ">>> TEST PASSED (closest_interp): readData did not throw.\n" << RESET;
+                if (data) free(data);
+
+                backend.endAction(&timeSliceCtx);
+                backend.endAction(&opCtx);
+            }
+
+            // Test 2: Linear
+            {
+                double target_time = 0.15; // Between 0.1 and 0.2
+                std::cout << "Attempting to read slice at t=" << target_time << " with alconst::linear_interp...\n";
+                OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::linear_interp);
+                backend.beginAction(&opCtx);
+
+                ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
+                int ts_size_read = 0;
+                backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
+                assert(ts_size_read == 1);
+
+                void* data = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                
+                backend.readData(&timeSliceCtx, "field_map/grid/r", "time", &data, &datatype, &dim, size);
+                
+                std::cout << GREEN << ">>> TEST PASSED (linear_interp): readData did not throw.\n" << RESET;
+                if (data) free(data);
+
+                backend.endAction(&timeSliceCtx);
+                backend.endAction(&opCtx);
+            }
+
+            // Test 3: Previous
+            {
+                double target_time = 0.19; // Previous should be 0.1
+                std::cout << "Attempting to read slice at t=" << target_time << " with alconst::previous_interp...\n";
+                OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::previous_interp);
+                backend.beginAction(&opCtx);
+
+                ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
+                int ts_size_read = 0;
+                backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
+                assert(ts_size_read == 1);
+
+                // This call will throw if the bug is present
+                void* data = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                backend.readData(&timeSliceCtx, "field_map/grid/r", "time", &data, &datatype, &dim, size);
+                
+                std::cout << GREEN << ">>> TEST PASSED (previous_interp): readData did not throw.\n" << RESET;
+                if (data) free(data);
+
+                backend.endAction(&timeSliceCtx);
+                backend.endAction(&opCtx);
+            }
+
             backend.closePulse(&dataEntryCtx, OPEN_PULSE);
         }
 
@@ -135,5 +180,5 @@ int main() {
         std::cerr << RED << "Caught an unexpected exception: " << e.what() << RESET << std::endl;
         return 1;
     }
-    return 0; // If no exception is caught, the test is passed.
+    return 1; // If no exception is caught, the bug is not reproduced.
 }

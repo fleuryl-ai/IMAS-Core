@@ -245,9 +245,21 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
 
     for (const auto& leaf : leaves) {
-        // Correspondance EXACTE du chemin complet
-        if (leaf.path == full_timebase_path && !leaf.is_empty) {
-            time_leaves_map[leaf.time_index] = &leaf;
+        // The full_timebase_path is a "generic" path like "time_slice/time".
+        // The actual leaf paths are "time_slice/0/time", "time_slice/1/time", etc.
+        // We need to match the pattern: timed_aos_path + "/" + index + "/" + timebase_name
+        
+        // 1. Check if the leaf's parent path starts with the AoS path.
+        //    e.g., parent_path "time_slice/0" starts with "time_slice"
+        if (leaf.parent_path.rfind(getPath(timed_ctx, false), 0) == 0) {
+            // 2. Check if the leaf's own name is the timebase name.
+            size_t last_slash = leaf.path.find_last_of('/');
+            if (last_slash != std::string::npos) {
+                std::string_view leaf_name = leaf.path.substr(last_slash + 1);
+                if (leaf_name == timed_ctx->getTimebasePath() && !leaf.is_empty) {
+                    time_leaves_map[leaf.time_index] = &leaf;
+                }
+            }
         }
     }
 
