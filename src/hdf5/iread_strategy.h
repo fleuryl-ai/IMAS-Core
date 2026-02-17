@@ -201,18 +201,6 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
         return time_values;
     }
 
-    // 1. Try explicit timebase if provided (handles nested time vectors in static AoS)
-    if (!timebasename.empty()) {
-        const PanzerDB::Leaf* leaf = find_leaf_for_context(ctx, timebasename, "", 0);
-        if (leaf && leaf->count > 0) {
-            time_values.resize(leaf->count);
-            panzer_db_ptr->readTensor(*leaf, time_values.data());
-            return time_values;
-        }
-        // If explicit timebase provided but not found, we could return empty or try fallback.
-        // Let's try fallback to be safe, though usually explicit path should win.
-    }
-
     // --- Logique pour homogeneous_time == 0 ---
 
     if (ctx == nullptr) {
@@ -230,7 +218,20 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     while(timed_ctx != nullptr && !timed_ctx->getTimed()) {
         timed_ctx = timed_ctx->getParent();
     }
-    if (!timed_ctx) return {}; // Pas de base de temps trouvée
+
+    // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
+    // In this case, the time vector is also static relative to the current context.
+    if (!timed_ctx) {
+        if (!timebasename.empty()) {
+            const PanzerDB::Leaf* leaf = find_leaf_for_context(ctx, timebasename, "", 0);
+            if (leaf && leaf->count > 0) {
+                time_values.resize(leaf->count);
+                panzer_db_ptr->readTensor(*leaf, time_values.data());
+                return time_values;
+            }
+        }
+        return {}; // No timebase found
+    }
 
     std::string full_timebase_path = getPath(timed_ctx, false); // false = pas d'index final
     if (!full_timebase_path.empty()) {
