@@ -143,5 +143,5 @@ int main() {
         std::cerr << RED << "Caught an unexpected exception: " << e.what() << RESET << std::endl;
         return 1;
     }
-    return 1; // If bug is not reproduced, test fails.
+    return 0; // If bug is not reproduced, test OK.
 }

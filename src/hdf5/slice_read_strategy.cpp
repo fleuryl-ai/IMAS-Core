@@ -7,9 +7,36 @@ SliceReadStrategy::SliceReadStrategy(hid_t loc_id)
     : IReadStrategy(loc_id) {}
 
 void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
-    std::string path_container = getPath(ctx, false);
+    OperationContext* opCtx = ctx->getOperationContext();
 
-    //std::replace(aos_path_token.begin(), aos_path_token.end(), '/', '&');
+    // Trouve le parent dynamique le plus proche pour identifier la bonne base de temps
+    ArraystructContext* timed_parent = nullptr;
+    Context* p = ctx;
+    while(p && p->getType() == CTX_ARRAYSTRUCT_TYPE) {
+        ArraystructContext* arr_p = static_cast<ArraystructContext*>(p);
+        if (arr_p->getTimed()) {
+            timed_parent = arr_p;
+            break;
+        }
+        p = arr_p->getParent();
+    }
+
+    int64_t slice_idx = -1;
+    if (timed_parent) {
+        int homogeneous_time = getHomogeneousTime();
+        std::string timebase_path;
+        if (homogeneous_time == 1) {
+            timebase_path = "time";
+        } else {
+            timebase_path = getPath(timed_parent, false);
+            if (!timebase_path.empty()) timebase_path += "/";
+            timebase_path += timed_parent->getTimebasePath();
+        }
+        slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime());
+    }
+
+    std::string path_container = getPath(ctx, false, slice_idx);
+
     auto shapes = panzer_db_ptr->getAOSShape(path_container);
     *size = shapes.empty() ? 0 : shapes[0]; 
     if (ctx->getTimed() && *size > 0)

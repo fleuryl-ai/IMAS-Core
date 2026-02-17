@@ -263,7 +263,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
 }
 
    protected: // La méthode est `protected` pour être accessible par les classes filles
-    std::string getPath(ArraystructContext *ctx, bool include_self_index = true) {
+    std::string getPath(ArraystructContext *ctx, bool include_self_index = true, int64_t override_timed_index = -1) {
     if (!ctx) return "";
 
     std::vector<std::pair<std::string, int>> segments;
@@ -292,7 +292,13 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
         
         std::replace(node_name.begin(), node_name.end(), '/', '&');
         
-        segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
+        int index_to_use = arr_ctx->getIndex();
+        // Si un override est fourni ET que le contexte actuel est dynamique, on l'utilise.
+        if (override_timed_index != -1 && arr_ctx->getTimed()) {
+            index_to_use = override_timed_index;
+        }
+
+        segments.insert(segments.begin(), {node_name, index_to_use});
         
         current_ctx = arr_ctx->getParent();
     }
