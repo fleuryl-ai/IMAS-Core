@@ -30,7 +30,7 @@ int main() {
 
         const int TIME_SLICE_SIZE = 2;
         const int CONTROL_SURFACE_SIZE = 3; // From the bug report: expected 3
-        const int EXPECTED_BUG_SIZE = 2;    // From the bug report: got 2
+        const int BUG_TRIGGER_SIZE = 2;    // Size at t=0 to trigger the bug
 
         // ===================================================================
         // 1. Écriture (simule ids_put of b_field_non_axisymmetric)
@@ -63,14 +63,18 @@ int main() {
             for (int t = 0; t < TIME_SLICE_SIZE; ++t) {
                 // Static AoS nested inside: control_surface
                 ArraystructContext controlSurfaceCtx(&timeSliceCtx, "control_surface", "");
-                int cs_size = CONTROL_SURFACE_SIZE;
+                
+                // VARYING SIZE: t=0 -> 2 elements, t=1 -> 3 elements
+                // This forces the bug to appear if the reader incorrectly looks at t=0 structure
+                int cs_size = (t == 0) ? BUG_TRIGGER_SIZE : CONTROL_SURFACE_SIZE;
+                
                 backend.beginArraystructAction(&controlSurfaceCtx, &cs_size);
 
-                for (int c = 0; c < CONTROL_SURFACE_SIZE; ++c) {
+                for (int c = 0; c < cs_size; ++c) {
                     // Write some dummy data
                     double r_val = 10.0 * t + c;
                     backend.writeData(&controlSurfaceCtx, "r", "", &r_val, alconst::double_data, 0, nullptr);
-                    if (c < CONTROL_SURFACE_SIZE - 1) controlSurfaceCtx.nextIndex(1);
+                    if (c < cs_size - 1) controlSurfaceCtx.nextIndex(1);
                 }
                 backend.endAction(&controlSurfaceCtx);
 
@@ -112,9 +116,9 @@ int main() {
             
             std::cout << "Size of nested static AoS 'control_surface' read from slice: " << cs_size_read << "\n";
             std::cout << "Expected correct size: " << CONTROL_SURFACE_SIZE << "\n";
-            std::cout << "Expected bug size: " << EXPECTED_BUG_SIZE << "\n";
+            std::cout << "Expected bug size (from t=0): " << BUG_TRIGGER_SIZE << "\n";
 
-            if (cs_size_read == EXPECTED_BUG_SIZE) {
+            if (cs_size_read == BUG_TRIGGER_SIZE) {
                 std::cout << RED << ">>> BUG REPRODUCED SUCCESSFULLY <<<\n";
                 std::cout << "    Read " << cs_size_read << " elements for 'control_surface', but expected " << CONTROL_SURFACE_SIZE << ".\n" << RESET;
                 backend.endAction(&controlSurfaceCtx);
