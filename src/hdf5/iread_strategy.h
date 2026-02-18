@@ -239,17 +239,6 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
         return {}; // No timebase found
     }
 
-    std::string full_timebase_path = getPath(timed_ctx, false); // false = pas d'index final
-
-    std::cerr << "[DEBUG getTimeValues] --> full_timebase_path='" << full_timebase_path << "'" << std::endl;
-    
-    if (!full_timebase_path.empty()) {
-        full_timebase_path += "/";
-    }
-    full_timebase_path += timed_ctx->getTimebasePath();
-    
-    std::cerr << "[DEBUG getTimeValues] full_timebase_path='" << full_timebase_path << "'" << std::endl;
-
     auto leaves = panzer_db_ptr->getLeaves();
 
     // ✅ Filtrer pour ne garder QUE les feuilles correspondant au chemin exact
@@ -283,6 +272,9 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
         }
     }
+    printf("timebasename = %s\n ", timebasename.c_str());
+    printf("homogeneous_time = %d\n", homogeneous_time);
+    panzer_db_ptr->dumpLeavesCache();
 
     std::cerr << "[DEBUG getTimeValues] Final time_values size: " << time_values.size() << std::endl;
     return time_values;
@@ -344,7 +336,23 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             }
         }
     }
-    return path_stream.str();
+
+    std::string result = path_stream.str();
+
+    // 1. Si la chaîne est déjà "time", on la renvoie telle quelle.
+    // 2. Si la chaîne est vide (aucun segment), on renvoie "time".
+    // 3. Sinon, on ajoute le suffixe "/time".
+    /*if (result == "time") {
+        return result;
+    } else if (result.empty()) {
+        return "time";
+    } else {
+        return result + "/time";
+    }*/
+
+    //printf("getPath::result = %s\n ", result.c_str());
+
+    return result;
 }
 
    /**
