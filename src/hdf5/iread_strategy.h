@@ -241,27 +241,33 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
 
     auto leaves = panzer_db_ptr->getLeaves();
 
-    // ✅ Filtrer pour ne garder QUE les feuilles correspondant au chemin exact
+    // Filtrer pour ne garder QUE les feuilles correspondant au chemin exact
     std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
+    std::string timed_aos_path = getPath(timed_ctx, false);
+    std::string timebase_name_str = timed_ctx->getTimebasePath();
+    std::cerr << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase name '" << timebase_name_str << "'" << std::endl;
 
     for (const auto& leaf : leaves) {
         // The full_timebase_path is a "generic" path like "time_slice/time".
         // The actual leaf paths are "time_slice/0/time", "time_slice/1/time", etc.
         // We need to match the pattern: timed_aos_path + "/" + index + "/" + timebase_name
-        
+
         // 1. Check if the leaf's parent path starts with the AoS path.
         //    e.g., parent_path "time_slice/0" starts with "time_slice"
-        if (leaf.parent_path.rfind(getPath(timed_ctx, false), 0) == 0) {
+        if (leaf.parent_path.rfind(timed_aos_path, 0) == 0) {
             // 2. Check if the leaf's own name is the timebase name.
             size_t last_slash = leaf.path.find_last_of('/');
             if (last_slash != std::string::npos) {
                 std::string_view leaf_name = leaf.path.substr(last_slash + 1);
-                if (leaf_name == timed_ctx->getTimebasePath() && !leaf.is_empty) {
+                if (leaf_name == timebase_name_str && !leaf.is_empty) {
                     time_leaves_map[leaf.time_index] = &leaf;
-                    // std::cerr << "[DEBUG getTimeValues] Found time leaf: " << leaf.path << " index=" << leaf.time_index << std::endl;
+                    std::cerr << "[DEBUG getTimeValues] Found time leaf: " << leaf.path << " with time_index=" << leaf.time_index << std::endl;
                 }
             }
         }
+    }
+    if (time_leaves_map.empty()) {
+        std::cerr << "[DEBUG getTimeValues] No time leaves found for this context." << std::endl;
     }
 
     // Lire les valeurs dans l'ordre des time_index
@@ -270,6 +276,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
+            std::cerr << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
     printf("timebasename = %s\n ", timebasename.c_str());
