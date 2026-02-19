@@ -2178,7 +2178,7 @@ size_t PanzerDB::getCurrentTotalSize(const std::string& level) const {
     return std::accumulate(v.begin(), v.end(), size_t(0));
 }
 
-int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requested_time) const {
+int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const {
     // 1. Retrieve all index leaves.
     const auto& leaves = getLeaves();
 
@@ -2218,17 +2218,16 @@ int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requeste
         return -1; // Timebase exists but is empty.
     }
 
-    // 5. Optimized binary search (std::lower_bound).
-    // Find first element not less than requested time.
-    auto it_lower = std::lower_bound(time_values.begin(), time_values.end(), requested_time);
-
-    // If requested time is greater than all values, return last index.
-    if (it_lower == time_values.end()) {
-        return time_values.size() - 1;
+    // 5. Use DataInterpolation to get the correct index based on interpolation mode.
+    DataInterpolation interpolator;
+    std::map<std::string, int> times_indices;
+    try {
+        return interpolator.getSlicesTimesIndices(requested_time, time_values, times_indices, interp_mode);
+    } catch (const ALBackendException& e) {
+        // Handle cases where time vector is empty or other issues.
+        std::cerr << "[PanzerDB::getTimeIndex] Warning: " << e.what() << std::endl;
+        return -1;
     }
-
-    // Return index of found element.
-    return std::distance(time_values.begin(), it_lower);
 }
 
 // In panzerdb.cpp, replace lambda is_time_in_leaf with a method:

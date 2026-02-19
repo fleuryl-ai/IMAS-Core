@@ -30,9 +30,11 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
         } else {
             timebase_path = getPath(timed_parent, false);
             if (!timebase_path.empty()) timebase_path += "/";
-            timebase_path += timed_parent->getTimebasePath();
+            //timebase_path += timed_parent->getTimebasePath();
+            timebase_path += "time";
         }
-        slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime());
+        slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
+        //printf("SliceReadStrategy::beginReadArraystructAction: slice_idx=%lld for timebase_path='%s' and requested_time=%f\n", slice_idx, timebase_path.c_str(), opCtx->getTime());
     }
 
     std::string path_container = getPath(ctx, false, slice_idx);
@@ -70,7 +72,6 @@ void SliceReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
         //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
 

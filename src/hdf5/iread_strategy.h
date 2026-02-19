@@ -272,9 +272,6 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             }
         }
     }
-    /*if (time_leaves_map.empty()) {
-        std::cerr << "[DEBUG getTimeValues] No time leaves found for this context." << std::endl;
-    }*/
 
     // Lire les valeurs dans l'ordre des time_index
     for (const auto& [time_idx, leaf_ptr] : time_leaves_map) {
@@ -285,11 +282,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             //std::cerr << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
-    //printf("timebasename = %s\n ", timebasename.c_str());
-    //printf("homogeneous_time = %d\n", homogeneous_time);
-    //panzer_db_ptr->dumpLeavesCache();
 
-    //std::cerr << "[DEBUG getTimeValues] Final time_values size: " << time_values.size() << std::endl;
     return time_values;
 }
 

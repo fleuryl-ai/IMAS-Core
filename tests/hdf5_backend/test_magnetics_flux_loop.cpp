@@ -292,7 +292,7 @@ int main() {
 
       PanzerDB db(magnetics_group_id, PanzerDB::OpenMode::READ, true, true);
       double requested_time = 0.3;
-      int64_t found_index = db.getTimeIndex("time", requested_time);
+      int64_t found_index = db.getTimeIndex("time", requested_time, alconst::closest_interp);
 
       if (found_index != 2) {
           std::cerr << RED << "ERREUR : getTimeIndex(\"time\", " << requested_time << ") a retourné " << found_index << " (attendu: 2)\n" << RESET;

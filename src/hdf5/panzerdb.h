@@ -359,7 +359,7 @@ public:
     const std::vector<Leaf>& getLeaves() const;
     std::vector<size_t> getAOSShape(const std::string& level_name) const;
     size_t getCurrentTotalSize(const std::string& level_name) const;
-    int64_t getTimeIndex(const std::string& timebase_path, double requested_time) const;
+    int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
     bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
     //uint64_t getCurrentTime() const { return global_time; }
 
