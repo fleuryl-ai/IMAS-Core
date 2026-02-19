@@ -28,7 +28,7 @@ int main() {
             fs::remove_all("test_db_dynamic_aos_nested_static_bug");
         }
 
-        const int TIME_SLICE_SIZE = 2;
+        const int TIME_SLICE_SIZE = 3;
         const int CONTROL_SURFACE_SIZE = 3; // From the bug report: expected 3
         const int BUG_TRIGGER_SIZE = 2;    // Size at t=0 to trigger the bug
 
@@ -48,12 +48,7 @@ int main() {
             int homogeneous_time = 1;
             backend.writeData(&opCtx, "ids_properties/homogeneous_time", "", &homogeneous_time, alconst::integer_data, 0, nullptr);
 
-            // Write global time vector
-            std::vector<double> times(TIME_SLICE_SIZE);
-            for(int t=0; t<TIME_SLICE_SIZE; ++t) times[t] = t * 0.1;
-            int time_dim = 1;
-            int time_size[] = {TIME_SLICE_SIZE};
-            backend.writeData(&opCtx, "time", "time", (void*)times.data(), alconst::double_data, time_dim, time_size);
+            
 
             // Dynamic AoS: time_slice
             ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
@@ -61,6 +56,17 @@ int main() {
             backend.beginArraystructAction(&timeSliceCtx, &ts_size);
 
             for (int t = 0; t < TIME_SLICE_SIZE; ++t) {
+                double current_time = t * 0.1;
+                backend.writeData(&timeSliceCtx, "time", "", &current_time, alconst::double_data, 0, nullptr);
+
+                // Add 'r' in time_slice (1D spatial field with 2 elements)
+                const int R_SPATIAL_SIZE = 2;
+                std::vector<double> r_values(R_SPATIAL_SIZE);
+                for(int i=0; i<R_SPATIAL_SIZE; ++i) r_values[i] = (double)(t * 10 + i);
+                int r_dim = 1;
+                int r_size[] = {R_SPATIAL_SIZE};
+                backend.writeData(&timeSliceCtx, "r", "", r_values.data(), alconst::double_data, r_dim, r_size);
+
                 // Static AoS nested inside: control_surface
                 ArraystructContext controlSurfaceCtx(&timeSliceCtx, "control_surface", "");
                 
@@ -81,6 +87,28 @@ int main() {
                 if (t < TIME_SLICE_SIZE - 1) timeSliceCtx.nextIndex(1);
             }
             backend.endAction(&timeSliceCtx);
+
+            // Add 'code_library/description' (static AoS with 4 elements)
+            int code_lib_size = 4;
+            ArraystructContext codeLibCtx(&opCtx, "code_library", "");
+            backend.beginArraystructAction(&codeLibCtx, &code_lib_size);
+            
+            for (int i = 0; i < code_lib_size; ++i) {
+                std::string desc = "Lib " + std::to_string(i);
+                int desc_dim = 1;
+                int desc_size[] = {(int)desc.length()};
+                backend.writeData(&codeLibCtx, "description", "", (void*)desc.c_str(), alconst::char_data, desc_dim, desc_size);
+                
+                if (i < code_lib_size - 1) codeLibCtx.nextIndex(1);
+            }
+            backend.endAction(&codeLibCtx);
+
+            // Write global time vector
+            std::vector<double> times(TIME_SLICE_SIZE);
+            for(int t=0; t<TIME_SLICE_SIZE; ++t) times[t] = t * 0.1;
+            int time_dim = 1;
+            int time_size[] = {TIME_SLICE_SIZE};
+            backend.writeData(&opCtx, "time", "time", (void*)times.data(), alconst::double_data, time_dim, time_size);
 
             backend.endAction(&opCtx);
             backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
