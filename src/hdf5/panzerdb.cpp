@@ -805,6 +805,7 @@ void PanzerDB::flush() {
     data_buffer_c128.clear();
     paths_buffer.clear();
     parent_paths_buffer.clear();
+    leaves_cache_valid = false;
     
 }
 
@@ -2087,6 +2088,10 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
 
   // 1. Find root AoS meta-node
   const Leaf *aos_root_leaf = nullptr;
+
+  //dumpLeavesCache();
+  printf("level_name: '%s'\n", level_name.c_str());
+
   
   // OPTIMISATION: Utiliser leaf_lookup
   auto it_root = leaf_lookup.find(std::string_view(level_name));
@@ -2119,6 +2124,8 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       // No data children found, but AoS exists. Size is 0.
       shapes.push_back(0);
     }
+    printf("Dynamic AoS detected. max_time_index: %lld, inferred size: %zu\n", max_time_index, shapes[0]);
+
     return shapes;
   }
 
@@ -2162,7 +2169,7 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       shapes.push_back(0); // Case where even meta-node has no shape (should not happen for an AoS)
     }
   }
-
+  printf("Static AoS detected. max_index: %lld, inferred size: %zu\n", max_index, shapes[0]);
   return shapes;
 }
 

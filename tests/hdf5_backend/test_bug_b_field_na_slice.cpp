@@ -67,7 +67,7 @@ int main() {
                 int r_size[] = {R_SIZE};
                 // Note: "field_map" and "grid" are structures, so we write "field_map/grid/r" directly from time_slice context
                 // The timebasename "time" links this data to the time vector defined for each slice of the parent AoS.
-                backend.writeData(&timeSliceCtx, "field_map/grid/r", "time", r_data.data(), alconst::double_data, r_dim, r_size);
+                backend.writeData(&timeSliceCtx, "field_map/grid/r", "", r_data.data(), alconst::double_data, r_dim, r_size);
 
                 if (t < TIME_STEPS - 1) timeSliceCtx.nextIndex(1);
             }

@@ -195,24 +195,24 @@ public:
 
 std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
     std::vector<double> time_values;
-    std::cerr << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
+    //std::cerr << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
 
     if (homogeneous_time == 1) {
         time_values = panzer_db_ptr->getWholeDynamicSignal("time");
-        std::cerr << "[DEBUG getTimeValues] getWholeDynamicSignal('time') returned size: " << time_values.size() << std::endl;
+        //std::cerr << "[DEBUG getTimeValues] getWholeDynamicSignal('time') returned size: " << time_values.size() << std::endl;
         return time_values;
     }
 
     // --- Logique pour homogeneous_time == 0 ---
 
     if (ctx == nullptr) {
-        std::cerr << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
+        //std::cerr << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
         return time_values; // Return empty vector
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
     if (!arrCtx) { // Cas où le contexte est OperationContext
-        std::cerr << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
+        //std::cerr << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
         time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback pour le temps racine
         return time_values;
     }
@@ -226,13 +226,13 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
     // In this case, the time vector is also static relative to the current context.
     if (!timed_ctx) {
-        std::cerr << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
+        //std::cerr << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
         if (!timebasename.empty()) {
             const PanzerDB::Leaf* leaf = find_leaf_for_context(ctx, timebasename, "", 0);
             if (leaf && leaf->count > 0) {
                 time_values.resize(leaf->count);
                 panzer_db_ptr->readTensor(*leaf, time_values.data());
-                std::cerr << "[DEBUG getTimeValues] Found static timebase leaf, size: " << time_values.size() << std::endl;
+                //std::cerr << "[DEBUG getTimeValues] Found static timebase leaf, size: " << time_values.size() << std::endl;
                 return time_values;
             }
         }
@@ -245,7 +245,13 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
     std::string timed_aos_path = getPath(timed_ctx, false);
     std::string timebase_name_str = timed_ctx->getTimebasePath();
-    std::cerr << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase name '" << timebase_name_str << "'" << std::endl;
+
+    // If timebase path is absolute (e.g. "time_slice/time") and we are inside the AoS ("time_slice"),
+    // we need the relative path ("time") to find the leaf inside the AoS instance.
+    if (!timed_aos_path.empty() && timebase_name_str.rfind(timed_aos_path + "/", 0) == 0) {
+        timebase_name_str = timebase_name_str.substr(timed_aos_path.length() + 1);
+    }
+    //std::cerr << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase name '" << timebase_name_str << "'" << std::endl;
 
     for (const auto& leaf : leaves) {
         // The full_timebase_path is a "generic" path like "time_slice/time".
@@ -261,14 +267,14 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
                 std::string_view leaf_name = leaf.path.substr(last_slash + 1);
                 if (leaf_name == timebase_name_str && !leaf.is_empty) {
                     time_leaves_map[leaf.time_index] = &leaf;
-                    std::cerr << "[DEBUG getTimeValues] Found time leaf: " << leaf.path << " with time_index=" << leaf.time_index << std::endl;
+                    //std::cerr << "[DEBUG getTimeValues] Found time leaf: " << leaf.path << " with time_index=" << leaf.time_index << std::endl;
                 }
             }
         }
     }
-    if (time_leaves_map.empty()) {
+    /*if (time_leaves_map.empty()) {
         std::cerr << "[DEBUG getTimeValues] No time leaves found for this context." << std::endl;
-    }
+    }*/
 
     // Lire les valeurs dans l'ordre des time_index
     for (const auto& [time_idx, leaf_ptr] : time_leaves_map) {
@@ -276,14 +282,14 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
-            std::cerr << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
+            //std::cerr << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
-    printf("timebasename = %s\n ", timebasename.c_str());
-    printf("homogeneous_time = %d\n", homogeneous_time);
-    panzer_db_ptr->dumpLeavesCache();
+    //printf("timebasename = %s\n ", timebasename.c_str());
+    //printf("homogeneous_time = %d\n", homogeneous_time);
+    //panzer_db_ptr->dumpLeavesCache();
 
-    std::cerr << "[DEBUG getTimeValues] Final time_values size: " << time_values.size() << std::endl;
+    //std::cerr << "[DEBUG getTimeValues] Final time_values size: " << time_values.size() << std::endl;
     return time_values;
 }
 
@@ -345,19 +351,6 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     }
 
     std::string result = path_stream.str();
-
-    // 1. Si la chaîne est déjà "time", on la renvoie telle quelle.
-    // 2. Si la chaîne est vide (aucun segment), on renvoie "time".
-    // 3. Sinon, on ajoute le suffixe "/time".
-    /*if (result == "time") {
-        return result;
-    } else if (result.empty()) {
-        return "time";
-    } else {
-        return result + "/time";
-    }*/
-
-    //printf("getPath::result = %s\n ", result.c_str());
 
     return result;
 }

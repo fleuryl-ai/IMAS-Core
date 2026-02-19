@@ -57,11 +57,6 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
     } else {
         throw ALBackendException("Unkwown operation context range mode", LOG);
     }
-
-    // ✅ OPTIMISATION: Vider le cache de chemin de contexte car on change de groupe/stratégie
-    // read_strategy->clearContextPathCache(); // -> Méthode à ajouter dans IReadStrategy
-
-    // L'appel à build_path_index() est maintenant dans le constructeur de IReadStrategy.
 }
 
 void HDF5Reader_v2::close_group(OperationContext *ctx)

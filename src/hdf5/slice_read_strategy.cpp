@@ -73,6 +73,7 @@ void SliceReadStrategy::endAction(Context *ctx) {
         //printf("GlobalReadStrategy::endAction called for OperationContext\n");
         //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
+
     }
   else{
   }

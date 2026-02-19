@@ -78,8 +78,12 @@ int main() {
 
                 for (int c = 0; c < cs_size; ++c) {
                     // Write some dummy data
-                    double r_val = 10.0 * t + c;
-                    backend.writeData(&controlSurfaceCtx, "r", "", &r_val, alconst::double_data, 0, nullptr);
+                    const int R_CS_SIZE = 3;
+                    std::vector<double> r_cs_values(R_CS_SIZE);
+                    for(int k=0; k<R_CS_SIZE; ++k) r_cs_values[k] = (double)(t * 100 + c * 10 + k);
+                    int r_cs_dim = 1;
+                    int r_cs_size[] = {R_CS_SIZE};
+                    backend.writeData(&controlSurfaceCtx, "r", "", r_cs_values.data(), alconst::double_data, r_cs_dim, r_cs_size);
                     if (c < cs_size - 1) controlSurfaceCtx.nextIndex(1);
                 }
                 backend.endAction(&controlSurfaceCtx);
@@ -123,47 +127,45 @@ int main() {
             DataEntryContext dataEntryCtx(URI);
             HDF5Backend backend;
             backend.openPulse(&dataEntryCtx, OPEN_PULSE);
-
-            double target_time = 0.1; // Corresponds to index 1 in our time vector
-            int target_time_idx = 1;
-
-            std::cout << "Attempting to read slice at t=" << target_time << "...\n";
-            OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::closest_interp);
-            backend.beginAction(&opCtx);
-
-            // Dynamic AoS: time_slice
-            ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
-            int ts_size_read = 0;
-            backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
-            assert(ts_size_read == 1); // In slice mode, the dynamic AoS has size 1
-
-            // Static AoS: control_surface
-            ArraystructContext controlSurfaceCtx(&timeSliceCtx, "control_surface", "");
-            int cs_size_read = 0;
-            backend.beginArraystructAction(&controlSurfaceCtx, &cs_size_read);
             
-            std::cout << "Size of nested static AoS 'control_surface' read from slice: " << cs_size_read << "\n";
-            std::cout << "Expected correct size: " << CONTROL_SURFACE_SIZE << "\n";
-            std::cout << "Expected bug size (from t=0): " << BUG_TRIGGER_SIZE << "\n";
+            for (int t_idx = 0; t_idx < TIME_SLICE_SIZE; ++t_idx) {
+                double target_time = t_idx * 0.1;
+                int expected_size = (t_idx == 0) ? BUG_TRIGGER_SIZE : CONTROL_SURFACE_SIZE;
 
-            if (cs_size_read == BUG_TRIGGER_SIZE) {
-                std::cout << RED << ">>> BUG REPRODUCED SUCCESSFULLY <<<\n";
-                std::cout << "    Read " << cs_size_read << " elements for 'control_surface', but expected " << CONTROL_SURFACE_SIZE << ".\n" << RESET;
+                std::cout << "Attempting to read slice at t=" << target_time << "...\n";
+                OperationContext opCtx(&dataEntryCtx, "b_field_non_axisymmetric", READ_OP, alconst::slice_op, target_time, alconst::closest_interp);
+                backend.beginAction(&opCtx);
+
+                // Dynamic AoS: time_slice
+                ArraystructContext timeSliceCtx(&opCtx, "time_slice", "time");
+                int ts_size_read = 0;
+                backend.beginArraystructAction(&timeSliceCtx, &ts_size_read);
+                assert(ts_size_read == 1); // In slice mode, the dynamic AoS has size 1
+
+                // Static AoS: control_surface
+                ArraystructContext controlSurfaceCtx(&timeSliceCtx, "control_surface", "");
+                int cs_size_read = 0;
+                backend.beginArraystructAction(&controlSurfaceCtx, &cs_size_read);
+                
+                std::cout << "Size of nested static AoS 'control_surface' read from slice: " << cs_size_read << "\n";
+                std::cout << "Expected correct size: " << expected_size << "\n";
+
+                if (cs_size_read != expected_size) {
+                    std::cout << RED << ">>> BUG DETECTED or UNEXPECTED SIZE at t=" << target_time << " <<<\n";
+                    std::cout << "    Read " << cs_size_read << " elements for 'control_surface', but expected " << expected_size << ".\n" << RESET;
+                    backend.endAction(&controlSurfaceCtx);
+                    backend.endAction(&timeSliceCtx);
+                    backend.endAction(&opCtx);
+                    backend.closePulse(&dataEntryCtx, OPEN_PULSE);
+                    return 1;
+                } else {
+                     std::cout << GREEN << ">>> TEST PASSED for t=" << target_time << ": Size is correct (" << cs_size_read << ").\n" << RESET;
+                }
+
                 backend.endAction(&controlSurfaceCtx);
                 backend.endAction(&timeSliceCtx);
                 backend.endAction(&opCtx);
-                backend.closePulse(&dataEntryCtx, OPEN_PULSE);
-                return 0; // Test succeeds by reproducing the bug
-            } else if (cs_size_read == CONTROL_SURFACE_SIZE) {
-                 std::cout << GREEN << ">>> TEST PASSED: Size is correct (" << cs_size_read << "). The bug is not reproduced.\n" << RESET;
-            } else {
-                std::cerr << RED << ">>> UNEXPECTED RESULT: Read size is " << cs_size_read << ". Neither correct nor the expected bug size.\n" << RESET;
-                return 1;
             }
-
-            backend.endAction(&controlSurfaceCtx);
-            backend.endAction(&timeSliceCtx);
-            backend.endAction(&opCtx);
             backend.closePulse(&dataEntryCtx, OPEN_PULSE);
         }
 

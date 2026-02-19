@@ -71,20 +71,6 @@ void HDF5Writer_v2::setWriteStrategy(int write_mode, hid_t loc_id) {
   }
 }
 
-/*void HDF5Writer_v2::create_IDS_group(
-    OperationContext *ctx, hid_t file_id,
-    std::unordered_map<std::string, hid_t> &opened_IDS_files,
-    std::string &files_directory, std::string &relative_file_path,
-    int access_mode, hid_t* loc_id) {
-  
-  // Call the base class implementation to do the actual group creation/opening
-  HDF5Writer::create_IDS_group(ctx, file_id, opened_IDS_files, files_directory,
-                               relative_file_path, access_mode, loc_id);
-  
-  // Now that we have a valid group ID in *loc_id, create the PanzerDB instance.
-  // This was the logic that was incorrectly placed before.
-}*/
-
 void HDF5Writer_v2::beginWriteArraystructAction(ArraystructContext *ctx,
                                              int *size) {
   HDF5Utils hdf5_utils;
@@ -583,8 +569,9 @@ void HDF5Writer_v2::endAction(Context *ctx) {
     
   } else if (ctx->getType() == CTX_OPERATION_TYPE) {
     //printf("HDF5Writer_v2::endAction called for OperationContext, calling flush()\n");
-    if (panzer_db_ptr) panzer_db_ptr->getLeaves();
+
     if (panzer_db_ptr) panzer_db_ptr->flush();
+    if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache();
     if (panzer_db_ptr) panzer_db_ptr->close();
   }
 }

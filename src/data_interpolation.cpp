@@ -104,12 +104,12 @@ int DataInterpolation::getSlicesTimesIndices(double requested_time, const std::v
         throw ALBackendException("Unexpected time vector with size 0", LOG); 
     }
 
-    printf("DataInterpolation::getSlicesTimesIndices::requested_time=%f\n", requested_time);
+    /*printf("DataInterpolation::getSlicesTimesIndices::requested_time=%f\n", requested_time);
     printf("time_vector.size()=%d\n", time_vector.size());
 
     for (int i = 0; i < time_vector.size(); i++){
         printf("t[%i] = %f\n  ", i, time_vector[i] );
-    } 
+    } */
 
     //printf("DataInterpolation::getSlicesTimesIndices::interp=%d\n", interp);
     if ((interp != alconst::undefined_interp) && (interp != CLOSEST_INTERP && interp != PREVIOUS_INTERP && interp != LINEAR_INTERP))
