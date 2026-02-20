@@ -249,9 +249,9 @@ void PanzerDB::readChunkingConfig() {
     
     H5Pclose(dcpl);
     
-    std::cout << "[PanzerDB] Read chunking config from file:" << std::endl;
+    /*std::cout << "[PanzerDB] Read chunking config from file:" << std::endl;
     std::cout << "  Data chunk (f64): " << chunk_config.data_chunk_f64 << " elements" << std::endl;
-    std::cout << "  Compression: " << (chunk_config.enable_compression ? "enabled" : "disabled") << std::endl;
+    std::cout << "  Compression: " << (chunk_config.enable_compression ? "enabled" : "disabled") << std::endl;*/
 }
 
 // ============================================================================
@@ -300,9 +300,9 @@ void PanzerDB::configureReadCache() {
 
     H5Pclose(dapl);
 
-    std::cout << "[PanzerDB] Read cache configured (DAPL applied to datasets):" << std::endl;
+    /*std::cout << "[PanzerDB] Read cache configured (DAPL applied to datasets):" << std::endl;
     std::cout << "  Chunk cache: " << (chunk_config.chunk_cache_size / 1024 / 1024) << " MB" << std::endl;
-    std::cout << "  Cache slots: " << chunk_config.chunk_cache_nslots << std::endl;
+    std::cout << "  Cache slots: " << chunk_config.chunk_cache_nslots << std::endl;*/
 }
 
 // ============================================================================
@@ -371,12 +371,12 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.compression_level = 1;
     }
     
-    std::cout << "[PanzerDB] Chunking configured for: " << usage_hint << std::endl;
+    /*std::cout << "[PanzerDB] Chunking configured for: " << usage_hint << std::endl;
     std::cout << "  Index chunk: " << chunk_config.index_chunk_rows << " rows" << std::endl;
     std::cout << "  Data chunk (f64): " << chunk_config.data_chunk_f64 
               << " elements (" << (chunk_config.data_chunk_f64 * 8 / 1024) << " KB)" << std::endl;
     std::cout << "  Compression: " << (chunk_config.enable_compression ? "enabled" : "disabled")
-              << " (level " << chunk_config.compression_level << ")" << std::endl;
+              << " (level " << chunk_config.compression_level << ")" << std::endl; */
 }
 
 // ============================================================================
@@ -2089,8 +2089,7 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
   // 1. Find root AoS meta-node
   const Leaf *aos_root_leaf = nullptr;
 
-  //dumpLeavesCache();
-  printf("level_name: '%s'\n", level_name.c_str());
+  //printf("level_name: '%s'\n", level_name.c_str());
 
   
   // OPTIMISATION: Utiliser leaf_lookup
@@ -2124,7 +2123,7 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       // No data children found, but AoS exists. Size is 0.
       shapes.push_back(0);
     }
-    printf("Dynamic AoS detected. max_time_index: %lld, inferred size: %zu\n", max_time_index, shapes[0]);
+    //printf("Dynamic AoS detected. max_time_index: %lld, inferred size: %zu\n", max_time_index, shapes[0]);
 
     return shapes;
   }
@@ -2169,7 +2168,7 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       shapes.push_back(0); // Case where even meta-node has no shape (should not happen for an AoS)
     }
   }
-  printf("Static AoS detected. max_index: %lld, inferred size: %zu\n", max_index, shapes[0]);
+  //printf("Static AoS detected. max_index: %lld, inferred size: %zu\n", max_index, shapes[0]);
   return shapes;
 }
 
@@ -2844,13 +2843,13 @@ int PanzerDB::readInterpolatedData(
                          void** data_out,
                          bool expect_time_dim) {
 
-    printf("[PanzerDB::readInterpolatedData] ENTER for path: %s, time: %f\n", 
-           full_data_path, time);
+    //printf("[PanzerDB::readInterpolatedData] ENTER for path: %s, time: %f\n", 
+    //       full_data_path, time);
 
     DataInterpolation data_interpolation_component;
     std::map<std::string, int> times_indices;
 
-    printf("--> Time basis size: %zu\n", time_basis.size());
+    //printf("--> Time basis size: %zu\n", time_basis.size());
     int slice_index = data_interpolation_component.getSlicesTimesIndices(time, time_basis, times_indices, interp_mode);
 
     auto read_slice_with_fallback = [&](int64_t idx, void** out_ptr) -> int {

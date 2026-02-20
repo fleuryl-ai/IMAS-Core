@@ -94,8 +94,8 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         return status;  
      }                                  
 
-    printf("SliceReadStrategy::read_ND_Data called for dataset '%s' with timebasename='%s' and homogeneous_time=%d\n", 
-           dataset_name.c_str(), timebasename.c_str(), homogeneous_time);
+    //printf("SliceReadStrategy::read_ND_Data called for dataset '%s' with timebasename='%s' and homogeneous_time=%d\n", 
+    //       dataset_name.c_str(), timebasename.c_str(), homogeneous_time);
     std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
 
     double time;
@@ -132,8 +132,6 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
     //const char* full_path = "A/0/B/0/C/0/D/0/tensor";
     std::string full_path = buildFullPath(ctx, dataset_name);
     const char* c_full_path = full_path.c_str();
-
-    printf("!!!!!Requesting interpolated data for full_path='%s' at time=%f with interp_mode=%d\n", c_full_path, time, interp);
 
     int res = panzer_db_ptr->readInterpolatedData(
         c_full_path,
