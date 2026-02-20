@@ -357,6 +357,7 @@ public:
     void close();
 
     const std::vector<Leaf>& getLeaves() const;
+    const std::vector<std::string>& getDynamicAOSRoots() const { return cached_dynamic_aos_roots; }
     std::vector<size_t> getAOSShape(const std::string& level_name) const;
     size_t getCurrentTotalSize(const std::string& level_name) const;
     int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
