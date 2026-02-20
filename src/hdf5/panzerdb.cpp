@@ -2844,11 +2844,13 @@ int PanzerDB::readInterpolatedData(
                          void** data_out,
                          bool expect_time_dim) {
 
-    //printf("[PanzerDB::readInterpolatedData] ENTER for path: %s, time: %f\n", 
-    //       full_data_path, time);
+    printf("[PanzerDB::readInterpolatedData] ENTER for path: %s, time: %f\n", 
+           full_data_path, time);
 
     DataInterpolation data_interpolation_component;
     std::map<std::string, int> times_indices;
+
+    printf("--> Time basis size: %zu\n", time_basis.size());
     int slice_index = data_interpolation_component.getSlicesTimesIndices(time, time_basis, times_indices, interp_mode);
 
     auto read_slice_with_fallback = [&](int64_t idx, void** out_ptr) -> int {
