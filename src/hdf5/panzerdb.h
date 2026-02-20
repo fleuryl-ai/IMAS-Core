@@ -360,6 +360,7 @@ public:
     const std::vector<std::string>& getDynamicAOSRoots() const { return cached_dynamic_aos_roots; }
     std::vector<size_t> getAOSShape(const std::string& level_name) const;
     size_t getCurrentTotalSize(const std::string& level_name) const;
+    size_t getDynamicAOSSize(const std::string& aos_path) const;
     int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
     bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
     //uint64_t getCurrentTime() const { return global_time; }

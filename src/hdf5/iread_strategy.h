@@ -280,18 +280,35 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             }
         }
     } else {
-        // 2. Fallback : Scan linéaire (Pour le cas Inhomogène fragmenté ou chemins complexes)
-        //    On cherche toutes les feuilles qui sont sous "AoS_Path" et qui se terminent par "time".
-        //    Ex: "AoS_Path/0/time", "AoS_Path/1/time"...
-        for (const auto& leaf : leaves) {
-            // Vérifie si le parent commence par le chemin de l'AoS
-            if (leaf.parent_path.rfind(timed_aos_path, 0) == 0) {
-                // Vérifie si le nom de la feuille correspond à la base de temps
-                size_t last_slash = leaf.path.find_last_of('/');
-                if (last_slash != std::string::npos) {
-                    std::string_view leaf_name = leaf.path.substr(last_slash + 1);
-                    if (leaf_name == timebase_basename && !leaf.is_empty) {
-                        time_leaves_map[leaf.time_index] = &leaf;
+        // 2. Fallback Optimisé : Itération par index (au lieu de scan linéaire)
+        // On utilise la taille connue de l'AoS pour générer les chemins probables.
+        size_t aos_size = panzer_db_ptr->getDynamicAOSSize(timed_aos_path);
+        
+        if (aos_size > 0) {
+            for (size_t i = 0; i < aos_size; ++i) {
+                // Construct path: AoS/i/time
+                // Note: timebase_name_str est déjà relatif à l'AoS (ex: "time" ou "nested/time")
+                std::string slice_tb_path = timed_aos_path + "/" + std::to_string(i) + "/" + timebase_name_str;
+                
+                auto it = path_cache.find(slice_tb_path);
+                if (it != path_cache.end()) {
+                    for (const auto* leaf : it->second) {
+                        if (!leaf->is_empty) {
+                            time_leaves_map[leaf->time_index] = leaf;
+                        }
+                    }
+                }
+            }
+        } else {
+            // 3. Dernier recours : Scan linéaire (si taille inconnue, ex: cas statique complexe)
+            for (const auto& leaf : leaves) {
+                if (leaf.parent_path.rfind(timed_aos_path, 0) == 0) {
+                    size_t last_slash = leaf.path.find_last_of('/');
+                    if (last_slash != std::string::npos) {
+                        std::string_view leaf_name = leaf.path.substr(last_slash + 1);
+                        if (leaf_name == timebase_basename && !leaf.is_empty) {
+                            time_leaves_map[leaf.time_index] = &leaf;
+                        }
                     }
                 }
             }

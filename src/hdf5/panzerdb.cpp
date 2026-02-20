@@ -2177,6 +2177,14 @@ size_t PanzerDB::getCurrentTotalSize(const std::string& level) const {
     return std::accumulate(v.begin(), v.end(), size_t(0));
 }
 
+size_t PanzerDB::getDynamicAOSSize(const std::string& aos_path) const {
+    auto it = aos_time_counters.find(aos_path);
+    if (it != aos_time_counters.end()) {
+        return static_cast<size_t>(it->second);
+    }
+    return 0;
+}
+
 int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const {
     // 1. Retrieve all index leaves.
     const auto& leaves = getLeaves();
