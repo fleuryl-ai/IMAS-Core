@@ -39,6 +39,7 @@ protected:
     // Valeur: Chemin pré-calculé
     mutable std::unordered_map<Context*, std::string> context_path_cache;
     std::unique_ptr<PanzerDB> panzer_db_ptr;
+    std::unordered_map<std::string, std::vector<double>> time_values_cache;
 
 public:
     IReadStrategy(hid_t loc_id) {
@@ -204,8 +205,12 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     }
 
     if (homogeneous_time == 1) {
+        if (time_values_cache.count("HOMOGENEOUS_TIME")) {
+            return time_values_cache["HOMOGENEOUS_TIME"];
+        }
         time_values = panzer_db_ptr->getWholeDynamicSignal("time");
         std::cout << "[DEBUG getTimeValues] getWholeDynamicSignal('time') returned size: " << time_values.size() << std::endl;
+        time_values_cache["HOMOGENEOUS_TIME"] = time_values;
         return time_values;
     }
 
@@ -263,6 +268,11 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     size_t last_slash_tb = timebase_name_str.find_last_of('/');
     if (last_slash_tb != std::string::npos) {
         timebase_basename = timebase_name_str.substr(last_slash_tb + 1);
+    }
+
+    std::string cache_key = timed_aos_path + "/" + timebase_basename;
+    if (time_values_cache.count(cache_key)) {
+        return time_values_cache[cache_key];
     }
     std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
 
@@ -325,6 +335,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
         }
     }
     printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
+    time_values_cache[cache_key] = time_values;
     return time_values;
 }
 
