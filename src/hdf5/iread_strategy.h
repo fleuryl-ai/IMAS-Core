@@ -266,23 +266,32 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     }
     std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
 
-    // OPTIMISATION: Au lieu de scanner toutes les feuilles (leaves), on scanne seulement les racines d'AoS dynamiques
-    // et on utilise le path_cache pour trouver la feuille de temps.
-    const auto& aos_roots = panzer_db_ptr->getDynamicAOSRoots();
-    std::string prefix = timed_aos_path + "/";
+    // STRATÉGIE HYBRIDE :
+    // 1. Tentative d'accès direct (Optimisation si la base de temps est stockée en un seul bloc sous l'AoS)
+    //    On cherche "AoS_Path/time".
+    std::string direct_tb_path = timed_aos_path + "/" + timebase_basename;
+    auto it_cache = path_cache.find(direct_tb_path);
     
-    for (const auto& root_path : aos_roots) {
-        // Vérifier si cette racine correspond à notre AoS dynamique (ex: "profiles_1d/0" commence par "profiles_1d/")
-        if (root_path.rfind(prefix, 0) == 0) {
-            // Construire le chemin complet de la base de temps pour cette instance (ex: "profiles_1d/0/time")
-            std::string tb_path = root_path + "/" + timebase_basename;
-            
-            // Recherche rapide dans le cache
-            auto it = path_cache.find(tb_path);
-            if (it != path_cache.end()) {
-                for (const auto* leaf : it->second) {
-                    if (!leaf->is_empty) {
-                        time_leaves_map[leaf->time_index] = leaf;
+    if (it_cache != path_cache.end() && !it_cache->second.empty()) {
+        // Cas Homogène trouvé dans le cache !
+        for (const auto* leaf : it_cache->second) {
+            if (!leaf->is_empty) {
+                time_leaves_map[leaf->time_index] = leaf;
+            }
+        }
+    } else {
+        // 2. Fallback : Scan linéaire (Pour le cas Inhomogène fragmenté ou chemins complexes)
+        //    On cherche toutes les feuilles qui sont sous "AoS_Path" et qui se terminent par "time".
+        //    Ex: "AoS_Path/0/time", "AoS_Path/1/time"...
+        for (const auto& leaf : leaves) {
+            // Vérifie si le parent commence par le chemin de l'AoS
+            if (leaf.parent_path.rfind(timed_aos_path, 0) == 0) {
+                // Vérifie si le nom de la feuille correspond à la base de temps
+                size_t last_slash = leaf.path.find_last_of('/');
+                if (last_slash != std::string::npos) {
+                    std::string_view leaf_name = leaf.path.substr(last_slash + 1);
+                    if (leaf_name == timebase_basename && !leaf.is_empty) {
+                        time_leaves_map[leaf.time_index] = &leaf;
                     }
                 }
             }
