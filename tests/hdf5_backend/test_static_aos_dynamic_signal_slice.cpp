@@ -48,7 +48,7 @@ int main() {
             backend.beginAction(&opCtx);
 
             if (t == 0) {
-                int homogeneous_time = 1;
+                int homogeneous_time = 0;
                 backend.writeData(&opCtx, "ids_properties/homogeneous_time", "", &homogeneous_time, alconst::integer_data, 0, nullptr);
             }
 
