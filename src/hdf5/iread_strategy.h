@@ -12,6 +12,7 @@
 #include <cstring>
 #include <complex>
 #include "al_defs.h"
+#include <set>
 
 // Forward declarations
 class Context;
@@ -40,11 +41,16 @@ protected:
     mutable std::unordered_map<Context*, std::string> context_path_cache;
     std::unique_ptr<PanzerDB> panzer_db_ptr;
     std::unordered_map<std::string, std::vector<double>> time_values_cache;
+    
+    // Cache pour la sanitization des chemins (Context + Path -> Sanitized Path)
+    mutable std::map<std::pair<Context*, std::string>, std::string> sanitized_path_cache;
+    mutable std::set<std::string> schema_aos_paths; // Cache des chemins d'AoS "schéma" (sans indices)
 
 public:
     IReadStrategy(hid_t loc_id) {
         panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::READ);
         build_path_index(); // Construire l'index juste après l'initialisation de PanzerDB
+        build_aos_schema_index();
     } 
     virtual void beginReadArraystructAction(ArraystructContext * ctx, int *size) = 0;
     virtual void endAction(Context * ctx) = 0;
@@ -81,6 +87,159 @@ public:
         DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths.");
     }
 
+    void build_aos_schema_index() {
+        schema_aos_paths.clear();
+        if (!panzer_db_ptr) return;
+        
+        const auto& leaves = panzer_db_ptr->getLeaves();
+        for (const auto& leaf : leaves) {
+            if (leaf.flags != 2 && leaf.flags != 3) continue; // Keep only AoS (Static=2, Dynamic=3)
+            std::string root(leaf.path);
+            // Convertir "A/0/B/0/C" -> "A/B/C"
+            std::string schema_path;
+            std::stringstream ss(root);
+            std::string segment;
+            while (std::getline(ss, segment, '/')) {
+                // Si le segment est numérique, on l'ignore (c'est un index)
+                if (segment.empty() || std::all_of(segment.begin(), segment.end(), ::isdigit)) {
+                    continue;
+                }
+                if (!schema_path.empty()) schema_path += "/";
+                schema_path += segment;
+            }
+            schema_aos_paths.insert(schema_path);
+        }
+    }
+
+    std::string sanitize_path(Context* ctx, const std::string& path) {
+        if (path.empty()) return "";
+        
+        // 1. Vérifier le cache
+        auto cache_key = std::make_pair(ctx, path);
+        if (sanitized_path_cache.count(cache_key)) {
+            return sanitized_path_cache[cache_key];
+        }
+
+        // 2. Construire le chemin "schéma" cible (sans indices)
+        // On part du contexte courant pour avoir le préfixe
+        std::string context_schema_prefix = "";
+        Context* curr = ctx;
+        std::vector<std::string> segments;
+        while (curr && curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
+            ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
+            std::string full = arr->getPath();
+            std::string node;
+            
+            // Logique robuste pour extraire le nom local (comme dans HDF5Writer)
+            Context* parent = arr->getParent();
+            if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
+                std::string parent_path = parent_arr->getPath();
+                if (full.size() > parent_path.size() && full.rfind(parent_path + "/", 0) == 0) {
+                    node = full.substr(parent_path.size() + 1);
+                } else {
+                    node = full;
+                }
+            } else {
+                node = full;
+            }
+            
+            std::replace(node.begin(), node.end(), '/', '&'); // Les noms d'AoS peuvent contenir &
+            segments.insert(segments.begin(), node);
+            curr = arr->getParent();
+        }
+        for (const auto& s : segments) {
+            if (!context_schema_prefix.empty()) context_schema_prefix += "/";
+            context_schema_prefix += s;
+        }
+
+        // Gérer le chemin d'entrée (relatif ou absolu)
+        std::string target_schema_path = context_schema_prefix;
+        std::string input_path = path;
+        
+        if (!path.empty() && path[0] == '/') { // Absolu
+            target_schema_path = input_path.substr(1); // Enlever le / initial
+            input_path = input_path.substr(1);
+            context_schema_prefix = ""; // On ignore le contexte pour un chemin absolu
+        } else {
+            if (!target_schema_path.empty()) target_schema_path += "/";
+            target_schema_path += input_path;
+        }
+
+        // 3. Trouver le plus long préfixe qui correspond à un AoS connu
+        // On cherche dans schema_aos_paths un chemin S tel que target_schema_path commence par S (fuzzy match / vs &)
+        std::string best_aos_match = "";
+        std::string best_aos_match_slashed = "";
+
+        for (const auto& known_aos : schema_aos_paths) {
+            // Convertir known_aos (qui a des &) en version avec / pour comparer
+            std::string known_slashed = known_aos;
+            std::replace(known_slashed.begin(), known_slashed.end(), '&', '/');
+
+            // Vérifier si target commence par known_slashed OU known_aos (pour gérer les & déjà présents)
+            bool match_slashed = (target_schema_path == known_slashed || 
+                (target_schema_path.size() > known_slashed.size() && 
+                 target_schema_path.compare(0, known_slashed.size(), known_slashed) == 0 &&
+                 target_schema_path[known_slashed.size()] == '/'));
+
+            bool match_original = (target_schema_path == known_aos || 
+                (target_schema_path.size() > known_aos.size() && 
+                 target_schema_path.compare(0, known_aos.size(), known_aos) == 0 &&
+                 target_schema_path[known_aos.size()] == '/'));
+
+            if (match_slashed || match_original) {
+                
+                if (known_aos.size() > best_aos_match.size()) {
+                    best_aos_match = known_aos;
+                }
+            }
+        }
+
+        // 4. Construire le résultat
+        // Partie AoS (avec & provenant de la définition de l'AoS)
+        std::string result = best_aos_match;
+        
+        // Partie restante (structures/feuilles) -> Remplacer / par &
+        std::string remainder = "";
+        if (!best_aos_match.empty()) {
+            if (target_schema_path.size() > best_aos_match.size()) {
+                remainder = target_schema_path.substr(best_aos_match.size() + 1);
+            }
+        } else {
+            remainder = target_schema_path;
+        }
+
+        if (!remainder.empty()) {
+            std::replace(remainder.begin(), remainder.end(), '/', '&');
+            if (!result.empty()) result += "/"; // Séparateur entre le dernier AoS et le reste
+            result += remainder;
+        }
+
+        // 5. Retirer le préfixe du contexte pour revenir à un chemin relatif si nécessaire
+        // (Note: PanzerDB attend souvent un chemin relatif au contexte pour certaines opérations, 
+        // mais ici on veut surtout formater correctement les & et /).
+        // Si l'entrée était relative, on essaie de renvoyer du relatif si possible, 
+        // mais avec la substitution correcte.
+        // Pour simplifier et vu l'usage dans read_ND_Data, on renvoie le chemin "corrigé" 
+        // qui correspond à la structure HDF5 (AoS/AoS/struct&leaf).
+        // Si le contexte était A/B et on a trouvé A/B/C&D, on renvoie C&D.
+        
+        if (!context_schema_prefix.empty() && !path.empty() && path[0] != '/') {
+             std::string sanitized_context_prefix;
+             for (const auto& s : segments) {
+                if (!sanitized_context_prefix.empty()) sanitized_context_prefix += "/";
+                sanitized_context_prefix += s;
+             }
+
+             if (!sanitized_context_prefix.empty() && result.rfind(sanitized_context_prefix + "/", 0) == 0) {
+                 result = result.substr(sanitized_context_prefix.length() + 1);
+             }
+        }
+
+        sanitized_path_cache[cache_key] = result;
+
+        return result;
+    }
 
     const PanzerDB::Leaf* find_leaf_for_context(Context* ctx, std::string_view dataset_name, std::string_view timebasename, int homogeneous_time) {
     DEBUG_PRINT("Searching for dataset '" << dataset_name << "' with timebasename='" << timebasename << "' and homogeneous_time=" << homogeneous_time);
@@ -196,13 +355,15 @@ public:
 
 std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
     std::vector<double> time_values;
-    //std::cout << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
+    std::cout << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
     //std::cout << "[DEBUG getTimeValues] Context type: " << (ctx ? std::to_string(ctx->getType()) : "nullptr") << std::endl;
 
     std::string timebasename_copy = timebasename;
     if (!timebasename_copy.empty() && timebasename_copy[0] == '/') {
         timebasename_copy.erase(0, 1); // Supprime 1 caractère à l'index 0
     }
+    // Utilisation de la sanitization intelligente
+    timebasename_copy = sanitize_path(ctx, timebasename_copy);
 
     if (homogeneous_time == 1) {
         if (time_values_cache.count("HOMOGENEOUS_TIME")) {
@@ -217,16 +378,16 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     // --- Logique pour homogeneous_time == 0 ---
     //std::cout << "[DEBUG getTimeValues] Searching for time values in dynamic AoS context." << std::endl;
     if (ctx == nullptr) {
-        //std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
+        std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
         return time_values; // Return empty vector
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
     if (!arrCtx) { // Cas où le contexte est OperationContext
         //panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
-        //std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
+        std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
         time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback pour le temps racine
-        //printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
+        printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
         return time_values;
     }
 
@@ -239,20 +400,22 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
     // In this case, the time vector is also static relative to the current context.
     if (!timed_ctx) {
-        //std::cout << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
+        std::cout << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
         if (!timebasename_copy.empty()) {
-            //const PanzerDB::Leaf* leaf = find_leaf_for_context(ctx, timebasename_copy, "", 0);
-            OperationContext* op_ctx = dynamic_cast<ArraystructContext*>(ctx)->getOperationContext(); //'time' is always at the OperationContext level for static AoS
-            const PanzerDB::Leaf* leaf = find_leaf_for_context(op_ctx, timebasename_copy, timebasename_copy, 0);
-            //printf("[DEBUG getTimeValues] Looking for static timebase with name '%s' in context. Leaf found: %s\n", timebasename_copy.c_str(), leaf ? "YES" : "NO");
-            if (leaf && leaf->count > 0) {
-                time_values.resize(leaf->count);
-                panzer_db_ptr->readTensor(*leaf, time_values.data());
-                //std::cout << "[DEBUG getTimeValues] Found static timebase leaf, size: " << time_values.size() << std::endl;
-                return time_values;
+            // For homogeneous_time=0, the timebase can be relative to the static AoS element,
+            // or fall back to a common timebase at the root of the IDS.
+
+            // 1. Try to find timebase relative to the current static AoS element.
+            std::string local_timebase_path = buildFullPath(ctx, timebasename_copy);
+            time_values = panzer_db_ptr->getWholeDynamicSignal(local_timebase_path);
+
+            // 2. If not found locally, fall back to the root timebase.
+            if (time_values.empty()) {
+                time_values = panzer_db_ptr->getWholeDynamicSignal(timebasename_copy);
             }
+            return time_values;
         }
-        //printf("[DEBUG getTimeValues] No timed parent context and no static timebase found. Returning empty time vector.\n");
+        printf("[DEBUG getTimeValues] No timed parent context and no static timebase found. Returning empty time vector.\n");
         return {}; // No timebase found
     }
 
@@ -260,6 +423,8 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
     std::string timed_aos_path = getPath(timed_ctx, false);
     std::string timebase_name_str = timed_ctx->getTimebasePath();
+    // Utilisation de la sanitization intelligente
+    timebase_name_str = sanitize_path(timed_ctx->getParent(), timebase_name_str);
 
     // Extract basename of timebase to handle both relative ("time") and absolute/generic ("path/to/time") paths
     std::string timebase_basename = timebase_name_str;
@@ -272,7 +437,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     if (time_values_cache.count(cache_key)) {
         return time_values_cache[cache_key];
     }
-    //std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
+    std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
 
     auto leaves = panzer_db_ptr->getLeaves();
 
@@ -331,10 +496,10 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
-            //std::cout << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
+            std::cout << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
-    //printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
+    printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
     time_values_cache[cache_key] = time_values;
     return time_values;
 }
