@@ -136,6 +136,8 @@ int DataInterpolation::getSlicesTimesIndices(double requested_time, const std::v
             }
             if (slice_sup > 0)
                 slice_inf = slice_sup - 1;
+            else
+                slice_inf = slice_sup;
             break;
         }
     }
