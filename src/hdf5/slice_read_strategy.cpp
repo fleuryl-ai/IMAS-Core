@@ -159,20 +159,20 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         // Heuristic: A scalar signal defined at the root or in a static AoS gets its dimension promoted when sliced,
         // but a scalar signal defined inside a dynamic AoS remains a scalar when sliced.
         bool is_dynamic = !timebasename.empty() || isTimedContext(ctx);
-        printf("[SliceReadStrategy] read_ND_Data: is_dynamic=%d, dataset='%s', timebasename='%s', root_name='%s', expected_time_dim=%d\n", 
-               is_dynamic, dataset_name.c_str(), timebasename.c_str(), root_name.c_str(), !isTimedContext(ctx));
-        // if (is_dynamic && *datatype != alconst::char_data) {
-        //     if (!isTimedContext(ctx)) {
-        //          size[*dim] = 1;
-        //          (*dim)++;
-        //     }
-        // }
+        //printf("[SliceReadStrategy] read_ND_Data: is_dynamic=%d, dataset='%s', timebasename='%s', root_name='%s', expected_time_dim=%d\n", 
+        //       is_dynamic, dataset_name.c_str(), timebasename.c_str(), root_name.c_str(), !isTimedContext(ctx));
+        if (is_dynamic && *datatype != alconst::char_data) {
+            if (!isTimedContext(ctx)) {
+                 size[*dim] = 1;
+                 (*dim)++;
+            }
+        }
         //printf("[SliceReadStrategy] read_ND_Data succeeded for dataset '%s' with time interpolation at t=%f\n", 
         //       dataset_name.c_str(), time);
         //printf(dim != nullptr ? "dim = %d\n" : "dim is nullptr\n", *dim);
         return 1;
     }
-    printf("[SliceReadStrategy] read_ND_Data failed for dataset '%s' with time interpolation at t=%f\n", 
-           dataset_name.c_str(), time);
+    //printf("[SliceReadStrategy] read_ND_Data failed for dataset '%s' with time interpolation at t=%f\n", 
+    //       dataset_name.c_str(), time);
     return 0;
 }

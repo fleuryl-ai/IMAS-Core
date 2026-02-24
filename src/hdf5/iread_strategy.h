@@ -112,56 +112,133 @@ public:
     }
 
     std::string sanitize_path(Context* ctx, const std::string& path) {
-        std::string fullPath = path;
-        if (fullPath.empty()) return "";
-        if (fullPath == "/time") return "time";
-        if (fullPath == "time") return fullPath;
+        if (path.empty()) return "";
+        if (path == "/time") return "time";
+        if (path == "time") return path;
         
         // 1. Vérifier le cache
         auto cache_key = std::make_pair(ctx, path);
         if (sanitized_path_cache.count(cache_key)) {
             return sanitized_path_cache[cache_key];
         }
-        if (!ctx) return fullPath;
 
-        std::vector<std::string> segmentsToAmper;
+        // 2. Construire le chemin "schéma" cible (sans indices)
+        // On part du contexte courant pour avoir le préfixe
+        std::string context_schema_prefix = "";
         Context* current = ctx;
-
-        // 1. Récupérer tous les segments qui doivent contenir des '&'
+        std::vector<std::string> segments;
         while (current != nullptr) {
             if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
                 ArraystructContext* arrCtx = static_cast<ArraystructContext*>(current);
                 std::string segment = arrCtx->getPath();
-                if (!segment.empty()) {
-                    segmentsToAmper.push_back(segment);
+                std::string node;
+
+                Context* parent = arrCtx->getParent();
+                if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                    ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
+                    std::string parent_path = parent_arr->getPath();
+                    if (segment.size() > parent_path.size() && segment.rfind(parent_path + "/", 0) == 0) {
+                        node = segment.substr(parent_path.size() + 1);
+                    } else {
+                        node = segment;
+                    }
+                } else {
+                    node = segment;
                 }
+
+                std::replace(node.begin(), node.end(), '/', '&');
+                segments.insert(segments.begin(), node);
                 current = arrCtx->getParent();
             } else {
                 current = nullptr;
             }
         }
-
-        // 2. Pour chaque segment, on cherche sa version avec '/' dans la fullPath
-        // et on remplace les '/' par des '&' à l'intérieur de ce segment uniquement.
-        for (const std::string& segment : segmentsToAmper) {
-            // Optimization: skip if segment has no slash
-            if (segment.find('/') == std::string::npos) continue;
-
-            size_t pos = fullPath.find(segment);
-            
-            if (pos != std::string::npos) {
-                // On crée la version modifiée du segment (ex: "F/g" -> "F&g")
-                std::string modifiedSegment = segment;
-                std::replace(modifiedSegment.begin(), modifiedSegment.end(), '/', '&');
-                
-                // On remplace dans la chaîne principale
-                fullPath.replace(pos, segment.length(), modifiedSegment);
-            }
+        for (const auto& s : segments) {
+            if (!context_schema_prefix.empty()) context_schema_prefix += "/";
+            context_schema_prefix += s;
         }
 
-        sanitized_path_cache[cache_key] = fullPath;
-        return fullPath;
+        // Gérer le chemin d'entrée (relatif ou absolu)
+        std::string target_schema_path = context_schema_prefix;
+        std::string input_path = path;
         
+        if (!path.empty() && path[0] == '/') { // Absolu
+            target_schema_path = input_path.substr(1);
+            input_path = input_path.substr(1);
+            context_schema_prefix = "";
+        } else {
+            if (!target_schema_path.empty()) target_schema_path += "/";
+            target_schema_path += input_path;
+        }
+
+        // 3. Trouver le plus long préfixe qui correspond à un AoS connu
+        auto find_best_match = [&](const std::string& target) -> std::string {
+            std::string best = "";
+            for (const auto& known_aos : schema_aos_paths) {
+                std::string known_slashed = known_aos;
+                std::replace(known_slashed.begin(), known_slashed.end(), '&', '/');
+
+                bool match_slashed = (target == known_slashed || 
+                    (target.size() > known_slashed.size() && 
+                     target.compare(0, known_slashed.size(), known_slashed) == 0 &&
+                     target[known_slashed.size()] == '/'));
+
+                bool match_original = (target == known_aos || 
+                    (target.size() > known_aos.size() && 
+                     target.compare(0, known_aos.size(), known_aos) == 0 &&
+                     target[known_aos.size()] == '/'));
+
+                if ((match_slashed || match_original) && known_aos.size() > best.size()) {
+                    best = known_aos;
+                }
+            }
+            return best;
+        };
+
+        std::string best_aos_match = find_best_match(target_schema_path);
+
+        if (best_aos_match.size() < context_schema_prefix.size()) {
+             build_aos_schema_index();
+             best_aos_match = find_best_match(target_schema_path);
+        }
+
+        // 4. Construire le résultat
+        std::string result = best_aos_match;
+        std::string remainder = "";
+        if (!best_aos_match.empty()) {
+            std::string best_aos_match_slashed = best_aos_match;
+            std::replace(best_aos_match_slashed.begin(), best_aos_match_slashed.end(), '&', '/');
+            
+            size_t prefix_len_to_check = (target_schema_path.rfind(best_aos_match + "/", 0) == 0) ? best_aos_match.length() : best_aos_match_slashed.length();
+
+            if (target_schema_path.size() > prefix_len_to_check) {
+                remainder = target_schema_path.substr(prefix_len_to_check + 1);
+            }
+        } else {
+            remainder = target_schema_path;
+        }
+
+        if (!remainder.empty()) {
+            std::replace(remainder.begin(), remainder.end(), '/', '&');
+            if (!result.empty()) result += "/";
+            result += remainder;
+        }
+
+        // 5. Retirer le préfixe du contexte pour revenir à un chemin relatif si nécessaire
+        if (!context_schema_prefix.empty() && !path.empty() && path[0] != '/') {
+             std::string sanitized_context_prefix;
+             for (const auto& s : segments) {
+                if (!sanitized_context_prefix.empty()) sanitized_context_prefix += "/";
+                sanitized_context_prefix += s;
+             }
+
+             if (!sanitized_context_prefix.empty() && result.rfind(sanitized_context_prefix + "/", 0) == 0) {
+                 result = result.substr(sanitized_context_prefix.length() + 1);
+             }
+        }
+
+        sanitized_path_cache[cache_key] = result;
+        return result;
     }
 
     const PanzerDB::Leaf* find_leaf_for_context(Context* ctx, std::string_view dataset_name, std::string_view timebasename, int homogeneous_time) {
@@ -347,7 +424,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     std::string timed_aos_path = getPath(timed_ctx, false);
     std::string timebase_name_str = timed_ctx->getTimebasePath();
     // Utilisation de la sanitization intelligente
-    timebase_name_str = sanitize_path(timed_ctx->getParent(), timebase_name_str);
+    timebase_name_str = sanitize_path(timed_ctx, timebase_name_str);
 
     // Extract basename of timebase to handle both relative ("time") and absolute/generic ("path/to/time") paths
     std::string timebase_basename = timebase_name_str;
