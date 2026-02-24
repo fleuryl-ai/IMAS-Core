@@ -145,7 +145,7 @@ int main() {
             int size[H5S_MAX_RANK];
             
             backend.readData(&fluxLoopCtx, "flux/data", "time", &data, &type, &dim, size);
-            printf("Read slice for flux_loop(0).flux.data: dim=%d, size[0]=%d\n", dim, size[0]);
+            //printf("Read slice for flux_loop(0).flux.data: dim=%d, size[0]=%d\n", dim, size[0]);
             if (dim != 1) throw std::runtime_error("Slice read should return 1 (no dim change expected upon slicing)");
             
             double val = *(double*)data;

@@ -81,9 +81,9 @@ void HDF5Reader_v2::endAction(Context *ctx)
 int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                  int *datatype, void **data, int *dim, int *size) {
     // La logique de lecture est maintenant déléguée à l'objet de stratégie
-  printf("HDF5Reader_v2::read_ND_Data called for dataset '%s' with timebasename='%s'\n", dataset_name.c_str(), timebasename.c_str());
+  //printf("HDF5Reader_v2::read_ND_Data called for dataset '%s' with timebasename='%s'\n", dataset_name.c_str(), timebasename.c_str());
 
-  if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+  /*if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
     ArraystructContext* arrCtx = static_cast<ArraystructContext*>(ctx);
     printf("Context path: %s\n", arrCtx->getPath().c_str());
     while(arrCtx) {
@@ -93,10 +93,13 @@ int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::st
                  : nullptr;
     }
   
-  }
+  }*/
   // Utilisation de la sanitization intelligente via la stratégie
-  std::string dataset_name_copy = read_strategy->sanitize_path(ctx, dataset_name);
-  std::string timebasename_copy = read_strategy->sanitize_path(ctx, timebasename);
+  //std::string dataset_name_copy = read_strategy->sanitize_path(ctx, dataset_name);
+  //std::string timebasename_copy = read_strategy->sanitize_path(ctx, timebasename);
+  std::string dataset_name_copy = dataset_name;
+  std::string timebasename_copy = timebasename;
+  std::replace(dataset_name_copy.begin(), dataset_name_copy.end(), '/', '&');
 
   //printf("HDF5Reader_v2::read_ND_Data called for dataset: %s\n", dataset_name.c_str());
   int status = read_strategy->read_ND_Data(ctx, dataset_name_copy, timebasename_copy, datatype, data, dim, size);

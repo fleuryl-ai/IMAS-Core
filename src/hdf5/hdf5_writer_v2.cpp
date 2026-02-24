@@ -571,7 +571,7 @@ void HDF5Writer_v2::endAction(Context *ctx) {
     //printf("HDF5Writer_v2::endAction called for OperationContext, calling flush()\n");
 
     if (panzer_db_ptr) panzer_db_ptr->flush();
-     if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache();
+    //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache();
     if (panzer_db_ptr) panzer_db_ptr->close();
   }
 }

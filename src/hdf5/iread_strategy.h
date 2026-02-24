@@ -111,136 +111,6 @@ public:
         }
     }
 
-    std::string sanitize_path(Context* ctx, const std::string& path) {
-        if (path.empty()) return "";
-        if (path == "/time") return "time";
-        if (path == "time") return path;
-        
-        // 1. Vérifier le cache
-        auto cache_key = std::make_pair(ctx, path);
-        if (sanitized_path_cache.count(cache_key)) {
-            return sanitized_path_cache[cache_key];
-        }
-
-        // 2. Construire le chemin "schéma" cible (sans indices)
-        // On part du contexte courant pour avoir le préfixe
-        std::string context_schema_prefix = "";
-        Context* current = ctx;
-        std::vector<std::string> segments;
-        while (current != nullptr) {
-            if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                ArraystructContext* arrCtx = static_cast<ArraystructContext*>(current);
-                std::string segment = arrCtx->getPath();
-                std::string node;
-
-                Context* parent = arrCtx->getParent();
-                if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                    ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-                    std::string parent_path = parent_arr->getPath();
-                    if (segment.size() > parent_path.size() && segment.rfind(parent_path + "/", 0) == 0) {
-                        node = segment.substr(parent_path.size() + 1);
-                    } else {
-                        node = segment;
-                    }
-                } else {
-                    node = segment;
-                }
-
-                std::replace(node.begin(), node.end(), '/', '&');
-                segments.insert(segments.begin(), node);
-                current = arrCtx->getParent();
-            } else {
-                current = nullptr;
-            }
-        }
-        for (const auto& s : segments) {
-            if (!context_schema_prefix.empty()) context_schema_prefix += "/";
-            context_schema_prefix += s;
-        }
-
-        // Gérer le chemin d'entrée (relatif ou absolu)
-        std::string target_schema_path = context_schema_prefix;
-        std::string input_path = path;
-        
-        if (!path.empty() && path[0] == '/') { // Absolu
-            target_schema_path = input_path.substr(1);
-            input_path = input_path.substr(1);
-            context_schema_prefix = "";
-        } else {
-            if (!target_schema_path.empty()) target_schema_path += "/";
-            target_schema_path += input_path;
-        }
-
-        // 3. Trouver le plus long préfixe qui correspond à un AoS connu
-        auto find_best_match = [&](const std::string& target) -> std::string {
-            std::string best = "";
-            for (const auto& known_aos : schema_aos_paths) {
-                std::string known_slashed = known_aos;
-                std::replace(known_slashed.begin(), known_slashed.end(), '&', '/');
-
-                bool match_slashed = (target == known_slashed || 
-                    (target.size() > known_slashed.size() && 
-                     target.compare(0, known_slashed.size(), known_slashed) == 0 &&
-                     target[known_slashed.size()] == '/'));
-
-                bool match_original = (target == known_aos || 
-                    (target.size() > known_aos.size() && 
-                     target.compare(0, known_aos.size(), known_aos) == 0 &&
-                     target[known_aos.size()] == '/'));
-
-                if ((match_slashed || match_original) && known_aos.size() > best.size()) {
-                    best = known_aos;
-                }
-            }
-            return best;
-        };
-
-        std::string best_aos_match = find_best_match(target_schema_path);
-
-        if (best_aos_match.size() < context_schema_prefix.size()) {
-             build_aos_schema_index();
-             best_aos_match = find_best_match(target_schema_path);
-        }
-
-        // 4. Construire le résultat
-        std::string result = best_aos_match;
-        std::string remainder = "";
-        if (!best_aos_match.empty()) {
-            std::string best_aos_match_slashed = best_aos_match;
-            std::replace(best_aos_match_slashed.begin(), best_aos_match_slashed.end(), '&', '/');
-            
-            size_t prefix_len_to_check = (target_schema_path.rfind(best_aos_match + "/", 0) == 0) ? best_aos_match.length() : best_aos_match_slashed.length();
-
-            if (target_schema_path.size() > prefix_len_to_check) {
-                remainder = target_schema_path.substr(prefix_len_to_check + 1);
-            }
-        } else {
-            remainder = target_schema_path;
-        }
-
-        if (!remainder.empty()) {
-            std::replace(remainder.begin(), remainder.end(), '/', '&');
-            if (!result.empty()) result += "/";
-            result += remainder;
-        }
-
-        // 5. Retirer le préfixe du contexte pour revenir à un chemin relatif si nécessaire
-        if (!context_schema_prefix.empty() && !path.empty() && path[0] != '/') {
-             std::string sanitized_context_prefix;
-             for (const auto& s : segments) {
-                if (!sanitized_context_prefix.empty()) sanitized_context_prefix += "/";
-                sanitized_context_prefix += s;
-             }
-
-             if (!sanitized_context_prefix.empty() && result.rfind(sanitized_context_prefix + "/", 0) == 0) {
-                 result = result.substr(sanitized_context_prefix.length() + 1);
-             }
-        }
-
-        sanitized_path_cache[cache_key] = result;
-        return result;
-    }
-
     const PanzerDB::Leaf* find_leaf_for_context(Context* ctx, std::string_view dataset_name, std::string_view timebasename, int homogeneous_time) {
     DEBUG_PRINT("Searching for dataset '" << dataset_name << "' with timebasename='" << timebasename << "' and homogeneous_time=" << homogeneous_time);
 
@@ -363,6 +233,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
         timebasename_copy.erase(0, 1); // Supprime 1 caractère à l'index 0
     }
     // Utilisation de la sanitization intelligente
+    printf("timebasename_copy before sanitization: '%s'\n", timebasename_copy.c_str());
     timebasename_copy = sanitize_path(ctx, timebasename_copy);
 
     if (homogeneous_time == 1) {
@@ -406,8 +277,14 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             // or fall back to a common timebase at the root of the IDS.
 
             // 1. Try to find timebase relative to the current static AoS element.
+            printf("timebasename_copy after sanitization: '%s'\n", timebasename_copy.c_str());
+            std::replace(timebasename_copy.begin(), timebasename_copy.end(), '/', '&');
+            printf("timebasename_copy after replacing '/': '%s'\n", timebasename_copy.c_str());
             std::string local_timebase_path = buildFullPath(ctx, timebasename_copy);
+            
+        
             time_values = panzer_db_ptr->getWholeDynamicSignal(local_timebase_path);
+            
 
             // 2. If not found locally, fall back to the root timebase.
             if (time_values.empty()) {
@@ -615,6 +492,108 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
        return path_stream.str();
    }
 
+    void replaceSlashWithAmpersand(std::string& s) {
+        std::replace(s.begin(), s.end(), '/', '&');
+    }
+
+public:
+    std::string sanitize_path(Context* ctx, const std::string& path) {
+        // On construit le chemin complet pour appliquer la logique
+        std::string fullPath = path;
+
+        if (fullPath.empty()) return "";
+        if (fullPath == "/time") return "time";
+        if (fullPath == "time") return fullPath;
+
+        // 1. Vérifier le cache
+        auto cache_key = std::make_pair(ctx, path);
+        if (sanitized_path_cache.count(cache_key)) {
+            return sanitized_path_cache[cache_key];
+        }
+
+        std::vector<std::string> segments;
+        std::string remaining = fullPath;
+        
+        // On retire le '/' initial s'il existe pour simplifier le découpage
+        bool hasLeadingSlash = (fullPath[0] == '/');
+        if (hasLeadingSlash) {
+            remaining.erase(0, 1);
+        }
+
+        Context* current = ctx;
+
+        // 1. Parcours des contextes du plus profond (F) vers le plus haut (A)
+        while (current != nullptr) {
+            std::string ctxPath;
+            if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                ctxPath = static_cast<ArraystructContext*>(current)->getPath();
+            } else {
+                // Stop if not ArraystructContext
+                break;
+            }
+            
+            if (!ctxPath.empty()) {
+                size_t pos = remaining.rfind(ctxPath);
+                
+                if (pos != std::string::npos) {
+                    // Extraire le suffixe (ce qui est APRÈS le contexte actuel, ex: "g/data")
+                    std::string suffix = remaining.substr(pos + ctxPath.length());
+                    if (!suffix.empty()) {
+                        if (suffix[0] == '/') suffix.erase(0, 1);
+                        replaceSlashWithAmpersand(suffix);
+                        segments.push_back(suffix);
+                    }
+
+                    // Transformer le bloc du contexte lui-même (ex: "d/e/F" -> "d&e&F")
+                    replaceSlashWithAmpersand(ctxPath);
+                    segments.push_back(ctxPath);
+
+                    // Réduire la chaîne pour l'itération suivante
+                    remaining = remaining.substr(0, pos);
+                    if (!remaining.empty() && remaining.back() == '/') {
+                        remaining.pop_back();
+                    }
+                }
+            }
+            
+            if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                current = static_cast<ArraystructContext*>(current)->getParent();
+            } else {
+                current = nullptr;
+            }
+        }
+
+        // 2. Traiter ce qui reste au début de la chaîne (ex: "A/B/a/C" si non couverts par ctx)
+        // On sépare par '/' car ce sont normalement des niveaux distincts (Tableaux/Structures)
+        if (!remaining.empty()) {
+            size_t pos = 0;
+            while ((pos = remaining.rfind('/')) != std::string::npos) {
+                std::string part = remaining.substr(pos + 1);
+                if (!part.empty()) segments.push_back(part);
+                remaining = remaining.substr(0, pos);
+            }
+            if (!remaining.empty()) {
+                segments.push_back(remaining);
+            }
+        }
+
+        // 3. Reconstruction de la chaîne finale
+        std::string result = "";
+        // On parcourt le vecteur à l'envers car on a empilé de la fin vers le début
+        for (int i = segments.size() - 1; i >= 0; --i) {
+            result += "/" + segments[i];
+        }
+
+        // Si la string d'origine n'avait pas de '/', on enlève le premier ajouté
+        if (!hasLeadingSlash && !result.empty()) {
+            result.erase(0, 1);
+        }
+
+        sanitized_path_cache[cache_key] = result;
+        return result;
+    }
+
+   protected: // La méthode est `protected` pour être accessible par les classes filles
     bool isTimedContext(Context *ctx) {
         if (!ctx || ctx->getType() != CTX_ARRAYSTRUCT_TYPE) {
             return false;
