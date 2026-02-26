@@ -12,12 +12,12 @@ HDF5BackendFactory::~HDF5BackendFactory()
 
 std::unique_ptr < HDF5Writer > HDF5BackendFactory::createWriter()
 {
-    /*if (backend_version_.compare("1.0") == 0) {
-        printf("Creating HDF5Writer\n");
+    if (backend_version_.compare("1.0") == 0) {
+        printf("Creating HDF5Writer v1.0\n");
         std::unique_ptr < HDF5Writer > writer = std::unique_ptr < HDF5Writer > (new HDF5Writer(backend_version_));
         return writer;
     } 
-    else*/ if (backend_version_.compare("2.0") == 0 || backend_version_.compare("1.0") == 0) {
+    else if (backend_version_.compare("2.0") == 0 ) {
         printf("Creating HDF5Writer_v2\n");
         std::unique_ptr < HDF5Writer_v2 > writer = std::unique_ptr < HDF5Writer_v2 > (new HDF5Writer_v2(backend_version_));
         return writer;
