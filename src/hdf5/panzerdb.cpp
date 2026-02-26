@@ -1438,7 +1438,8 @@ void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
         mem_type = H5T_NATIVE_INT;
     } else if (type == DataType::COMPLEX128) {
         dset_id = data_dset_c128;
-        mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, new hsize_t[1]{2});
+        hsize_t complex_dims[1] = {2};
+        mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, complex_dims);
     } else {
         throw std::runtime_error("Unsupported data type for readTensor");
     }
