@@ -225,15 +225,13 @@ public:
 
 std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
     std::vector<double> time_values;
-    std::cout << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
-    //std::cout << "[DEBUG getTimeValues] Context type: " << (ctx ? std::to_string(ctx->getType()) : "nullptr") << std::endl;
+    //std::cout << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
 
     std::string timebasename_copy = timebasename;
     if (!timebasename_copy.empty() && timebasename_copy[0] == '/') {
         timebasename_copy.erase(0, 1); // Supprime 1 caractère à l'index 0
     }
     // Utilisation de la sanitization intelligente
-    printf("timebasename_copy before sanitization: '%s'\n", timebasename_copy.c_str());
     timebasename_copy = sanitize_path(ctx, timebasename_copy);
 
     if (homogeneous_time == 1) {
@@ -249,16 +247,15 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     // --- Logique pour homogeneous_time == 0 ---
     //std::cout << "[DEBUG getTimeValues] Searching for time values in dynamic AoS context." << std::endl;
     if (ctx == nullptr) {
-        std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
+        //std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
         return time_values; // Return empty vector
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
     if (!arrCtx) { // Cas où le contexte est OperationContext
-        //panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
-        std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
+        //std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
         time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback pour le temps racine
-        printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
+        //printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
         return time_values;
     }
 
@@ -271,18 +268,15 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
     // In this case, the time vector is also static relative to the current context.
     if (!timed_ctx) {
-        std::cout << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
+        //std::cout << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
         if (!timebasename_copy.empty()) {
             // For homogeneous_time=0, the timebase can be relative to the static AoS element,
             // or fall back to a common timebase at the root of the IDS.
 
             // 1. Try to find timebase relative to the current static AoS element.
-            printf("timebasename_copy after sanitization: '%s'\n", timebasename_copy.c_str());
             std::replace(timebasename_copy.begin(), timebasename_copy.end(), '/', '&');
-            printf("timebasename_copy after replacing '/': '%s'\n", timebasename_copy.c_str());
             std::string local_timebase_path = buildFullPath(ctx, timebasename_copy);
             
-        
             time_values = panzer_db_ptr->getWholeDynamicSignal(local_timebase_path);
             
 
@@ -292,7 +286,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             }
             return time_values;
         }
-        printf("[DEBUG getTimeValues] No timed parent context and no static timebase found. Returning empty time vector.\n");
+        //printf("[DEBUG getTimeValues] No timed parent context and no static timebase found. Returning empty time vector.\n");
         return {}; // No timebase found
     }
 
@@ -314,7 +308,7 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
     if (time_values_cache.count(cache_key)) {
         return time_values_cache[cache_key];
     }
-    std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
+    //std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
 
     auto leaves = panzer_db_ptr->getLeaves();
 
@@ -373,10 +367,10 @@ std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std:
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
-            std::cout << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
+            //std::cout << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
-    printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
+    //printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
     time_values_cache[cache_key] = time_values;
     return time_values;
 }
@@ -536,22 +530,28 @@ public:
                 size_t pos = remaining.rfind(ctxPath);
                 
                 if (pos != std::string::npos) {
-                    // Extraire le suffixe (ce qui est APRÈS le contexte actuel, ex: "g/data")
-                    std::string suffix = remaining.substr(pos + ctxPath.length());
-                    if (!suffix.empty()) {
-                        if (suffix[0] == '/') suffix.erase(0, 1);
-                        replaceSlashWithAmpersand(suffix);
-                        segments.push_back(suffix);
-                    }
+                    // Check boundaries to ensure we matched a full path segment
+                    bool boundaryStart = (pos == 0 || remaining[pos - 1] == '/');
+                    bool boundaryEnd = (pos + ctxPath.length() == remaining.length() || remaining[pos + ctxPath.length()] == '/');
 
-                    // Transformer le bloc du contexte lui-même (ex: "d/e/F" -> "d&e&F")
-                    replaceSlashWithAmpersand(ctxPath);
-                    segments.push_back(ctxPath);
+                    if (boundaryStart && boundaryEnd) {
+                        // Extraire le suffixe (ce qui est APRÈS le contexte actuel, ex: "g/data")
+                        std::string suffix = remaining.substr(pos + ctxPath.length());
+                        if (!suffix.empty()) {
+                            if (suffix[0] == '/') suffix.erase(0, 1);
+                            replaceSlashWithAmpersand(suffix);
+                            segments.push_back(suffix);
+                        }
 
-                    // Réduire la chaîne pour l'itération suivante
-                    remaining = remaining.substr(0, pos);
-                    if (!remaining.empty() && remaining.back() == '/') {
-                        remaining.pop_back();
+                        // Transformer le bloc du contexte lui-même (ex: "d/e/F" -> "d&e&F")
+                        replaceSlashWithAmpersand(ctxPath);
+                        segments.push_back(ctxPath);
+
+                        // Réduire la chaîne pour l'itération suivante
+                        remaining = remaining.substr(0, pos);
+                        if (!remaining.empty() && remaining.back() == '/') {
+                            remaining.pop_back();
+                        }
                     }
                 }
             }
