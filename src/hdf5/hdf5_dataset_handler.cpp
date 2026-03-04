@@ -610,6 +610,7 @@ void HDF5DataSetHandler::setCurrentShapesAndExtend(int *size, int *AOSShapes) {
 void HDF5DataSetHandler::setCurrentShapes(int *size, int *AOSShapes) {
 	
 	for (int i = 0; i < AOSRank; i++) {
+        
 			if (! (slice_mode && isTimed && i == timed_AOS_index)) { //we don't update the time axis in slice mode of a timed AOS
 				dims[i] = (hsize_t) AOSShapes[i];
 			}

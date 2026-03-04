@@ -32,6 +32,8 @@ class HDF5EventsHandler {
    **/
     virtual void endAction(Context * ctx, hid_t file_id, HDF5Writer & writer, HDF5Reader & reader, std::unordered_map < std::string, hid_t > &opened_IDS_files);
 
+    private:
+    bool strategy_set;
 
 };
 

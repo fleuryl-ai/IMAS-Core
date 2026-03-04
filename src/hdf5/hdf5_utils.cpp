@@ -44,6 +44,8 @@ int
     if (!debug)
         H5Eset_auto(H5E_DEFAULT, NULL, NULL);
 
+    //H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
+
     if (! (mode == OPEN_PULSE || mode == FORCE_OPEN_PULSE))
         throw ALBackendException("HDF5Backend: unexepcted mode in HDF5Utils::openPulse()", LOG);
 
@@ -121,6 +123,8 @@ void
     /* Turn off error handling */
     if (!debug)
         H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+    //H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
     
     if (*file_id != -1)
         hdf5_utils.closeMasterFile(file_id);

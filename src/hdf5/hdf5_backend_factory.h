@@ -7,6 +7,9 @@
 #include "hdf5_reader.h"
 #include "hdf5_events_handler.h"
 #include "data_interpolation.h"
+#include "hdf5_writer_v2.h"
+#include "hdf5_reader_v2.h"
+
 
 #include <memory>
 #include <string>

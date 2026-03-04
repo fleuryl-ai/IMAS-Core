@@ -82,6 +82,8 @@ if(APPLE)
   set(AL_BACKEND_UDA OFF CACHE BOOL "UDA backend" FORCE)    
 endif()
 
+# Enable testing with CTest
+enable_testing()
 
 # Dependencies
 # ##############################################################################
@@ -189,6 +191,7 @@ if(NOT WIN32 AND NOT APPLE)
   # On Windows, filesystem is part of the standard library
   target_link_libraries( imas_print_version PRIVATE stdc++fs )
 endif()
+target_link_libraries( imas_print_version PRIVATE al stdc++fs )
 add_dependencies( imas_print_version al )
 
 # Install

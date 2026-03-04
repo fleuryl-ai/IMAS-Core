@@ -27,6 +27,7 @@ const int HDF5Backend::HDF5_BACKEND_VERSION_MINOR = 0;
 
 void
  HDF5Backend::createBackendComponents(std::string backend_version) {
+    printf("Creating backend components for version: %s\n", backend_version.c_str());
     HDF5BackendFactory backendFactory(backend_version);
     hdf5Writer = backendFactory.createWriter();
     hdf5Reader = backendFactory.createReader();
@@ -44,7 +45,7 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
       files_path_strategy = HDF5Utils::MODIFIED_MDSPLUS_STRATEGY;
       bool masterFileAlreadyOpened = (this->file_id != -1);
       //we call openPulse() which reads the backend version from the master file (no attempt for opening the master file will be performed if it is already opened) 
-      HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
+      HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
       std::string::size_type pos = backend_version.find_first_of('.');
       std::string version_major = backend_version.substr(0, pos);
       std::string version_minor = backend_version.substr(pos+1, std::string::npos);
@@ -83,7 +84,7 @@ void
     case OPEN_PULSE:
     case FORCE_OPEN_PULSE: 
         {
-        int status = HDF5Utils::openPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
+        int status = HDF5Utils::openPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
         if (status == -1) { //master file doesn't exist
             backend_version = getVersion();
             HDF5Utils::createPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
@@ -122,7 +123,7 @@ void HDF5Backend::writeData(Context * ctx, std::string fieldname, std::string ti
 int HDF5Backend::readData(Context * ctx, std::string fieldname, std::string timebasename, void **data, int *datatype, int *dim, int *size)
 {
     int dataAvailable = 0;      //not available by default
-    dataAvailable = hdf5Reader->read_ND_Data(ctx, fieldname, timebasename, *datatype, data, dim, size);
+    dataAvailable = hdf5Reader->read_ND_Data(ctx, fieldname, timebasename, datatype, data, dim, size);
     return dataAvailable;
 }
 
