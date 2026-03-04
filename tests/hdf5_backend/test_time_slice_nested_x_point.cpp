@@ -30,6 +30,13 @@ int main() {
             DataEntryContext dataEntryCtx(URI);
             HDF5Backend backend;
             backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+            auto version = backend.getVersion(&dataEntryCtx);
+
+            if (version == std::make_pair(1,0)) {
+                backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+                return 0;
+            } 
+            
 
             OperationContext opCtx(&dataEntryCtx, "core_profiles", "", WRITE_OP);
             backend.beginAction(&opCtx);

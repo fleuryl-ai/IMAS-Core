@@ -21,7 +21,7 @@ HDF5Backend::~HDF5Backend()
 {
 }
 
-const int HDF5Backend::HDF5_BACKEND_VERSION_MAJOR = 1;
+const int HDF5Backend::HDF5_BACKEND_VERSION_MAJOR = 2;
 const int HDF5Backend::HDF5_BACKEND_VERSION_MINOR = 0;
 
 

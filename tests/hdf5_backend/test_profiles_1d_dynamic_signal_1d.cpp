@@ -31,15 +31,14 @@ int main() {
             std::cout << "\n--- Phase 1: Writing Data ---\n";
             DataEntryContext dataEntryCtx(URI);
             HDF5Backend backend;
-
+            backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
             auto version = backend.getVersion(&dataEntryCtx);
-            std::cout << "Backend version: " << version.first << "." << version.second << std::endl;
 
             if (version == std::make_pair(1,0)) {
-                std::cout  << "Detected legacy backend version 1.0\n" << std::endl;
+                backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
                 return 0;
             } 
-            backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+            
 
             OperationContext opCtx(&dataEntryCtx, "core_profiles", "", WRITE_OP);
             backend.beginAction(&opCtx);

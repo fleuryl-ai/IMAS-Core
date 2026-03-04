@@ -103,18 +103,18 @@ class HDF5DataSetHandler {
 
 	void create(const char *dataset_name, hid_t * dataset_id, int datatype, hid_t loc_id, int dim, int *size, int AOSRank, int *AOSSize, bool shape_dataset, bool create_chunk_cache);
 	void open(const char *dataset_name, hid_t loc_id, hid_t * dataset_id, int dim, int *size, int datatype, bool shape_dataset, bool create_chunk_cache, uri::Uri uri, int AOSRank=-1, int *AOSSize = NULL);
-	void setCurrentShapesAndExtend(int *size, int *AOSShapes);
-	void setCurrentShapes(int *size, int *AOSShapes);
+	void setCurrentShapesAndExtend(int *size, std::vector<int> &AOSShapes);
+	void setCurrentShapes(int *size, std::vector<int> &AOSShapes);
 	void setExtent();
     void storeInitialDims();
-	void extendDataSpaceForTimeSlices(int *size, int *AOSShapes, int dynamic_AOS_slices_extension);
+	void extendDataSpaceForTimeSlices(int *size, std::vector<int> &AOSShapes, int dynamic_AOS_slices_extension);
 	void setTimeAxisOffset(const std::vector < int > &current_arrctx_indices, int dynamic_AOS_slices_extension);
     void updateTimeAxisOffset(const std::vector < int > &current_arrctx_indices);
 
 	//AOS Dataset management
-	void setCurrentShapesAndExtendForAOSDataSet(int *size, int *AOSShapes);
-	void setCurrentShapesForAOSDataSet(int *size, int *AOSShapes);
-    void extendDataSpaceForTimeSlicesForAOSDataSet(int *size, int *AOSShapes, int dynamic_AOS_slices_extension); 
+	void setCurrentShapesAndExtendForAOSDataSet(int *size, std::vector<int> &AOSShapes);
+	void setCurrentShapesForAOSDataSet(int *size, std::vector<int> &AOSShapes);
+    void extendDataSpaceForTimeSlicesForAOSDataSet(int *size, std::vector<int> &AOSShapes, int dynamic_AOS_slices_extension); 
 	void setTimeAxisOffsetForAOSDataSet();
     void setTimedAOSShape(int timedAOS_shape);
     int getTimedAOSShape() const;

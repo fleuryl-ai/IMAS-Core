@@ -470,7 +470,7 @@ void HDF5Writer::write_ND_Data(Context * ctx, const std::string & att_name, cons
             data_set = std::move(got->second);
             opened_data_sets.erase(got);
             data_set->setNonSliceMode();
-	        data_set->setCurrentShapesAndExtend(size, arrctx_shapes.data());
+	        data_set->setCurrentShapesAndExtend(size, arrctx_shapes);
         }
     } else {
         //std::cout << "WRITER IN SLICE MODE!!! " << std::endl;
@@ -494,7 +494,7 @@ void HDF5Writer::write_ND_Data(Context * ctx, const std::string & att_name, cons
             dataSetHandler->storeInitialDims(); //store the dims into initial_dims at beginning of the put_slice
             //printf("-->Extending dataset for path %s with AOSRank=%d, timed_AOS_index=%d, slices_extension=%d\n", tensorized_path.c_str(), AOSRank, timed_AOS_index, slices_extension);
             //if (arrctx_shapes.size() > 0)
-                dataSetHandler->extendDataSpaceForTimeSlices(size, arrctx_shapes.data(), slices_extension);
+                dataSetHandler->extendDataSpaceForTimeSlices(size, arrctx_shapes, slices_extension);
 	        dataSetHandler->setTimeAxisOffset(current_arrctx_indices, slices_extension);
             data_set = std::move(dataSetHandler);
         } else {
@@ -502,7 +502,7 @@ void HDF5Writer::write_ND_Data(Context * ctx, const std::string & att_name, cons
             opened_data_sets.erase(got);
             data_set->setSliceMode(ctx);
             data_set->updateTimeAxisOffset(current_arrctx_indices);
-	        data_set->setCurrentShapesAndExtend(size, arrctx_shapes.data());
+	        data_set->setCurrentShapesAndExtend(size, arrctx_shapes);
         }
     }
 
@@ -650,7 +650,7 @@ const std::string & timebasename, int timed_AOS_index, const std::vector < int >
 
             if (extendDataSet) {
                 //if (aos_shapes.size() > 0)
-	            data_set->extendDataSpaceForTimeSlices(size, aos_shapes.data(), slices_extension);
+	            data_set->extendDataSpaceForTimeSlices(size, aos_shapes, slices_extension);
 	            data_set->setTimeAxisOffset(current_arrctx_indices, slices_extension);
             }
 			
@@ -675,10 +675,10 @@ const std::string & timebasename, int timed_AOS_index, const std::vector < int >
             data_set->setSliceMode(ctx);
             data_set->updateTimeAxisOffset(current_arrctx_indices);
             //printf("Extending dataset for path %s with AOSRank=%d, timed_AOS_index=%d, slices_extension=%d\n", tensorized_path.c_str(), AOSRank, timed_AOS_index, slices_extension);
-            data_set->setCurrentShapesAndExtend(size, aos_shapes.data());
+            data_set->setCurrentShapesAndExtend(size, aos_shapes);
         } else {
             data_set->setNonSliceMode();
-			data_set->setCurrentShapesAndExtend(size, aos_shapes.data());
+			data_set->setCurrentShapesAndExtend(size, aos_shapes);
         }
 	
         const hsize_t* dataspace_dims = fieldHandler.getDims();
@@ -754,12 +754,12 @@ void HDF5Writer::createOrUpdateAOSShapesDataSet(ArraystructContext * ctx, hid_t 
                     shapes[0] = timedAOS_shape + slices_extension;
                 }
 				dataSetHandler->open(tensorized_path.c_str(), loc_id, &dataset_id, dim, size, alconst::integer_data, shapes_dataset, create_chunk_cache, ctx->getDataEntryContext()->getURI()); //dataset extension occurs
-				dataSetHandler->extendDataSpaceForTimeSlicesForAOSDataSet(size, aos_shapes.data(), slices_extension);
+				dataSetHandler->extendDataSpaceForTimeSlicesForAOSDataSet(size, aos_shapes, slices_extension);
 				dataSetHandler->setTimeAxisOffsetForAOSDataSet();
 			} else {
 				dataSetHandler->setNonSliceMode();
 				dataSetHandler->open(tensorized_path.c_str(), loc_id, &dataset_id, dim, size, alconst::integer_data, shapes_dataset, create_chunk_cache, ctx->getDataEntryContext()->getURI());
-				dataSetHandler->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes.data());
+				dataSetHandler->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes);
 			}
 			
             if (dataSetHandler->useBuffering && slice_mode != SLICE_OP) {
@@ -779,10 +779,10 @@ void HDF5Writer::createOrUpdateAOSShapesDataSet(ArraystructContext * ctx, hid_t 
                     shapes[0] = data_set->getTimedAOSShape() + slices_extension;
                 }
 
-				data_set->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes.data());
+				data_set->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes);
 			} else {
 				data_set->setNonSliceMode();
-				data_set->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes.data());
+				data_set->setCurrentShapesAndExtendForAOSDataSet(size, aos_shapes);
 			}
 
             if (data_set->useBuffering && slice_mode != SLICE_OP) {
@@ -824,7 +824,7 @@ void HDF5Writer::createOrUpdateAOSShapesDataSet(ArraystructContext * ctx, hid_t 
                     dataSetHandler->setTimedAOSShape(timedAOS_shape);
                     shapes[0] = timedAOS_shape + slices_extension;
                 }
-				dataSetHandler->extendDataSpaceForTimeSlicesForAOSDataSet(size, aos_shapes.data(), slices_extension);
+				dataSetHandler->extendDataSpaceForTimeSlicesForAOSDataSet(size, aos_shapes, slices_extension);
 				dataSetHandler->setTimeAxisOffsetForAOSDataSet();
 		}
         

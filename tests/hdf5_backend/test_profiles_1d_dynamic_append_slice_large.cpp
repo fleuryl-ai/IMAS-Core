@@ -17,7 +17,7 @@ namespace fs = std::filesystem;
 #define GREEN   ""
 #define RED     ""
 
-const std::string URI = "imas:hdf5?path=./test_db_profiles_1d_dynamic_append_slice";
+const std::string URI = "imas:hdf5?path=./test_db_profiles_1d_dynamic_append_slice_large";
 
 int main() {
     try {
@@ -32,6 +32,11 @@ int main() {
             DataEntryContext dataEntryCtx(URI);
             HDF5Backend backend;
             backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+            auto version = backend.getVersion(&dataEntryCtx);
+            if (version == std::make_pair(1,0)) {
+                backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+                return 0;
+            } 
 
             OperationContext opCtx(&dataEntryCtx, "core_profiles", "", WRITE_OP);
             backend.beginAction(&opCtx);

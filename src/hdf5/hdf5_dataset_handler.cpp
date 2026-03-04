@@ -568,7 +568,7 @@ void HDF5DataSetHandler::setTimeAxisOffsetForAOSDataSet() {
 	}
 }
 
-void HDF5DataSetHandler::extendDataSpaceForTimeSlices(int *size, int *AOSShapes, int dynamic_AOS_slices_extension) {
+void HDF5DataSetHandler::extendDataSpaceForTimeSlices(int *size, std::vector<int> &AOSShapes, int dynamic_AOS_slices_extension) {
 	if (!slice_mode) //slice mode only is supported here
         throw ALBackendException("HDF5Backend: only slice operation is supported by HDF5DataSetHandler::extendDataSpaceForTimeSlices()!", LOG);
 	setCurrentShapes(size, AOSShapes);
@@ -587,7 +587,7 @@ void HDF5DataSetHandler::extendDataSpaceForTimeSlices(int *size, int *AOSShapes,
 	   setExtent();
 }
 
-void HDF5DataSetHandler::extendDataSpaceForTimeSlicesForAOSDataSet(int *size, int *AOSShapes, int dynamic_AOS_slices_extension) {
+void HDF5DataSetHandler::extendDataSpaceForTimeSlicesForAOSDataSet(int *size, std::vector<int> &AOSShapes, int dynamic_AOS_slices_extension) {
 	if (!slice_mode) //slice mode only is supported here
         throw ALBackendException("HDF5Backend: only slice operation is supported by HDF5DataSetHandler::extendDataSpaceForTimeSlicesForAOSDataSet()!", LOG);
 	setCurrentShapes(size, AOSShapes);
@@ -601,18 +601,19 @@ void HDF5DataSetHandler::extendDataSpaceForTimeSlicesForAOSDataSet(int *size, in
 	   setExtent();
 }
 
-void HDF5DataSetHandler::setCurrentShapesAndExtend(int *size, int *AOSShapes) {
+void HDF5DataSetHandler::setCurrentShapesAndExtend(int *size, std::vector<int> &AOSShapes) {
 	setCurrentShapes(size, AOSShapes);
 	if (dataset_rank > 0)
 	   setExtent();
 }
 
-void HDF5DataSetHandler::setCurrentShapes(int *size, int *AOSShapes) {
+void HDF5DataSetHandler::setCurrentShapes(int *size, std::vector<int> &AOSShapes) {
 	
 	for (int i = 0; i < AOSRank; i++) {
         
 			if (! (slice_mode && isTimed && i == timed_AOS_index)) { //we don't update the time axis in slice mode of a timed AOS
-				dims[i] = (hsize_t) AOSShapes[i];
+                if (AOSShapes.size() > i)
+				    dims[i] = (hsize_t) AOSShapes[i];
 			}
 			if (dims[i] > largest_dims[i]) {
 				largest_dims[i] = dims[i];
@@ -642,13 +643,13 @@ void HDF5DataSetHandler::setCurrentShapes(int *size, int *AOSShapes) {
     }
 }
 
-void HDF5DataSetHandler::setCurrentShapesAndExtendForAOSDataSet(int *size, int *AOSShapes) {
+void HDF5DataSetHandler::setCurrentShapesAndExtendForAOSDataSet(int *size, std::vector<int> &AOSShapes) {
 	setCurrentShapesForAOSDataSet(size, AOSShapes);
 	if (dataset_rank > 0)
 	   setExtent();
 }
 
-void HDF5DataSetHandler::setCurrentShapesForAOSDataSet(int *size, int *AOSShapes) {
+void HDF5DataSetHandler::setCurrentShapesForAOSDataSet(int *size, std::vector<int> &AOSShapes) {
 	
 	for (int i = 0; i < AOSRank; i++) {
 			if (! (slice_mode && isTimed && i == timed_AOS_index)) { //we don't update the time axis in slice mode of a timed AOS

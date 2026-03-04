@@ -87,13 +87,13 @@ void core_profiles_put() {
         }
         int sig_dim = 1;
         int sig_size[] = {SPATIAL_SIZE};
-        backend.writeData(&profilesCtx, "signal_1d", "time", val.data(), alconst::double_data, sig_dim, sig_size);
+        backend.writeData(&profilesCtx, "signal_1d", "", val.data(), alconst::double_data, sig_dim, sig_size);
 
         // Ajout signal 0D char_data 'string_0d'
         std::string str_val = "String_" + std::to_string(t);
         int str_dim = 1;
         int str_size_arr[] = {(int)str_val.length()};
-        backend.writeData(&profilesCtx, "string_0d", "time", (void*)str_val.c_str(), alconst::char_data, str_dim, str_size_arr);
+        backend.writeData(&profilesCtx, "string_0d", "", (void*)str_val.c_str(), alconst::char_data, str_dim, str_size_arr);
 
         // Ajout signal 1D char_data 'string_1d'
         int str_1d_dim = 2;
@@ -103,7 +103,7 @@ void core_profiles_put() {
             std::string s = "S_" + std::to_string(t) + "_" + std::to_string(x);
             strncpy(str_1d_buf.data() + x * STR_1D_LEN, s.c_str(), STR_1D_LEN - 1);
         }
-        backend.writeData(&profilesCtx, "string_1d", "time", str_1d_buf.data(), alconst::char_data, str_1d_dim, str_1d_size_arr);
+        backend.writeData(&profilesCtx, "string_1d", "", str_1d_buf.data(), alconst::char_data, str_1d_dim, str_1d_size_arr);
 
         // Ajout AOS statique 'ion' avec donnée 0D 'z_ion'
         ArraystructContext ionCtx(&profilesCtx, "ion", "");
@@ -177,7 +177,7 @@ void core_profiles_get() {
     assert(p_size == TIME_STEPS_PUT);
 
     for (int t = 0; t < TIME_STEPS_PUT; ++t) {
-        backend.readData(&profilesCtx, "signal_1d", "time", &data, &type, &dim, size);
+        backend.readData(&profilesCtx, "signal_1d", "", &data, &type, &dim, size);
         
         assert(dim == 1);
         assert(size[0] == SPATIAL_SIZE);
@@ -194,7 +194,7 @@ void core_profiles_get() {
         int str_type = alconst::char_data;
         int str_dim = 0;
         int str_size_arr[H5S_MAX_RANK];
-        backend.readData(&profilesCtx, "string_0d", "time", &str_data, &str_type, &str_dim, str_size_arr);
+        backend.readData(&profilesCtx, "string_0d", "", &str_data, &str_type, &str_dim, str_size_arr);
         assert(str_dim == 1);
         std::string read_str((char*)str_data);
         std::string expected_str = "String_" + std::to_string(t);
@@ -205,7 +205,7 @@ void core_profiles_get() {
         void* str_1d_data = nullptr;
         int str_1d_rdim = 0;
         int str_1d_rsize[H5S_MAX_RANK];
-        backend.readData(&profilesCtx, "string_1d", "time", &str_1d_data, &str_type, &str_1d_rdim, str_1d_rsize);
+        backend.readData(&profilesCtx, "string_1d", "", &str_1d_data, &str_type, &str_1d_rdim, str_1d_rsize);
         assert(str_1d_rdim == 2);
         assert(str_1d_rsize[0] == SPATIAL_SIZE);
         int r_len = str_1d_rsize[1];
@@ -540,6 +540,15 @@ int main(int argc, char** argv) {
 
         printf("---> Using backend : HDF5_BACKEND\n");
         printf("Processing IDS: core_profiles\n");
+        DataEntryContext dataEntryCtx(URI);
+        HDF5Backend backend;
+        backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+        auto version = backend.getVersion(&dataEntryCtx);
+            if (version == std::make_pair(1,0)) {
+                backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+                return 0;
+            } 
+        //backend.closePulse(&dataEntryCtx, OPEN_PULSE);
 
         // Execute the test phases
         core_profiles_put();

@@ -27,6 +27,17 @@ int main() {
             fs::remove_all("test_db_static_aos_dynamic_signal_slice");
         }
 
+        DataEntryContext dataVersionEntryCtx(URI);
+        HDF5Backend backend;
+        backend.openPulse(&dataVersionEntryCtx, FORCE_CREATE_PULSE);
+        auto version = backend.getVersion(&dataVersionEntryCtx);
+
+        if (version == std::make_pair(1,0)) {
+            backend.closePulse(&dataVersionEntryCtx, FORCE_CREATE_PULSE);
+            return 0;
+        } 
+        backend.closePulse(&dataVersionEntryCtx, FORCE_CREATE_PULSE);
+
         const int STATIC_SIZE = 2;
         const int NUM_SLICES = 3;
 
