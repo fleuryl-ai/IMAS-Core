@@ -226,6 +226,8 @@ install(
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
 
+include(CTest)
+
 # Install mdsplusIMASDB4to5
 install(
   PROGRAMS mdsplusIMASDB4to5
