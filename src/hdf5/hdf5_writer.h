@@ -33,7 +33,7 @@ class HDF5Writer {
   public:
 
      HDF5Writer(std::string backend_version_);
-    ~HDF5Writer();
+    virtual ~HDF5Writer();
 
      int homogeneous_time;
 

@@ -27,6 +27,7 @@ class HDF5Backend:public Backend {
 
      std::unique_ptr < HDF5Writer > hdf5Writer;
      std::unique_ptr < HDF5Reader > hdf5Reader;
+
      std::unique_ptr < HDF5EventsHandler > eventsHandler;
 
     int access_mode;

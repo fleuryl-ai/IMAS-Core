@@ -872,7 +872,7 @@ public:
              if (return_as_scalar) {
                  *dim = 1;
                  size[0] = (int)temp_buffer[0].size(); // Length excluding null
-                 *data = new char[size[0] + 1];
+                 *data = (char*)malloc(size[0] + 1);
                  memcpy(*data, temp_buffer[0].c_str(), size[0] + 1);
              } else {
                  *dim = 2;
@@ -880,7 +880,7 @@ public:
                  size[1] = (int)max_str_len;
                  
                  size_t buffer_bytes = total_elements * max_str_len;
-                 char* char_buffer = new char[buffer_bytes];
+                 char* char_buffer = (char*)malloc(buffer_bytes);
                  std::memset(char_buffer, 0, buffer_bytes);
                  for (size_t i = 0; i < total_elements; ++i) {
                      if (!temp_buffer[i].empty()) strncpy(char_buffer + (i * max_str_len), temp_buffer[i].c_str(), max_str_len);
@@ -929,7 +929,11 @@ public:
 
         // OPTIMISATION: Lecture groupée (Hyperslab Union)
         int res = panzer_db_ptr->readLeavesUnion(sorted_leaves, *data, actual_type_enum);
-        if (res < 0) return 0;
+        if (res < 0) {
+            free(*data);
+            *data = nullptr;
+            return 0;
+        }
 
         *datatype = actual_datatype; // On retourne le type qui a été lu
         return 1;
