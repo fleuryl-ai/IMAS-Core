@@ -809,6 +809,13 @@ public:
             total_elements += leaf->count;
         }
         
+        if (total_elements == 0) {
+            *data = nullptr;
+            *dim = 0;
+            // size can be left uninitialized as dim is 0
+            return 1; // Success, dataset is empty.
+        }
+
         const PanzerDB::Leaf* first_leaf = sorted_leaves[0];
         
         // FIX: Handle multiple static writes for scalars (overwrites).
@@ -845,6 +852,10 @@ public:
         }
 
         size_t leaf_rank = first_leaf->shape.size();
+
+        DEBUG_PRINT("Dataset " << dataset_name << " resolved to type " << actual_datatype
+            << " rank=" << leaf_rank << " total_elements=" << total_elements
+            << " first_shape=" << (first_leaf->shape.empty() ? "scalar" : "array"));
 
         // 3. Traitement CHAR / STRING
         // On lit toujours avec le type réel du fichier. La conversion sera faite par al_lowlevel.
@@ -936,6 +947,15 @@ public:
         }
 
         *datatype = actual_datatype; // On retourne le type qui a été lu
+        //DEBUG_PRINT("Returning numeric buffer: ptr=%p size=%zu dim=%d size[0]=%d type=%d",
+        //    *data, total_elements, *dim, size[0], *datatype);
+
+        // Pour test : décommente pour confirmer que le leak disparaît
+        // free(*data); *data = nullptr; return 1;   // ← si plus de leak → appelant ne libère JAMAIS
+        if (dataset_name == "global_quantities&ip" || dataset_name == "grid&rho_tor_norm") {
+            //free(*data);
+            //DEBUG_PRINT("Time dataset read complete: total_elements=" << total_elements);
+        }
         return 1;
     }
     

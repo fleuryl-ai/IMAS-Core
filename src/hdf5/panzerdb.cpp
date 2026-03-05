@@ -2287,6 +2287,13 @@ int PanzerDB::pz_readData_by_index(
 
         if (matches.empty()) return -1;
 
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            // shape_out can be left uninitialized
+            return 0; // Success, empty dataset
+        }
+
         // Simple case: single leaf
         if (matches.size() == 1) {
             const Leaf& leaf = *matches[0];
@@ -2499,6 +2506,12 @@ int PanzerDB::pz_readStringData_by_index(
 
         if (matches.empty()) return -1;
 
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0; // Success, empty dataset
+        }
+
         std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
             return a->time_index < b->time_index;
         });
@@ -2703,6 +2716,12 @@ int PanzerDB::pz_readComplexData_by_index(
         }
 
         if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0; // Success, empty dataset
+        }
 
         if (matches.size() == 1) {
             const Leaf& leaf = *matches[0];
