@@ -26,8 +26,8 @@ const int HDF5Backend::HDF5_BACKEND_VERSION_MINOR = 0;
 
 
 void
- HDF5Backend::createBackendComponents(std::string backend_version) {
-    printf("Creating backend components for version: %s\n", backend_version.c_str());
+ HDF5Backend::createBackendComponents(std::pair<int,int>  backend_version) {
+    printf("Creating backend components for version: %d.%d\n", backend_version.first, backend_version.second);
     HDF5BackendFactory backendFactory(backend_version);
     hdf5Writer = backendFactory.createWriter();
     hdf5Reader = backendFactory.createReader();
@@ -41,34 +41,35 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
     version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
   else
     {
-      std::string backend_version;
+    std::pair<int,int> required_version;
+    try {
+      std::string backend_version_from_file;
       files_path_strategy = HDF5Utils::MODIFIED_MDSPLUS_STRATEGY;
-      bool masterFileAlreadyOpened = (this->file_id != -1);
+      
       //we call openPulse() which reads the backend version from the master file (no attempt for opening the master file will be performed if it is already opened) 
-      HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
-      std::string::size_type pos = backend_version.find_first_of('.');
-      std::string version_major = backend_version.substr(0, pos);
-      std::string version_minor = backend_version.substr(pos+1, std::string::npos);
-      try {
-          version = {std::stoi( version_major ),std::stoi( version_minor )};
+      HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version_from_file, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
+      required_version = HDF5BackendFactory::getRequiredVersion(backend_version_from_file);
+      
         }
       catch (std::exception &e) {
             char error_message[200];
-            sprintf(error_message, "Unable to get backend version: %s\n", e.what());
+            sprintf(error_message, "Unable to get backend required version: %s\n", e.what());
             throw ALBackendException(error_message, LOG);
       }
+
+      version = required_version;
       
-      HDF5BackendFactory backendFactory(backend_version);
+      HDF5BackendFactory backendFactory(version);
       auto hdf5Reader_version = backendFactory.createReader();
+      bool masterFileAlreadyOpened = (this->file_id != -1);
       if (!masterFileAlreadyOpened) //the master pulse file is closed only if it was already closed before to call the getVersion() method
         hdf5Reader_version->closePulse(ctx, OPEN_PULSE, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
     }
   return version;
 }
 
-std::string HDF5Backend::getVersion() {
-    std::pair<int,int> version = getVersion(NULL);
-    return std::to_string(version.first) + "." + std::to_string(version.second);
+std::pair<int,int> HDF5Backend::getVersion() {
+    return getVersion(NULL);;
 }
 
 void
@@ -76,28 +77,33 @@ void
 {
     access_mode = mode;
 
-    std::string backend_version;
+    std::pair<int,int> backend_version;
     
     files_path_strategy = HDF5Utils::MODIFIED_MDSPLUS_STRATEGY;
+    std::string backend_version_str;
 
     switch (mode) {
-    case OPEN_PULSE:
-    case FORCE_OPEN_PULSE: 
-        {
-        int status = HDF5Utils::openPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
-        if (status == -1) { //master file doesn't exist
+        case OPEN_PULSE:
+        case FORCE_OPEN_PULSE: 
+            {
+            backend_version = getVersion(ctx);
+            backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
+            int status = HDF5Utils::openPulse(ctx, mode, backend_version_str, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
+            if (status == -1) { //master file doesn't exist
+                backend_version = getVersion();
+                backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
+                HDF5Utils::createPulse(ctx, mode, backend_version_str, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
+            }
+            break;
+            }
+        case CREATE_PULSE:
+        case FORCE_CREATE_PULSE:
             backend_version = getVersion();
-            HDF5Utils::createPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
-        }
-        break;
-        }
-    case CREATE_PULSE:
-    case FORCE_CREATE_PULSE:
-        backend_version = getVersion();
-        HDF5Utils::createPulse(ctx, mode, backend_version, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
-        break;
-    default:
-        throw ALBackendException("Mode not yet supported", LOG);
+            backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
+            HDF5Utils::createPulse(ctx, mode, backend_version_str, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
+            break;
+        default:
+            throw ALBackendException("Mode not yet supported", LOG);
     }
     createBackendComponents(backend_version);
 }

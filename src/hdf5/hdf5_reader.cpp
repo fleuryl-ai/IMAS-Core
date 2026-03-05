@@ -13,7 +13,7 @@
 #define HOMOGENEOUS_TIME_FIELD_NAME "ids_properties&homogeneous_time"
 #define HOMOGENEOUS_TIME_BASIS_FIELD_NAME "time"
 
-HDF5Reader::HDF5Reader(std::string backend_version_)
+HDF5Reader::HDF5Reader(std::pair<int,int> backend_version_)
     : backend_version(backend_version_), opened_data_sets(), opened_shapes_data_sets(), aos_opened_shapes_data_sets(), existing_data_sets(),
       tensorized_paths_per_context(), tensorized_paths_per_op_context(), arrctx_shapes_per_context(), homogeneous_time(-1),
       IDS_group_id(), slice_mode(GLOBAL_OP), data_interpolation_component()

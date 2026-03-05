@@ -853,10 +853,6 @@ public:
 
         size_t leaf_rank = first_leaf->shape.size();
 
-        DEBUG_PRINT("Dataset " << dataset_name << " resolved to type " << actual_datatype
-            << " rank=" << leaf_rank << " total_elements=" << total_elements
-            << " first_shape=" << (first_leaf->shape.empty() ? "scalar" : "array"));
-
         // 3. Traitement CHAR / STRING
         // On lit toujours avec le type réel du fichier. La conversion sera faite par al_lowlevel.
         if (actual_datatype == alconst::char_data) {
@@ -939,7 +935,7 @@ public:
         else return 0;
 
         // OPTIMISATION: Lecture groupée (Hyperslab Union)
-        int res = panzer_db_ptr->readLeavesUnion(sorted_leaves, *data, actual_type_enum);
+        int res = panzer_db_ptr->readLeavesUnion(sorted_leaves, *data, actual_type_enum); 
         if (res < 0) {
             free(*data);
             *data = nullptr;
@@ -947,15 +943,7 @@ public:
         }
 
         *datatype = actual_datatype; // On retourne le type qui a été lu
-        //DEBUG_PRINT("Returning numeric buffer: ptr=%p size=%zu dim=%d size[0]=%d type=%d",
-        //    *data, total_elements, *dim, size[0], *datatype);
-
-        // Pour test : décommente pour confirmer que le leak disparaît
-        // free(*data); *data = nullptr; return 1;   // ← si plus de leak → appelant ne libère JAMAIS
-        if (dataset_name == "global_quantities&ip" || dataset_name == "grid&rho_tor_norm") {
-            //free(*data);
-            //DEBUG_PRINT("Time dataset read complete: total_elements=" << total_elements);
-        }
+        
         return 1;
     }
     

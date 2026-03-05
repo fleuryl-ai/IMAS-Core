@@ -33,8 +33,8 @@ class HDF5Backend:public Backend {
     int access_mode;
     int files_path_strategy;
 
-     void createBackendComponents(std::string backend_version);
-     std::string getVersion();
+     void createBackendComponents(std::pair<int,int> backend_version);
+     std::pair<int,int> getVersion();
      std::string getPulseFilePath(DataEntryContext * ctx);
 
     void beginWriteArraystructAction(ArraystructContext * ctx, int *size);

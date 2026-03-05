@@ -26,7 +26,7 @@ using namespace boost::filesystem;
   } while (0)
 #endif
 
-HDF5Writer::HDF5Writer(std::string backend_version_)
+HDF5Writer::HDF5Writer(std::pair<int,int> backend_version_)
 :  backend_version(backend_version_), opened_data_sets(), existing_data_sets(), tensorized_paths_per_context(), arrctx_shapes_per_context(), 
 dynamic_AOS_slices_extension(), homogeneous_time(-1), IDS_group_id(), slice_mode(GLOBAL_OP)
 {
@@ -176,12 +176,15 @@ void HDF5Writer::create_IDS_group(OperationContext * ctx, hid_t file_id, std::un
     std::string IDSpulseFile = hdf5_utils.getIDSPulseFilePath(files_directory, relative_file_path, IDS_link_name);
     hid_t IDS_file_id = -1;
 
+    std::string backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
+
     if (opened_IDS_files.find(IDS_link_name) == opened_IDS_files.end()) {
             if (!exists(IDSpulseFile.c_str())) {
-                hdf5_utils.createIDSFile(ctx, IDSpulseFile, backend_version, &IDS_file_id);
+
+                hdf5_utils.createIDSFile(ctx, IDSpulseFile, backend_version_str, &IDS_file_id);
             }
             else {
-                hdf5_utils.openIDSFile(ctx, IDSpulseFile, &IDS_file_id, false, backend_version);
+                hdf5_utils.openIDSFile(ctx, IDSpulseFile, &IDS_file_id, false, backend_version_str);
             }
         
         opened_IDS_files[IDS_link_name] = IDS_file_id;
@@ -190,10 +193,10 @@ void HDF5Writer::create_IDS_group(OperationContext * ctx, hid_t file_id, std::un
         IDS_file_id = opened_IDS_files[IDS_link_name];
         if (IDS_file_id == -1) { //file not opened
             if (!exists(IDSpulseFile.c_str())) {
-                hdf5_utils.createIDSFile(ctx, IDSpulseFile, backend_version, &IDS_file_id);
+                hdf5_utils.createIDSFile(ctx, IDSpulseFile, backend_version_str, &IDS_file_id);
             }
             else {
-                hdf5_utils.openIDSFile(ctx, IDSpulseFile, &IDS_file_id, false, backend_version);
+                hdf5_utils.openIDSFile(ctx, IDSpulseFile, &IDS_file_id, false, backend_version_str);
             }
             
             opened_IDS_files[IDS_link_name] = IDS_file_id;

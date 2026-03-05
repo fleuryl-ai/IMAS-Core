@@ -14,8 +14,6 @@
 
 
 class HDF5Writer_v2 : public HDF5Writer {
-public: // Members accessed by strategies
-  std::string backend_version;
 
 private:
    std::unique_ptr<PanzerDB> panzer_db_ptr;
@@ -23,7 +21,7 @@ private:
    std::unordered_set<ArraystructContext*> initialized_aos;
 
 public:
-  HDF5Writer_v2(std::string backend_version_);
+  HDF5Writer_v2(std::pair<int,int> backend_version_);
   ~HDF5Writer_v2();
 
 

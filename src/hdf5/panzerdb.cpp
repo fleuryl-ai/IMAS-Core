@@ -1483,7 +1483,7 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
     hid_t memspace = H5Screate_simple(1, &hcount, NULL);
 
     // HDF5 reads variable-length strings into a char* array
-    char** rdata = (char**)malloc(sizeof(char*) * hcount); 
+    char** rdata = (char**)calloc(hcount, sizeof(char*)); 
     hid_t str_type_vl = H5Tcopy(H5T_C_S1);
     H5Tset_size(str_type_vl, H5T_VARIABLE);
     H5Tset_cset(str_type_vl, H5T_CSET_UTF8);

@@ -12,7 +12,7 @@
 class HDF5Writer {
   private:
 
-    std::string backend_version;
+    std::pair<int,int> backend_version;
     std::unordered_map < std::string, std::unique_ptr < HDF5DataSetHandler > > opened_data_sets;
     std::unordered_map < std::string, hid_t > existing_data_sets;
     std::unordered_map < ArraystructContext *, std::vector < std::string >> tensorized_paths_per_context;
@@ -32,7 +32,7 @@ class HDF5Writer {
  
   public:
 
-     HDF5Writer(std::string backend_version_);
+     HDF5Writer(std::pair<int,int> backend_version_);
     virtual ~HDF5Writer();
 
      int homogeneous_time;

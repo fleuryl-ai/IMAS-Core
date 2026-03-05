@@ -29,7 +29,7 @@ class HDF5Reader_v2 : public HDF5Reader {
 
   public:
 
-     HDF5Reader_v2(std::string backend_version_);
+     HDF5Reader_v2(std::pair<int,int> backend_version_);
     ~HDF5Reader_v2() override;
 
     void open_IDS_group(OperationContext * ctx, hid_t file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative_file_path) override;

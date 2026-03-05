@@ -28,8 +28,8 @@
 
 using namespace boost::filesystem;
 
-HDF5Writer_v2::HDF5Writer_v2(std::string backend_version_)
-    : HDF5Writer(backend_version_), backend_version(backend_version_)
+HDF5Writer_v2::HDF5Writer_v2(std::pair<int,int> backend_version_)
+    : HDF5Writer(backend_version_)
        {
   // H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
 

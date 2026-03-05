@@ -16,11 +16,11 @@
 
 class HDF5BackendFactory {
   private:
-    std::string backend_version_;
+    std::pair<int,int> backend_version_;
 
   public:
 
-    HDF5BackendFactory(std::string backend_version);
+    HDF5BackendFactory(std::pair<int,int> backend_version);
     ~HDF5BackendFactory();
 
   /**
@@ -37,6 +37,8 @@ class HDF5BackendFactory {
    Creates a events handler instance according to the backend version passed to the factory.
    **/
     std::unique_ptr < HDF5EventsHandler > createEventsHandler();
+
+  static std::pair<int,int> getRequiredVersion(const std::string &backend_version_from_file);
 
 };
 

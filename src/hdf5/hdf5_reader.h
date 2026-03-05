@@ -19,7 +19,7 @@ class HDF5Reader {
     typedef herr_t(* H5L_iterate1_t) (hid_t group, const char *name, const H5L_info_t *info, void *op_data);
     static herr_t iterate_callback (hid_t loc_id, const char *name, const H5L_info_t *info, void *callback_data);
     
-    std::string backend_version;
+    std::pair<int,int> backend_version;
     std::unordered_map < std::string, std::unique_ptr < HDF5DataSetHandler > > opened_data_sets;
     std::unordered_map < std::string, std::unique_ptr < HDF5DataSetHandler > > opened_shapes_data_sets;
     std::unordered_map < std::string, std::unique_ptr < HDF5DataSetHandler > > aos_opened_shapes_data_sets;
@@ -78,7 +78,7 @@ class HDF5Reader {
 
   public:
 
-     HDF5Reader(std::string backend_version_);
+     HDF5Reader(std::pair<int,int> backend_version_);
     virtual ~HDF5Reader();
     virtual std::string getVersion();
 
