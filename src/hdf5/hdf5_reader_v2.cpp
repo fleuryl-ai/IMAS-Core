@@ -45,8 +45,7 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
         gid = it->second;
     }
 
-    if (gid < 0)
-        throw ALBackendException("HDF5Reader_v2: Could not get a valid group ID to create a read strategy.", LOG);
+    if (gid < 0) return;
 
     if (ctx->getRangemode() == GLOBAL_OP) { 
         read_strategy = std::make_unique<GlobalReadStrategy>(gid); 
@@ -73,37 +72,46 @@ void HDF5Reader_v2::beginReadArraystructAction(ArraystructContext *ctx, int *siz
 
 void HDF5Reader_v2::endAction(Context *ctx)
 {
-    read_strategy->endAction(ctx);
-
+    if (read_strategy) {
+        read_strategy->endAction(ctx);
+    }
 }
 
 // Délégation de la méthode read_ND_Data à la stratégie de lecture
 int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                  int *datatype, void **data, int *dim, int *size) {
-    // La logique de lecture est maintenant déléguée à l'objet de stratégie
-  //printf("HDF5Reader_v2::read_ND_Data called for dataset '%s' with timebasename='%s'\n", dataset_name.c_str(), timebasename.c_str());
-
-  /*if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-    ArraystructContext* arrCtx = static_cast<ArraystructContext*>(ctx);
-    printf("Context path: %s\n", arrCtx->getPath().c_str());
-    while(arrCtx) {
-        printf("  - ArraystructContext at path: %s, index: %d\n", arrCtx->getPath().c_str(), arrCtx->getIndex());
-        arrCtx = arrCtx->getParent() && arrCtx->getParent()->getType() == CTX_ARRAYSTRUCT_TYPE 
-                 ? static_cast<ArraystructContext*>(arrCtx->getParent()) 
-                 : nullptr;
+  OperationContext *opctx = nullptr;
+    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE)
+    {
+        opctx = (static_cast<ArraystructContext *>(ctx))->getOperationContext();
     }
-  
-  }*/
-  // Utilisation de la sanitization intelligente via la stratégie
-  //std::string dataset_name_copy = read_strategy->sanitize_path(ctx, dataset_name);
-  //std::string timebasename_copy = read_strategy->sanitize_path(ctx, timebasename);
+    else
+    {
+        opctx = static_cast<OperationContext *>(ctx);
+    }
+  hid_t gid = -1;
+  auto got_gid = IDS_group_id.find(opctx);
+  if (got_gid != IDS_group_id.end())
+        gid = got_gid->second;
+
+  if (gid == -1) // IDS does not exist in the file
+    return 0;
+
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
   std::replace(dataset_name_copy.begin(), dataset_name_copy.end(), '/', '&');
-
-  printf("HDF5Reader_v2::read_ND_Data called for dataset: %s\n", dataset_name.c_str());
+  printf("--> HDF5Reader_v2::read_ND_Data called for dataset: %s\n", dataset_name_copy.c_str());
+  printf("  Timebase: %s\n", timebasename_copy.c_str());
+  printf("  Datatype requested: %d\n", *datatype);
+  printf("  OperationContext range mode: %d\n", opctx->getRangemode());
+  printf("  OperationContext target time: %f\n", opctx->getTime());
+  
   int status = read_strategy->read_ND_Data(ctx, dataset_name_copy, timebasename_copy, datatype, data, dim, size);
-  //printf("done HDF5Reader_v2::read_ND_Data for dataset: %s with status: %d\n", dataset_name.c_str(), status);
-  //printf("Data dimension: %d\n", *dim);
+  printf("  Status: %d\n", status);
+  //printf("data = %s\n", *(char **)data);
+  //printf("data=%p\n", *data);
+  if (status == 1 && (*datatype == alconst::char_data)){
+    printf("-->data = %s\n", *(char **)data);
+  } 
   return status;
 }

@@ -664,6 +664,12 @@ public:
     int read_dataset_globally(Context *ctx, std::string &dataset_name, int* datatype, void **data, int *dim, int *size) {
         DEBUG_PRINT("--> Entering read_dataset_globally for dataset: " << dataset_name);
 
+        /*if (!ctx) {
+            throw ALBackendException("read_dataset_globally received nullptr context", LOG);
+        }*/
+
+        int type = ctx->getType();
+
         if (!panzer_db_ptr) {
             throw ALBackendException("PanzerDB not initialized", LOG);
         }
@@ -688,7 +694,16 @@ public:
         std::vector<bool> is_dynamic_level;
         int64_t target_time_index = -1;
         Context* curr = ctx;
+        
+        // DEBUG: Vérification du pointeur ctx
+        /*if (curr == nullptr) {
+            std::cerr << "[ERROR] read_dataset_globally: ctx is NULL!" << std::endl;
+            return 0;
+        }*/
+        // std::cerr << "[DEBUG] read_dataset_globally: ctx address = " << curr << std::endl;
+
         while (curr != nullptr) {
+            // Crash potentiel ici si curr est invalide
             if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
                 ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
                 std::string full_path = arr->getPath(); 
@@ -798,6 +813,9 @@ public:
             DEBUG_PRINT("Leaf not found for: " << specific_path << " or generic variant");
             return 0;
         }
+        else {
+            DEBUG_PRINT("Number of candidate leaves found: " << sorted_leaves.size());
+        }
 
         std::sort(sorted_leaves.begin(), sorted_leaves.end(), 
             [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
@@ -808,7 +826,9 @@ public:
         for (const auto* leaf : sorted_leaves) {
             total_elements += leaf->count;
         }
-        
+
+        DEBUG_PRINT("Total elements to read (after filtering by time index): " << total_elements);
+
         if (total_elements == 0) {
             *data = nullptr;
             *dim = 0;
@@ -855,7 +875,9 @@ public:
 
         // 3. Traitement CHAR / STRING
         // On lit toujours avec le type réel du fichier. La conversion sera faite par al_lowlevel.
+        DEBUG_PRINT("Actual data type determined from leaf flags: " << actual_datatype);
         if (actual_datatype == alconst::char_data) {
+             DEBUG_PRINT("Processing string data...");
              std::vector<std::string> temp_buffer;
              temp_buffer.reserve(total_elements);
              for (const auto* leaf : sorted_leaves) {
@@ -873,15 +895,18 @@ public:
              // Scalar string: shape is empty (rank 0).
              // List of strings: shape has rank 1.
              bool is_scalar_leaf = (first_leaf->shape.empty());
-             
+             DEBUG_PRINT("Is scalar leaf: " << is_scalar_leaf);
+
              bool return_as_scalar = (is_scalar_leaf && total_elements == 1);
 
              if (return_as_scalar) {
+                DEBUG_PRINT("Detected scalar string leaf. Returning as single string.");
                  *dim = 1;
                  size[0] = (int)temp_buffer[0].size(); // Length excluding null
                  *data = (char*)malloc(size[0] + 1);
                  memcpy(*data, temp_buffer[0].c_str(), size[0] + 1);
              } else {
+                 DEBUG_PRINT("Detected list of strings. Returning as 2D char array with max string length: " << max_str_len);
                  *dim = 2;
                  size[0] = (int)total_elements;
                  size[1] = (int)max_str_len;

@@ -83,9 +83,6 @@ void SliceReadStrategy::endAction(Context *ctx) {
 int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                     int *datatype, void **data, int *dim, int *size) {
     
-    //bool is_timed = isTimedContext(ctx);
-    //if (!is_timed && timebasename.empty()) return 0;
-
     int homogeneous_time = getHomogeneousTime();
     
      if (timebasename.empty() && !isTimedContext(ctx)) {                              

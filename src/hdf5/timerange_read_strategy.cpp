@@ -66,7 +66,12 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
 }
 
 void TimeRangeReadStrategy::endAction(Context *ctx) {
-    
+    /*if (ctx->getType() == CTX_OPERATION_TYPE) {
+        if (panzer_db_ptr) {
+            panzer_db_ptr->dumpLeavesCache(); // Affiche le contenu de l'index pour le débogage
+            panzer_db_ptr->close();
+        }
+    }*/
 }
 
 int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,

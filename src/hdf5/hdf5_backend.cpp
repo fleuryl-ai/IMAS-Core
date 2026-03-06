@@ -27,7 +27,7 @@ const int HDF5Backend::HDF5_BACKEND_VERSION_MINOR = 0;
 
 void
  HDF5Backend::createBackendComponents(std::pair<int,int>  backend_version) {
-    printf("Creating backend components for version: %d.%d\n", backend_version.first, backend_version.second);
+    
     HDF5BackendFactory backendFactory(backend_version);
     hdf5Writer = backendFactory.createWriter();
     hdf5Reader = backendFactory.createReader();
@@ -37,8 +37,21 @@ void
 std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
 {
   std::pair<int,int> version;
-  if(ctx==NULL)
-    version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
+  if(ctx==NULL){ 
+    if (getenv("IMAS_HDF5_BACKEND_VERSION") != NULL) {
+      std::string env_version_str(getenv("IMAS_HDF5_BACKEND_VERSION"));
+      size_t dot_pos = env_version_str.find('.');
+      if (dot_pos != std::string::npos) {
+        int major = std::stoi(env_version_str.substr(0, dot_pos));
+        int minor = std::stoi(env_version_str.substr(dot_pos + 1));
+        version = {major, minor};
+      } else {
+        version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
+      }
+    } else {
+      version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
+    }
+  } 
   else
     {
     std::pair<int,int> required_version;
@@ -49,7 +62,7 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
       //we call openPulse() which reads the backend version from the master file (no attempt for opening the master file will be performed if it is already opened) 
       HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version_from_file, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
       required_version = HDF5BackendFactory::getRequiredVersion(backend_version_from_file);
-      
+      printf("Required backend components will be created for version: %d.%d\n", required_version.first, required_version.second);
         }
       catch (std::exception &e) {
             char error_message[200];

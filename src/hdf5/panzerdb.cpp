@@ -2034,24 +2034,24 @@ void PanzerDB::dumpIndexBuffer() const {
 
 void PanzerDB::dumpLeavesCache() const {
     const auto& leaves = getLeaves();
-    std::cout << "=== PanzerDB Index Table (" << leaves.size() << " entries) ===" << std::endl;
-    std::cout << std::left << std::setw(60) << "Path" 
+    std::cerr << "=== PanzerDB Index Table (" << leaves.size() << " entries) ===" << std::endl;
+    std::cerr << std::left << std::setw(60) << "Path" 
               << std::setw(10) << "TimeIdx" 
               << std::setw(10) << "Count" 
               << std::setw(15) << "Offset" 
               << "Shape" << std::endl;
     
     for (const auto& leaf : leaves) {
-        std::cout << std::left << std::setw(60) << leaf.path 
+        std::cerr << std::left << std::setw(60) << leaf.path 
                   << std::setw(10) << leaf.time_index 
                   << std::setw(10) << leaf.count 
                   << std::setw(15) << leaf.offset << " [";
         for (size_t i = 0; i < leaf.shape.size(); ++i) {
-            std::cout << leaf.shape[i] << (i < leaf.shape.size() - 1 ? "," : "");
+            std::cerr << leaf.shape[i] << (i < leaf.shape.size() - 1 ? "," : "");
         }
-        std::cout << "]" << std::endl;
+        std::cerr << "]" << std::endl;
     }
-    std::cout << "============================================" << std::endl;
+    std::cerr << "============================================" << std::endl;
 }
 
 void PanzerDB::endArray() {
