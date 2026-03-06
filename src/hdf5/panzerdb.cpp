@@ -1476,10 +1476,22 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
     hid_t dset_id = data_dset_str;
     if (dset_id < 0) throw std::runtime_error("Dataset for string type is not open");
 
+    // DEBUG: Check if dset_id is valid
+    H5I_type_t id_type = H5Iget_type(dset_id);
+    if (id_type != H5I_DATASET) {
+        std::cerr << "[PanzerDB] CRITICAL ERROR: data_dset_str (" << dset_id << ") is not a dataset! Type: " << id_type << std::endl;
+        throw std::runtime_error("Internal error: String dataset ID is invalid");
+    }
+
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
     hid_t space = H5Dget_space(dset_id);
-    H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL);
+    if (space < 0) throw std::runtime_error("H5Dget_space failed");
+
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL) < 0) {
+        H5Sclose(space);
+        throw std::runtime_error("H5Sselect_hyperslab failed");
+    }
     hid_t memspace = H5Screate_simple(1, &hcount, NULL);
 
     // HDF5 reads variable-length strings into a char* array
