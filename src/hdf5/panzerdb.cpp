@@ -1488,7 +1488,14 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
     H5Tset_size(str_type_vl, H5T_VARIABLE);
     H5Tset_cset(str_type_vl, H5T_CSET_UTF8);
 
-    H5Dread(dset_id, str_type_vl, memspace, space, H5P_DEFAULT, rdata);
+    herr_t status = H5Dread(dset_id, str_type_vl, memspace, space, H5P_DEFAULT, rdata);
+    if (status < 0) {
+        std::cerr << "[PanzerDB] Error: H5Dread failed for string tensor at offset " << leaf.offset << " count " << leaf.count << std::endl;
+        H5Eprint2(H5E_DEFAULT, stderr);
+    }
+    else{
+        printf("[PanzerDB] Successfully read string tensor: offset = %llu, count = %llu\n", leaf.offset, leaf.count);
+    }  
 
     for (size_t i = 0; i < hcount; ++i) {
         if (rdata[i] != nullptr) {
