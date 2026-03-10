@@ -33,7 +33,7 @@ target_sources( al PRIVATE
     timerange_read_strategy.cpp
 )
 # target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_WRITER_V2 )
-target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_READER_V2 )
+# target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_READER_V2 )
 target_compile_definitions( al PRIVATE -DHDF5 )
 if(WIN32)
 	# Use modern CMake targets if available (vcpkg), otherwise legacy variables

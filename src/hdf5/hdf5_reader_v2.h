@@ -22,10 +22,15 @@ class HDF5Reader_v2 : public HDF5Reader {
   private:
 
     void read_homogeneous_time(int* homogenenous_time, hid_t gid);
-
     void build_path_index();
+    void select_strategy(OperationContext *ctx, hid_t gid);
+    void prepare_strategy(Context *ctx);
     
-    std::unique_ptr<IReadStrategy> read_strategy; // Stratégie de lecture
+    std::unique_ptr<IReadStrategy> global_strategy;
+    std::unique_ptr<IReadStrategy> slice_strategy;
+    std::unique_ptr<IReadStrategy> timerange_strategy;
+
+    IReadStrategy* read_strategy = nullptr; // Stratégie de lecture
 
   public:
 
