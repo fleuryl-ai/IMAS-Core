@@ -1470,27 +1470,35 @@ template<>
 void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const {
     if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
     if (static_cast<DataType>(leaf.flags >> 4) != DataType::STRING) {
-        throw std::runtime_error("Mismatched data type for readTensor<std::string>");
+        throw ALBackendException("Mismatched data type for readTensor<std::string>", LOG);
     }
 
-    hid_t dset_id = data_dset_str;
-    if (dset_id < 0) throw std::runtime_error("Dataset for string type is not open");
-
-    // DEBUG: Check if dset_id is valid
-    H5I_type_t id_type = H5Iget_type(dset_id);
+    // Check validity and attempt recovery if needed
+    H5I_type_t id_type = H5Iget_type(data_dset_str);
     if (id_type != H5I_DATASET) {
-        std::cerr << "[PanzerDB] CRITICAL ERROR: data_dset_str (" << dset_id << ") is not a dataset! Type: " << id_type << std::endl;
-        throw std::runtime_error("Internal error: String dataset ID is invalid");
+        /*std::cerr << "[PanzerDB] WARNING: data_dset_str (" << data_dset_str << ") is invalid (Type: " << id_type << "). Attempting to reopen..." << std::endl;
+        
+        if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) {
+            data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
+            if (data_dset_str < 0) {
+                 throw std::runtime_error("Failed to recover data_dset_str");
+            }
+            std::cerr << "[PanzerDB] Successfully reopened data_dset_str: " << data_dset_str << std::endl;
+        } else {
+            throw std::runtime_error("Dataset for string type is not open and does not exist in file");
+        }*/
+         throw ALBackendException("Dataset for string type is not open", LOG);
     }
+    
+    hid_t dset_id = data_dset_str;
 
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
     hid_t space = H5Dget_space(dset_id);
-    if (space < 0) throw std::runtime_error("H5Dget_space failed");
-
+    if (space < 0) throw ALBackendException("H5Dget_space failed", LOG);
     if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL) < 0) {
         H5Sclose(space);
-        throw std::runtime_error("H5Sselect_hyperslab failed");
+        throw ALBackendException("H5Sselect_hyperslab failed", LOG);
     }
     hid_t memspace = H5Screate_simple(1, &hcount, NULL);
 
@@ -1502,12 +1510,13 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
 
     herr_t status = H5Dread(dset_id, str_type_vl, memspace, space, H5P_DEFAULT, rdata);
     if (status < 0) {
-        std::cerr << "[PanzerDB] Error: H5Dread failed for string tensor at offset " << leaf.offset << " count " << leaf.count << std::endl;
-        H5Eprint2(H5E_DEFAULT, stderr);
+        //std::cerr << "[PanzerDB] Error: H5Dread failed for string tensor at offset " << leaf.offset << " count " << leaf.count << std::endl;
+        //H5Eprint2(H5E_DEFAULT, stderr);
+        throw ALBackendException("H5Dread failed for string tensor", LOG);
     }
-    else{
+    /*else{
         printf("[PanzerDB] Successfully read string tensor: offset = %llu, count = %llu\n", leaf.offset, leaf.count);
-    }  
+    } */ 
 
     for (size_t i = 0; i < hcount; ++i) {
         if (rdata[i] != nullptr) {
@@ -1538,7 +1547,7 @@ void PanzerDB::writeDataImpl(const std::string& name,
                               std::vector<T>& buffer) {
     // ✅ ASSERT: timebase must be empty (static data only)
     if (!timebase.empty()) {
-        throw std::runtime_error("writeData with timebase not allowed, use writeDataSlices");
+        throw ALBackendException("writeData with timebase not allowed, use writeDataSlices", LOG);
     }
     
     last_level_had_write = true;

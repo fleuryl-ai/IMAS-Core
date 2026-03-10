@@ -16,6 +16,7 @@ HDF5EventsHandler::~HDF5EventsHandler()
 void
 HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, HDF5Writer & writer, HDF5Reader & reader, std::string & files_directory, std::string & relative_file_path, int access_mode)
 {
+	printf("HDF5EventsHandler::beginAction called for context type %d\n", ctx->getType());
 	hid_t loc_id = -1;
 	strategy_set = false;
 	if (ctx->getAccessmode() == WRITE_OP && ctx->getRangemode() == GLOBAL_OP) {
@@ -28,9 +29,7 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 		HDF5Utils hdf5_utils;
 		std::string IDS_pulse_file = hdf5_utils.getIDSPulseFilePath(files_directory, relative_file_path, IDS_link_name);
 		bool call_put_required = false;
-		
 		if (hdf5_utils.pulseFileExists(IDS_pulse_file)) {
-			
 			writer.open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path, &loc_id);
 			writer.setWriteStrategy(SLICE_OP, loc_id);
 			strategy_set = true;
@@ -63,7 +62,7 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 		}
 		
 	} else if (ctx->getAccessmode() == READ_OP) {
-		//printf("reader version: %s\n", reader.getVersion().c_str());
+		printf("READ_OP detected in beginAction, opening IDS group for reading\n");
 		reader.open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path);
 		reader.setSliceMode(ctx);
 	}

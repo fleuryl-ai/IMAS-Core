@@ -695,13 +695,7 @@ public:
         int64_t target_time_index = -1;
         Context* curr = ctx;
         
-        // DEBUG: Vérification du pointeur ctx
-        /*if (curr == nullptr) {
-            std::cerr << "[ERROR] read_dataset_globally: ctx is NULL!" << std::endl;
-            return 0;
-        }*/
-        // std::cerr << "[DEBUG] read_dataset_globally: ctx address = " << curr << std::endl;
-
+    
         while (curr != nullptr) {
             // Crash potentiel ici si curr est invalide
             if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {

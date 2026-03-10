@@ -44,19 +44,45 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
     if (it != IDS_group_id.end()) {
         gid = it->second;
     }
-
+    printf("HDF5Reader_v2::open_IDS_group called for OperationContext, gid: %d\n", gid);
     if (gid < 0) return;
 
     if (ctx->getRangemode() == GLOBAL_OP) { 
+        printf("Initializing GlobalReadStrategy for OperationContext\n");
         read_strategy = std::make_unique<GlobalReadStrategy>(gid); 
-    } else if (ctx->getRangemode() == SLICE_OP) { 
+    } else if (ctx->getRangemode() == SLICE_OP) {
+        printf("Initializing SliceReadStrategy for OperationContext\n"); 
         read_strategy = std::make_unique<SliceReadStrategy>(gid); 
     } else if (ctx->getRangemode() == TIMERANGE_OP) { 
+        printf("Initializing TimeRangeReadStrategy for OperationContext\n");
         read_strategy = std::make_unique<TimeRangeReadStrategy>(gid); 
     } else {
         throw ALBackendException("Unkwown operation context range mode", LOG);
     }
 }
+
+/*void HDF5Reader_v2::select_strategy(OperationContext *ctx) {
+    hid_t gid = -1;
+    auto it = IDS_group_id.find(ctx);
+    if (it != IDS_group_id.end()) {
+        gid = it->second;
+    }
+
+    if (gid < 0) return;
+     if (ctx->getRangemode() == GLOBAL_OP) { 
+        printf("Initializing GlobalReadStrategy for OperationContext\n");
+        read_strategy = std::make_unique<GlobalReadStrategy>(gid); 
+    } else if (ctx->getRangemode() == SLICE_OP) {
+        printf("Initializing SliceReadStrategy for OperationContext\n"); 
+        read_strategy = std::make_unique<SliceReadStrategy>(gid); 
+    } else if (ctx->getRangemode() == TIMERANGE_OP) { 
+        printf("Initializing TimeRangeReadStrategy for OperationContext\n");
+        read_strategy = std::make_unique<TimeRangeReadStrategy>(gid); 
+    } else {
+        throw ALBackendException("Unkwown operation context range mode", LOG);
+    }
+
+}*/
 
 void HDF5Reader_v2::close_group(OperationContext *ctx)
 {
@@ -72,7 +98,9 @@ void HDF5Reader_v2::beginReadArraystructAction(ArraystructContext *ctx, int *siz
 
 void HDF5Reader_v2::endAction(Context *ctx)
 {
-    if (read_strategy) {
+    auto op_ctx = static_cast<OperationContext *>(ctx);
+
+    if (read_strategy && IDS_group_id.size() == 1 && IDS_group_id.count(op_ctx)) {
         read_strategy->endAction(ctx);
     }
 }
@@ -100,7 +128,7 @@ int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::st
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
   std::replace(dataset_name_copy.begin(), dataset_name_copy.end(), '/', '&');
-  printf("--> HDF5Reader_v2::read_ND_Data called for dataset: %s\n", dataset_name_copy.c_str());
+  printf("--> HDF5Reader_v2::read_ND_Data called for dataset: %s, gid: %d\n", dataset_name_copy.c_str(), gid);
   printf("  Timebase: %s\n", timebasename_copy.c_str());
   printf("  Datatype requested: %d\n", *datatype);
   printf("  OperationContext range mode: %d\n", opctx->getRangemode());
@@ -108,10 +136,15 @@ int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::st
   
   int status = read_strategy->read_ND_Data(ctx, dataset_name_copy, timebasename_copy, datatype, data, dim, size);
   printf("  Status: %d\n", status);
+  printf("Dim: %d\n", *dim);
+  //printf("Size: %d\n", *size);
+  for (int i = 0; i < *dim; ++i) {
+      printf("  Axis shape[%d]: %d\n", i, size[i]);
+  }
   //printf("data = %s\n", *(char **)data);
   //printf("data=%p\n", *data);
-  if (status == 1 && (*datatype == alconst::char_data)){
+  /*if (status == 1 && (*datatype == alconst::char_data)){
     printf("-->data = %s\n", *(char **)data);
-  } 
+  } */
   return status;
 }

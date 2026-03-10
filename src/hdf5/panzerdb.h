@@ -114,10 +114,10 @@ private:
     hid_t parent_paths_dset = -1;
 
     // Datasets for each data type
-    hid_t data_dset_f64 = -1; // double
-    hid_t data_dset_i32 = -1; // int64_t
-    hid_t data_dset_c128 = -1; // complex
-    hid_t data_dset_str = -1; // string
+    mutable hid_t data_dset_f64 = -1; // double
+    mutable hid_t data_dset_i32 = -1; // int64_t
+    mutable hid_t data_dset_c128 = -1; // complex
+    mutable hid_t data_dset_str = -1; // string
 
     // Cache for dataset sizes to avoid H5Dget_space calls
     hsize_t disk_size_f64 = 0;
@@ -249,6 +249,10 @@ public:
 
     PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty_nodes = false);
     PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty_nodes = false, bool close_loc_id_on_exit = false);
+
+    // Disable copy to prevent accidental closure of HDF5 handles by temporary copies
+    PanzerDB(const PanzerDB&) = delete;
+    PanzerDB& operator=(const PanzerDB&) = delete;
 
     ~PanzerDB();
 

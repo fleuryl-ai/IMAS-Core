@@ -26,7 +26,6 @@ GlobalReadStrategy::GlobalReadStrategy(hid_t loc_id)
 
 void GlobalReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
 
-
     std::string aos_path_token = getPath(ctx, false);
     DEBUG_PRINT("Preparing AOS for path: " << aos_path_token);
     auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);

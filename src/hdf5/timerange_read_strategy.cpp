@@ -66,12 +66,15 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
 }
 
 void TimeRangeReadStrategy::endAction(Context *ctx) {
-    /*if (ctx->getType() == CTX_OPERATION_TYPE) {
-        if (panzer_db_ptr) {
-            panzer_db_ptr->dumpLeavesCache(); // Affiche le contenu de l'index pour le débogage
-            panzer_db_ptr->close();
-        }
-    }*/
+    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+        // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
+    } else if (ctx->getType() == CTX_OPERATION_TYPE) {
+        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
+        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
+        if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
+    }
+  else{
+  }
 }
 
 int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,

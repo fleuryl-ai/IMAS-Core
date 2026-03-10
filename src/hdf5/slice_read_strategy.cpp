@@ -72,9 +72,9 @@ void SliceReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
+        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
         //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
-
     }
   else{
   }
