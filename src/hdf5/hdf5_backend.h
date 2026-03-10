@@ -56,10 +56,10 @@ class HDF5Backend:public Backend {
      This function opens a database entry described by the passed pulse context.
      @param[in] ctx pointer on pulse context
      @param[in] mode opening option:
-     - OPEN_PULSE = open an existing pulse (only if exist)
-     - FORCE_OPEN_PULSE = open a pulse (create it if not exist)
-     - CREATE_PULSE = create a new pulse (do not overwrite if already exist)
-     - FORCE_CREATE_PULSE = create a new pulse (erase old one if already exist)
+     - OPEN_PULSE = open an existing pulse (only if it exists)
+     - FORCE_OPEN_PULSE = open a pulse (create it if it does not exist)
+     - CREATE_PULSE = create a new pulse (do not overwrite if it already exists)
+     - FORCE_CREATE_PULSE = create a new pulse (erase the old one if it already exists)
      @throw BackendException
 	 */
     void openPulse(DataEntryContext * ctx, int mode) override;
@@ -98,7 +98,7 @@ class HDF5Backend:public Backend {
      This function reads a signal in the database given the passed operation context.
      @param[in] ctx pointer on operation context
      @param[in] fieldname field name
-     @param[in] istimed specify the time-dependency of the field
+     @param[in] timebase time base field name
      @param[out] data returned pointer on the read data 
      @param[out] datatype type of data to be read:
      - CHAR_DATA strings

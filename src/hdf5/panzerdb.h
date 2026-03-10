@@ -71,20 +71,20 @@
  */
 struct ChunkingConfig {
     // Index table chunking
-    size_t index_chunk_rows = 8192;           // Nombre de rows par chunk
+    size_t index_chunk_rows = 8192;           // Number of rows per chunk
     
-    // Data chunking (par type)
-    size_t data_chunk_f64 = 131072;           // 1 MB par chunk (131k doubles)
-    size_t data_chunk_i32 = 262144;           // 1 MB par chunk (262k int32)
-    size_t data_chunk_c128 = 65536;           // 1 MB par chunk (65k complex)
-    size_t data_chunk_str = 8192;             // 8k strings par chunk
+    // Data chunking (by type)
+    size_t data_chunk_f64 = 131072;           // 1 MB per chunk (131k doubles)
+    size_t data_chunk_i32 = 262144;           // 1 MB per chunk (262k int32)
+    size_t data_chunk_c128 = 65536;           // 1 MB per chunk (65k complex)
+    size_t data_chunk_str = 8192;             // 8k strings per chunk
     
     // Path chunking
-    size_t path_chunk_entries = 8192;         // 8k paths par chunk
+    size_t path_chunk_entries = 8192;         // 8k paths per chunk
     
     // Compression settings
     bool enable_compression = true;
-    int compression_level = 6;                // 0-9, 6 est un bon compromis
+    int compression_level = 6;                // 0-9, 6 is a good compromise
     
     // Cache settings (HDF5 metadata cache)
     size_t metadata_cache_size = 16 * 1024 * 1024;  // 16 MB
@@ -257,7 +257,7 @@ private:
 
     // Reusable scratch buffers to avoid repetitive malloc/free on reads
     mutable std::vector<double> scratch_f64;
-    mutable std::vector<int32_t> scratch_i32; // Pas utilisé dans le code actuel mais prêt
+    mutable std::vector<int32_t> scratch_i32; // Not used in current code but ready
     mutable std::vector<std::complex<double>> scratch_c128;
     mutable std::vector<std::string> scratch_str;
 

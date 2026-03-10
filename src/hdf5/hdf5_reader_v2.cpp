@@ -10,7 +10,7 @@
 #include "hdf5_utils.h"
 
 
-// Macro de debug
+// Debug macro
 #ifdef DEBUG_HDF5_READER_V2
 #define DEBUG_PRINT(msg) \
   std::cerr << "[DEBUG " << __func__ << "] " << msg << std::endl
@@ -86,7 +86,7 @@ void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
 }
 
 void HDF5Reader_v2::prepare_strategy(Context *ctx) {
-    // 1. Extraire l'OperationContext selon le type de contexte
+    // 1. Extract the OperationContext according to the context type
     OperationContext *opctx = nullptr;
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         opctx = static_cast<ArraystructContext *>(ctx)->getOperationContext();
@@ -94,7 +94,7 @@ void HDF5Reader_v2::prepare_strategy(Context *ctx) {
         opctx = static_cast<OperationContext *>(ctx);
     }
 
-    // 2. Trouver le GID
+    // 2. Find the GID
     hid_t gid = -1;
     auto it = IDS_group_id.find(opctx);
     if (it != IDS_group_id.end()) {
@@ -105,11 +105,11 @@ void HDF5Reader_v2::prepare_strategy(Context *ctx) {
         throw ALBackendException("No HDF5 group ID found for this context", LOG);
     }
 
-    // 3. Sélectionner/Initialiser
+    // 3. Select/Initialize
     select_strategy(opctx, gid);
 }
 
-// Délégation de la méthode read_ND_Data à la stratégie de lecture
+// Delegation of the read_ND_Data method to the read strategy
 int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                  int *datatype, void **data, int *dim, int *size) {
   

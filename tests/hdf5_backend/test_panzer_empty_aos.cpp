@@ -9,41 +9,41 @@ int main() {
     const std::string filename = "test_empty_aos.panzer";
 
     // ===================================================================
-    // 1. Écriture d'un AoS "A" de taille 5.
-    //    Chaque élément de A est parcouru, mais aucune donnée n'est écrite
-    //    avec writeData().
+    // 1. Write an AoS "A" of size 5.
+    //    Each element of A is iterated, but no data is written
+    //    with writeData().
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::WRITE, true);
 
-        std::cout << "Écriture d'un AoS 'A' de taille 5 sans aucune donnée...\n";
+        std::cout << "Writing an AoS 'A' of size 5 with no data...\n";
         db.beginArray("A", 5);
         for (int i = 0; i < 5; ++i) {
-            // On crée une structure enfant "B" pour chaque élément de "A",
-            // mais on n'appelle jamais db.writeData().
+            // A child structure "B" is created for each element of "A",
+            // but db.writeData() is never called.
             db.beginArray("B", 1);
-            // Pas d'écriture, donc pas d'incrément automatique de l'index de B.
+            // No write, so no automatic increment of B's index.
             db.endArray(); // B
-            db.incrementArrayIndex(); // On passe manuellement à l'élément A suivant.
+            db.incrementArrayIndex(); // Manually move to the next A element.
         }
         db.endArray(); // A
 
         db.close();
-        std::cout << "Fichier fermé.\n\n";
+        std::cout << "File closed.\n\n";
     }
 
     // ===================================================================
-    // 2. Réouverture et vérification de la taille de A
+    // 2. Reopen and verify the size of A
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
 
-        std::cout << "Vérification de la taille de l'AoS 'A'...\n";
+        std::cout << "Verifying the size of AoS 'A'...\n";
         auto shapeA = db.getAOSShape("A");
 
-        assert(shapeA.size() == 1 && "La shape de A doit contenir un seul élément.");
-        assert(shapeA[0] == 5 && "La taille de A doit être 5.");
-        std::cout << "Shape de A: { " << shapeA[0] << " } (attendu: { 5 })\n";
+        assert(shapeA.size() == 1 && "The shape of A must contain a single element.");
+        assert(shapeA[0] == 5 && "The size of A must be 5.");
+        std::cout << "Shape of A: { " << shapeA[0] << " } (expected: { 5 })\n";
 
         auto shapeB = db.getAOSShape("A/0/B");
         printf("shapeB[0]=%d\n", shapeB[0]);
@@ -54,6 +54,6 @@ int main() {
 
     }
 
-    std::cout << "\nTOUS LES TESTS RÉUSSIS !\n";
+    std::cout << "\nALL TESTS PASSED!\n";
     return 0;
 }

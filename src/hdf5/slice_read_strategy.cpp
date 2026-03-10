@@ -9,7 +9,7 @@ SliceReadStrategy::SliceReadStrategy(hid_t loc_id)
 void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
     OperationContext* opCtx = ctx->getOperationContext();
 
-    // Trouve le parent dynamique le plus proche pour identifier la bonne base de temps
+    // Find the closest dynamic parent to identify the correct time base
     ArraystructContext* timed_parent = nullptr;
     Context* p = ctx;
     while(p && p->getType() == CTX_ARRAYSTRUCT_TYPE) {
@@ -70,7 +70,7 @@ std::vector<int> SliceReadStrategy::getIndices(Context *ctx, int dynamic_index) 
 
 void SliceReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
+        // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
         //printf("GlobalReadStrategy::endAction called for OperationContext\n");
         //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
@@ -110,12 +110,12 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
     }
     
     std::vector<int> ctx_indices;
-    // On récupère les indices sans forcer l'index temporel (il sera géré par readInterpolatedData)
+    // We retrieve the indices without forcing the time index (it will be managed by readInterpolatedData)
     ctx_indices = getIndices(ctx, -1);
 
     std::vector<uint64_t> indices(ctx_indices.begin(), ctx_indices.end());
 
-    // Extraction du nom racine (ex: "A" depuis "A/0/B")
+    // Extracting the root name (e.g., "A" from "A/0/B")
     std::string root_name = aos_path;
     size_t pos = aos_path.find('/');
     if (pos != std::string::npos) {
