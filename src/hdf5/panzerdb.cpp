@@ -12,23 +12,61 @@
 #include <iomanip>
 #include <string_view>
 
+/*
+ * ###############################################################################
+ * # Important Points to Understand
+ * ###############################################################################
+ *
+ * 1.  **Columnar Storage & Indexing**:
+ *     - PanzerDB does not store data in a hierarchical HDF5 structure (groups/datasets).
+ *       Instead, it flattens data into a few large 1D datasets based on type
+ *       (e.g., `data_raw_f64` for doubles, `data_raw_i32` for integers).
+ *     - A central `index` table stores metadata for every logical node (path, shape,
+ *       time index, offset in the raw dataset). This allows for extremely fast
+ *       writes (append-only) and flexible reads.
+ *
+ * 2.  **Dynamic vs. Static AoS (Array of Structures)**:
+ *     - **Static AoS**: Fixed size, known at creation. The index in the path
+ *       (e.g., `profiles_1d/0/ion`) is explicit.
+ *     - **Dynamic AoS**: Time-evolving structures. The "time" dimension is implicit
+ *       in the structure's growth. The code handles "time steps" by creating new
+ *       entries in the index for the same path but with an incremented `time_index`.
+ *
+ * 3.  **Optimization Strategies**:
+ *     - **Write Buffering**: Data is accumulated in memory (`data_buffer_f64`, etc.)
+ *       and flushed to disk in large chunks to minimize HDF5 I/O overhead.
+ *     - **Direct Hyperslab Reads**: `readSliceDirect` reads specific data slices
+ *       directly from the HDF5 file into the user's buffer without intermediate copies.
+ *     - **Batched Reads**: `readLeavesUnion` combines multiple non-contiguous data
+ *       chunks (e.g., a time series scattered across the file) into a single HDF5
+ *       read operation using `H5S_SELECT_OR`.
+ *     - **Caching**: The `getLeaves` method caches the entire index table in memory.
+ *       `buildTimeIndex` creates an O(log n) lookup structure for fast time-based queries.
+ *
+ * 4.  **Path Substitution**:
+ *     - When reading dynamic data (e.g., `pz_readData_by_index`), the code must often
+ *       translate a logical path like `A/0/B` (requested at time `t=1`) into the
+ *       actual stored path `A/1/B`. This is handled by finding the "Dynamic AoS Root"
+ *       and substituting the index.
+ */
+
 constexpr size_t PATH_MAX_LEN = 256;
 
 // PanzerDB constructor modification
 PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty)
     : preserve_empty_nodes(preserve_empty)
 {
-    // OPTIMISATION: File Access Property List (FAPL) pour écritures massives
+     // OPTIMIZATION: File Access Property List (FAPL) for massive writes
     hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
     
-    // 1. Alignement sur les blocs du système de fichiers (ex: Lustre stripe size = 4MB)
-    // Tout objet > 4KB sera aligné sur une frontière de 4MB.
+    // 1. Alignment on file system blocks (e.g., Lustre stripe size = 4MB)
+    // Any object > 4KB will be aligned on a 4MB boundary.
     H5Pset_alignment(fapl, 4096, 4 * 1024 * 1024);
     
-    // 2. Utiliser le format HDF5 le plus récent (meilleure indexation des chunks)
+    // 2. Use the latest HDF5 format (better chunk indexing)
     H5Pset_libver_bounds(fapl, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
     
-    // 3. Agréger les métadonnées en blocs de 2MB pour réduire les IOPS
+    // 3. Aggregate metadata in 2MB blocks to reduce IOPS
     H5Pset_meta_block_size(fapl, 2 * 1024 * 1024);
 
     if (mode == OpenMode::WRITE) {
@@ -70,14 +108,14 @@ void PanzerDB::init(OpenMode mode) {
     }
     configureChunking(usage_hint);
 
-    // OPTIMISATION: Créer un DAPL (Dataset Access Property List) avec un grand cache
-    // Cela s'applique aussi bien en création (WRITE) qu'en ouverture (APPEND/READ)
+     // OPTIMIZATION: Create a DAPL (Dataset Access Property List) with a large cache
+    // Applies to both creation (WRITE) and opening (APPEND/READ)
     hid_t dapl = H5Pcreate(H5P_DATASET_ACCESS);
     H5Pset_chunk_cache(dapl, chunk_config.chunk_cache_nslots, 
                        chunk_config.chunk_cache_size, 0.75);
 
     if (mode == OpenMode::WRITE) {
-        // Supprimer datasets existants
+        // Delete existing datasets
         if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) H5Ldelete(file_id, "index", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_f64", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_i32", H5P_DEFAULT);
@@ -86,7 +124,7 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
         
-        // OPTIMISATION: Créer index dataset avec chunking optimal
+        // OPTIMIZATION: Create index dataset with optimal chunking
         hsize_t dims[2] = {0, 14};
         hsize_t maxdims[2] = {H5S_UNLIMITED, 14};
         hsize_t chunk[2] = {chunk_config.index_chunk_rows, 14};
@@ -95,10 +133,10 @@ void PanzerDB::init(OpenMode mode) {
         hid_t plist = H5Pcreate(H5P_DATASET_CREATE);
         H5Pset_chunk(plist, 2, chunk);
         
-        // Compression pour l'index
+        // Compression for the index
         if (chunk_config.enable_compression) {
             H5Pset_deflate(plist, chunk_config.compression_level);
-            H5Pset_shuffle(plist);  // Améliore compression
+            H5Pset_shuffle(plist);  // Improves compression
         }
         
         H5Pset_fill_time(plist, H5D_FILL_TIME_NEVER);
@@ -109,13 +147,13 @@ void PanzerDB::init(OpenMode mode) {
         H5Pclose(plist);
         H5Sclose(space);
         
-        // OPTIMISATION: Créer data datasets avec chunking optimal
+         // OPTIMIZATION: Create data datasets with optimal chunking
         data_dset_f64 = createOptimizedDataset("data_raw_f64", H5T_IEEE_F64LE, 
                                                 chunk_config.data_chunk_f64, true, dapl);
         data_dset_i32 = createOptimizedDataset("data_raw_i32", H5T_STD_I32LE, 
                                                 chunk_config.data_chunk_i32, true, dapl);
         
-        // String dataset (compression moins efficace, mais toujours utile)
+         // String dataset (compression less effective, but still useful)
         hid_t str_type_vl = H5Tcopy(H5T_C_S1);
         H5Tset_size(str_type_vl, H5T_VARIABLE);
         H5Tset_cset(str_type_vl, H5T_CSET_UTF8);
@@ -2057,9 +2095,6 @@ bool PanzerDB::isInsideDynamicAOS(std::string* timebase) const {
 }
 
 
-void PanzerDB::dumpIndexBuffer() const {
-}
-
 void PanzerDB::dumpLeavesCache() const {
     const auto& leaves = getLeaves();
     std::cerr << "=== PanzerDB Index Table (" << leaves.size() << " entries) ===" << std::endl;
@@ -2199,11 +2234,6 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
   }
   //printf("Static AoS detected. max_index: %lld, inferred size: %zu\n", max_index, shapes[0]);
   return shapes;
-}
-
-size_t PanzerDB::getCurrentTotalSize(const std::string& level) const {
-    auto v = getAOSShape(level);
-    return std::accumulate(v.begin(), v.end(), size_t(0));
 }
 
 size_t PanzerDB::getDynamicAOSSize(const std::string& aos_path) const {

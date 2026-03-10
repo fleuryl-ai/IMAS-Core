@@ -52,17 +52,6 @@ int main() {
         auto shape1B = db.getAOSShape("A/1/B");
         assert(shape1B[0] == 1 && "La taille de B doit être 1.");
 
-        /*auto shapeB = db.getAOSShape("B");
-        std::vector<size_t> expected_shapeB = {1, 1, 1, 1, 1};
-        assert(shapeB == expected_shapeB && "La shape de B doit être {1, 1, 1, 1, 1}.");
-        std::cout << "Shape de B: { ";
-        for(size_t s : shapeB) { std::cout << s << " "; }
-        std::cout << "} (attendu: { 1 1 1 1 1 })\n";*/
-
-        /*size_t aos_size = db.getCurrentTotalSize("B");
-        printf("aos_size=%d\n ", aos_size);
-        assert(aos_size == 5 && "La taille totale de B doit être 5.");*/
-
     }
 
     std::cout << "\nTOUS LES TESTS RÉUSSIS !\n";

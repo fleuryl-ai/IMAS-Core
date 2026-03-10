@@ -13,10 +13,62 @@
 #include <list>
 #include <map>
 
-// ============================================================================
-// 1. CONFIGURATION DYNAMIQUE DU CHUNKING
-// ============================================================================
+/**
+ * @class PanzerDB
+ * @brief A high-performance HDF5-based data storage engine.
+ *
+ * PanzerDB provides a high-level C++ interface for storing and retrieving large-scale
+ * scientific data, designed as a replacement for the legacy HDF5 backend in the IMAS
+ * data model. It uses a columnar storage approach, where data is organized by type
+ * into flat, one-dimensional datasets, and a central index table maps structured data
+ * paths to raw data offsets.
+ *
+ * Key Features:
+ * - **Columnar Storage**: All data of the same type (e.g., double, int32) is appended
+ *   to a single, large, chunked HDF5 dataset. An index table (`/index`) stores metadata
+ *   for each data entry, including its path, shape, time index, and location (offset, count)
+ *   in the raw data dataset. This design is highly efficient for both writing and for
+ *   reading specific time slices or data subsets.
+ *
+ * - **Array of Structures (AoS) Emulation**: PanzerDB emulates complex, nested data
+ *   structures (Arrays of Structures) using a path-based system. For example, a path
+ *   like "profiles_1d/0/ion/0/density" represents a specific data node within a
+ *   hierarchical structure.
+ *
+ * - **Static and Dynamic AoS**: It supports both statically-sized AoS (size known at
+ *   creation) and dynamically-sized AoS (size grows over time). Dynamic AoS are ideal
+ *   for time-evolving data, where each "slice" corresponds to a new time step.
+ *
+ * - **Optimized I/O**:
+ *   - **Write Buffering**: Data writes are buffered in memory and flushed to disk in
+ *     large, contiguous blocks, minimizing the number of costly HDF5 I/O operations.
+ *   - **Dynamic Chunking**: HDF5 chunk sizes are automatically configured based on a
+ *     "usage hint" (e.g., "time_series", "bulk_write", "interactive") to optimize
+ *     performance for the intended access pattern.
+ *   - **Optimized Reads**: Features a fast, cached index (`getLeaves`), direct-to-buffer
+ *     hyperslab reads (`readSliceDirect`), and batched reads for multiple data blocks
+ *     (`readLeavesUnion`).
+ *
+ * - **Time-Series Data Handling**: Provides first-class support for time-dependent data,
+ *   including efficient time-based lookups and data interpolation (`readInterpolatedData`).
+ *
+ * - **Flexible Instantiation**: Can be instantiated to manage an entire HDF5 file or to
+ *   operate within a specific HDF5 group, allowing it to be seamlessly embedded into
+ *   existing HDF5 file structures.
+ *
+ * - **Multiple Open Modes**:
+ *   - `WRITE`: Creates a new file, truncating if it exists.
+ *   - `APPEND`: Opens an existing file for reading and writing, preserving its content.
+ *   - `READ`: Opens an existing file for read-only access.
+ */
 
+/**
+ * @struct ChunkingConfig
+ * @brief Holds configuration parameters for HDF5 chunking, compression, and caching.
+ *
+ * This structure allows fine-tuning of storage performance by adjusting how data
+ * is laid out on disk and cached in memory.
+ */
 struct ChunkingConfig {
     // Index table chunking
     size_t index_chunk_rows = 8192;           // Nombre de rows par chunk
@@ -54,13 +106,10 @@ struct ArrayLevel {
     std::string aos_full_path;
 };
 
-// ============================================================================
-// OPTIMISATIONS PERFORMANCE LECTURE - PANZERDB
-// ============================================================================
-
-// 1. NOUVEAU: Index temporel pour recherche O(log n)
-// ============================================================================
-
+/**
+ * @struct TimeRangeP
+ * @brief Represents a time range [start, end) for indexing.
+ */
 struct TimeRangeP {
     uint64_t start;
     uint64_t end;
@@ -75,6 +124,10 @@ struct TimeRangeP {
     }
 };
 
+/**
+ * @struct PathComponents
+ * @brief Helper struct to hold the parsed components of a data path within a dynamic AoS.
+ */
 struct PathComponents {
     std::string prefix;      // "profiles_2d"
     std::string index_str;   // "0"
@@ -84,17 +137,27 @@ struct PathComponents {
     PathComponents() : has_index(false) {}
 };
 
+/**
+ * @struct ChunkingStats
+ * @brief Holds statistics about HDF5 chunking performance.
+ */
 struct ChunkingStats {
     size_t total_chunks_written = 0;
     size_t total_chunks_read = 0;
     size_t total_bytes_written = 0;
     size_t total_bytes_read = 0;
-    size_t compression_ratio = 100;  // Pourcentage (100 = pas de compression)
+    size_t compression_ratio = 100;  // Percentage (100 = no compression)
 };
 
 class PanzerDB {
 public:
-    // Read
+    /**
+     * @struct Leaf
+     * @brief Represents a terminal node (a data entry) in the PanzerDB index.
+     *
+     * Each leaf corresponds to one row in the main index table and holds all
+     * metadata required to locate and interpret a piece of data.
+     */
     struct Leaf {
         std::vector<size_t> shape;
         uint64_t time_index = 0;
@@ -127,7 +190,6 @@ private:
     
     void updateDiskSizes();
 
-    //uint64_t global_time = 0;
     std::unordered_map<std::string, uint64_t> aos_time_counters;
     std::string dynamic_level;
     std::vector<std::string> current_path;
@@ -148,17 +210,17 @@ private:
     std::vector<char> paths_buffer;       // Buffer for plain text paths (fixed size)
     std::vector<char> parent_paths_buffer;
 
-     // Nouvelles constantes pour gestion mémoire
-    static constexpr size_t INITIAL_INDEX_BUFFER_SIZE = 1000;      // 112 KB au lieu de 11 MB
-    static constexpr size_t INITIAL_DATA_BUFFER_SIZE = 8192;       // 64 KB au lieu de 1 MB
-    static constexpr size_t INITIAL_STRING_BUFFER_SIZE = 512;      // 4 KB au lieu de 128 KB
-    static constexpr size_t BUFFER_GROWTH_FACTOR = 2;              // Doubler quand plein
+     // Constants for buffer management
+    static constexpr size_t INITIAL_INDEX_BUFFER_SIZE = 1000;      
+    static constexpr size_t INITIAL_DATA_BUFFER_SIZE = 8192;       
+    static constexpr size_t INITIAL_STRING_BUFFER_SIZE = 512;      
+    static constexpr size_t BUFFER_GROWTH_FACTOR = 2;              
     
-    // Seuils pour flush automatique
+    // Thresholds for auto-flush (to avoid too large buffers in memory)
     static constexpr size_t AUTO_FLUSH_THRESHOLD = 100'000'000;    // 100 MB
     static constexpr size_t CRITICAL_FLUSH_THRESHOLD = 500'000'000; // 500 MB
 
-    // Cache pour éviter reconstructions
+    // Cache to avoid reconstructions
     mutable std::string cached_path_prefix;
     mutable bool path_prefix_dirty = true;
     
@@ -193,16 +255,15 @@ private:
     mutable std::vector<std::string> cached_dynamic_aos_roots;
     mutable std::map<TimeRangeP, size_t> time_range_index;
 
-    // NOUVEAU: Scratch buffers réutilisables pour éviter malloc/free répétitifs en lecture
+    // Reusable scratch buffers to avoid repetitive malloc/free on reads
     mutable std::vector<double> scratch_f64;
     mutable std::vector<int32_t> scratch_i32; // Pas utilisé dans le code actuel mais prêt
     mutable std::vector<std::complex<double>> scratch_c128;
     mutable std::vector<std::string> scratch_str;
 
-    // NOUVEAU: Index temporel optimisé
     mutable bool time_index_valid = false;
     
-    // NOUVEAU: Cache de métadonnées pour éviter recalculs
+    // Metadata cache
     struct LeafMetadata {
         size_t slice_volume;
         size_t n_time_steps;
@@ -227,17 +288,56 @@ private:
 
     void readChunkingConfig();
     void configureReadCache();
+
+    //==========================================================================
+    // Configuration API
+    //==========================================================================
+
+    /**
+     * @brief Sets a usage hint to optimize chunking for new files (in WRITE mode).
+     * @param hint A string hint, e.g., "time_series", "bulk_write", "interactive".
+     */
     void setChunkingHint(const std::string& hint);
+
+     /**
+     * @brief Sets the GZIP compression level for new datasets.
+     * @param level An integer from 0 (no compression) to 9 (max compression).
+     */
     void setCompressionLevel(int level);
+
+    /**
+     * @brief Disables compression for new datasets.
+     */
     void disableCompression();
 
+    //==========================================================================
+    // Statistics and Debugging
+    //==========================================================================
+
+    /**
+     * @brief Retrieves statistics about chunking performance.
+     * @return A ChunkingStats struct.
+     */
     ChunkingStats getChunkingStats() const;
+
+    /**
+     * @brief Prints chunking statistics to standard output.
+     */
     void printChunkingStats() const ;
 
 
 
 public:
+    /**
+     * @enum OpenMode
+     * @brief Defines how the PanzerDB file should be opened.
+     */
     enum class OpenMode { WRITE, READ, APPEND };
+
+    /**
+     * @enum DataType
+     * @brief Internal enumeration for data types, stored in the index flags.
+     */
     enum class DataType : uint64_t {
         FLOAT64 = 0,
         INT32 = 1,
@@ -247,29 +347,88 @@ public:
         UNKNOWN = 99
     };
 
+    /**
+     * @brief Constructs a PanzerDB instance to manage an HDF5 file.
+     * @param filename The path to the HDF5 file.
+     * @param mode The mode in which to open the file (WRITE, READ, APPEND).
+     * @param preserve_empty_nodes If true, metadata for empty nodes is preserved.
+     */
     PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty_nodes = false);
+
+     /**
+     * @brief Constructs a PanzerDB instance within an existing HDF5 group.
+     * @param loc_id The HDF5 identifier of the parent group.
+     * @param mode The mode for operations within the group (WRITE, READ, APPEND).
+     * @param preserve_empty_nodes If true, metadata for empty nodes is preserved.
+     * @param close_loc_id_on_exit If true, PanzerDB will call H5Gclose on loc_id upon destruction.
+     */
     PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty_nodes = false, bool close_loc_id_on_exit = false);
 
     // Disable copy to prevent accidental closure of HDF5 handles by temporary copies
     PanzerDB(const PanzerDB&) = delete;
     PanzerDB& operator=(const PanzerDB&) = delete;
 
+    /**
+     * @brief Destructor. Flushes any remaining data and closes the file.
+     */
     ~PanzerDB();
 
     OpenMode mode;
 
+     //==========================================================================
+    // Write API - Array of Structures
+    //==========================================================================
+
+    /**
+     * @brief Begins a new statically-sized Array of Structures (AoS) level.
+     * @param name The name of the AoS.
+     * @param size The fixed number of elements in the array.
+     */
     void beginArray(const std::string& name, size_t size);
+
+     /**
+     * @brief Begins a new dynamically-sized (time-evolving) Array of Structures (AoS) level.
+     * @param name The name of the AoS.
+     * @param timebase The name of the dataset that serves as the time coordinate for this AoS.
+     */
     void beginArray(const std::string& name, const std::string& timebase);
+
+     /**
+     * @brief Manually increments the index of the current AoS level.
+     */
     void beginArray(ArrayLevel& level);
 
+    /**
+     * @brief Manually sets the index of the current AoS level.
+     * @param new_index The new index to set.
+     */
     void incrementArrayIndex();
     void setCurrentArrayIndex(size_t new_index);
+
+    /**
+     * @brief Checks if the current write position is inside a dynamic AoS.
+     * @param timebase If inside a dynamic AoS, this string is filled with the name of the timebase.
+     * @return True if inside a dynamic AoS, false otherwise.
+     */
     bool isInsideDynamicAOS(std::string* timebase) const;
+
+
     uint64_t getTimeBaseLength(const std::string& timebase_name) const;
     uint64_t getLastTimeIndex(const std::string& data_path) const;
 
-    // 1. Declaration of the generic template writeData<T>
-    // Note the absence of the function body; it will be defined in the .cpp
+    //==========================================================================
+    // Write API - Data
+    //==========================================================================
+
+    /**
+     * @brief Writes a static (non-time-dependent) data tensor.
+     * @tparam T The data type (e.g., double, int32_t, std::complex<double>).
+     * @param name The name of the data node.
+     * @param shape The dimensions of the tensor.
+     * @param data A pointer to the data buffer.
+     * @param count The total number of elements in the buffer.
+     * @param timebase (Unsupported for this function, must be empty).
+     */
     template<typename T>
     void writeData(const std::string& name,
                    const std::vector<size_t>& shape,
@@ -286,30 +445,43 @@ public:
                               hid_t dataset_id,
                               std::vector<T>& buffer);
 
-  
+    /**
+     * @brief Writes one or more time slices of a dynamic double-precision floating point signal.
+     * @param name The name of the signal.
+     * @param base_shape The shape of a single time slice.
+     * @param data Pointer to the contiguous data for all slices.
+     * @param n_slices The number of slices to write.
+     * @param timebase The name of the associated timebase.
+     */
     void writeDataSlices(const std::string& name,
                                const std::vector<size_t>& base_shape,
                                const double* data, size_t n_slices,
                                const std::string& timebase);
 
-    // int32_t - uses data_dset_i32 and data_buffer_i32
+     /**
+     * @brief Writes one or more time slices of a dynamic 32-bit integer signal.
+     */
     void writeDataSlices(const std::string& name,
                                const std::vector<size_t>& base_shape,
                                const int32_t* data, size_t n_slices,
                                const std::string& timebase);
 
-    // complex - uses data_dset_c128 and data_buffer_c128
+     /**
+     * @brief Writes one or more time slices of a dynamic complex signal.
+     */
     void writeDataSlices(const std::string& name,
                                const std::vector<size_t>& base_shape,
                                const std::complex<double>* data, size_t n_slices,
                                const std::string& timebase);
 
+    /**
+     * @brief Writes one or more time slices of a dynamic string signal.
+     */                           
     void writeDataSlices(const std::string& name,
                                const std::vector<size_t>& base_shape,
                                const char* const* data, size_t n_slices,
                                const std::string& timebase);
                               
-    // 1. Declaration of the generic template writeDataSlices<T>
     template<typename T>
     void writeDataSlicesImpl(const std::string& name,
                                     const std::vector<size_t>& base_shape,
@@ -319,70 +491,97 @@ public:
                                     DataType dtype,
                                     hid_t dataset_id,
                                     std::vector<T>& buffer);
-
-    // VERSION WITH root_aos_name to handle multiple root hierarchies
-    // In panzerdb.h
-    int pz_readData_by_index(
-        const char* full_data_path,  // ✅ Full path: "profiles_2d/1/ion/0/state/0/z_min"
-        int64_t time_index,
-        uint64_t* ndim_out,
-        uint64_t shape_out[6],
-        double** data_out);
-
-    int pz_readStringData_by_index(
-        const char* full_data_path,
-        int64_t time_index,
-        uint64_t* ndim_out,
-        uint64_t shape_out[6],
-        char** data_out);
-
-    int pz_readComplexData_by_index(
-        const char* full_data_path,
-        int64_t time_index,
-        uint64_t* ndim_out,
-        uint64_t shape_out[6],
-        std::complex<double>** data_out);
-
-    int readInterpolatedData(
-                         const char* full_data_path,  // ✅ Changed
-                         double time,
-                         const std::vector<double>& time_basis,
-                         int interp_mode,
-                         int datatype,
-                         uint64_t* ndim_out,
-                         uint64_t shape_out[6],
-                         void** data_out,
-                         bool expect_time_dim = true);
-
-    void dumpIndexBuffer() const;                 
+ 
+    
+     /**
+     * @brief Prints the content of the cached index table (leaves) to standard output for debugging.
+     */
     void dumpLeavesCache() const;
     void endArray();
+
+     /**
+     * @brief Flushes all in-memory write buffers to the HDF5 file.
+     * This makes the written data visible to other readers without closing the file.
+     */
     void flush();
+
+     /**
+     * @brief Flushes all in-memory write buffers to the HDF5 file and closes all handles.
+     */
     void close();
 
-    const std::vector<Leaf>& getLeaves() const;
-    const std::vector<std::string>& getDynamicAOSRoots() const { return cached_dynamic_aos_roots; }
-    std::vector<size_t> getAOSShape(const std::string& level_name) const;
-    size_t getCurrentTotalSize(const std::string& level_name) const;
-    size_t getDynamicAOSSize(const std::string& aos_path) const;
-    int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
-    bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
-    //uint64_t getCurrentTime() const { return global_time; }
+    //==========================================================================
+    // Read API - Metadata and Index
+    //==========================================================================
 
-    
+    /**
+     * @brief Retrieves the entire database index as a vector of Leaf objects.
+     * The result is cached for subsequent calls. This is the primary entry point for read operations.
+     * @return A constant reference to the cached vector of leaves.
+     */
+    const std::vector<Leaf>& getLeaves() const;
+    //const std::vector<std::string>& getDynamicAOSRoots() const { return cached_dynamic_aos_roots; }
+
+     /**
+     * @brief Gets the effective size of an Array of Structures.
+     * For static AoS, it returns the declared size. For dynamic AoS, it returns the number of time steps written.
+     * @param level_name The full path to the AoS meta-node (e.g., "profiles_1d" or "profiles_1d/0/ion").
+     * @return A vector containing the size of the AoS.
+     */
+    std::vector<size_t> getAOSShape(const std::string& level_name) const;
+    size_t getDynamicAOSSize(const std::string& aos_path) const;
+
+    /**
+     * @brief Finds the index in a time base vector that is closest to a requested time.
+     * @param timebase_path The full path to the 1D dataset representing the time base.
+     * @param requested_time The time value to search for.
+     * @return The index of the element in the time base closest to the requested time.
+     */
+    int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
+
+
+    bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
+
+    /**
+     * @brief Gets the current open mode of the database.
+     * @return The current OpenMode (READ, WRITE, or APPEND).
+     */
     OpenMode getOpenMode() const { return mode; }
 
+    //==========================================================================
+    // Read API - Data Retrieval
+    //==========================================================================
+
+    /**
+     * @brief Reads the entire data tensor associated with a specific Leaf.
+     * @tparam T The data type to read into (e.g., double, int32_t).
+     * @param leaf The Leaf object from getLeaves() representing the data to read.
+     * @param out_buffer A pre-allocated buffer to store the read data.
+     */
     template<typename T>
     void readTensor(const Leaf& leaf, T* out_buffer) const;
 
+     /**
+     * @brief Reads a single time slice of data directly into an output buffer.
+     * This is a highly optimized read that uses an HDF5 hyperslab to avoid intermediate copies.
+     * @tparam T The data type.
+     * @param leaf The Leaf representing the dynamic signal.
+     * @param time_index The specific time index of the slice to read.
+     * @param out_buffer A pre-allocated buffer to hold the slice data.
+     * @return 0 on success, -1 on failure.
+     */
     template<typename T>
     int readSliceDirect(const Leaf& leaf, int64_t time_index, T* out_buffer) const;
 
+     /**
+     * @brief Reads multiple contiguous data chunks in a single HDF5 operation.
+     * @tparam T The data type.
+     * @param leaves A vector of Leaf pointers that are contiguous in the raw data file.
+     * @param output A pre-allocated buffer to hold the combined data.
+     * @return 0 on success, -1 on failure.
+     */
     template<typename T>
     int readMultipleSlices(const std::vector<const Leaf*>& leaves, T* output) const;
-    // Requested magic function
-    /*template<typename T>
-    void getSlice(double temps, std::vector<T>& data_out);*/
 
     /**
      * @brief Reads multiple leaves into a contiguous buffer using Hyperslab Union (H5S_SELECT_OR).
@@ -395,7 +594,13 @@ public:
      */
     int readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const;
 
-    // Function to read a scalar directly by its path
+     /**
+     * @brief Reads a single scalar value by its full path.
+     * @tparam T The scalar type.
+     * @param path The full path to the scalar node.
+     * @param status Output parameter, set to 0 on success, -1 on failure.
+     * @return The read scalar value.
+     */
     template<typename T>
     T readScalar(const std::string& path, int *status) const {
         for (const auto& leaf : getLeaves()) {
@@ -413,8 +618,74 @@ public:
         return static_cast<T>(-1);
     }
 
+    /**
+     * @brief Reads data at a specific time, performing interpolation if necessary.
+     * @param full_data_path The full path to the data node.
+     * @param time The requested time point.
+     * @param time_basis The time vector to use for interpolation.
+     * @param interp_mode The interpolation mode (e.g., linear, closest).
+     * @param datatype The type of data to read.
+     * @param ndim_out Pointer to store the number of dimensions of the output.
+     * @param shape_out Array to store the shape of the output.
+     * @param data_out Pointer to store the allocated output data buffer.
+     * @param expect_time_dim If true, expects the data to have a time dimension.
+     * @return 0 on success, -1 on failure.
+     */
+    int readInterpolatedData(
+                         const char* full_data_path, 
+                         double time,
+                         const std::vector<double>& time_basis,
+                         int interp_mode,
+                         int datatype,
+                         uint64_t* ndim_out,
+                         uint64_t shape_out[6],
+                         void** data_out,
+                         bool expect_time_dim = true);
+
+    /**
+     * @brief C-style API to read double-precision data by path and time index.
+     * Handles static data (time_index = -1), single time slices, and path substitution for dynamic AoS.
+     * @param full_data_path The full path to the data node (e.g., "A/0/B/signal").
+     * @param time_index The time index to read, or -1 for static data or to aggregate all time slices.
+     * @param ndim_out Pointer to store the number of dimensions.
+     * @param shape_out Array to store the output shape.
+     * @param data_out Pointer to store the allocated output data buffer.
+     * @return 0 on success, -1 on failure.
+     */
+    int pz_readData_by_index(
+        const char* full_data_path,  // ✅ Full path: "profiles_2d/1/ion/0/state/0/z_min"
+        int64_t time_index,
+        uint64_t* ndim_out,
+        uint64_t shape_out[6],
+        double** data_out);
+
+     /**
+     * @brief C-style API to read string data by path and time index.
+     */
+    int pz_readStringData_by_index(
+        const char* full_data_path,
+        int64_t time_index,
+        uint64_t* ndim_out,
+        uint64_t shape_out[6],
+        char** data_out);
+    
+    /**
+     * @brief C-style API to read complex data by path and time index.
+     */
+    int pz_readComplexData_by_index(
+        const char* full_data_path,
+        int64_t time_index,
+        uint64_t* ndim_out,
+        uint64_t shape_out[6],
+        std::complex<double>** data_out);
+
     void advanceTimebase(const std::string& timebase_name, uint64_t n_steps = 1);
     std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
+
+     /**
+     * @brief Gets the current depth of the AoS stack.
+     * @return The number of active `beginArray` calls.
+     */
     size_t getArrayStackSize() const { return array_stack.size(); }
 
 
@@ -430,7 +701,8 @@ public:
                             const std::vector<int>& indices);
 
     /**
-     * @brief Checks if the array stack is empty
+     * @brief Checks if the AoS stack is empty.
+     * @return True if not inside any AoS, false otherwise.
      */
     bool isArrayStackEmpty() const { return array_stack.empty(); }
 

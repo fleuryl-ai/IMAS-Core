@@ -68,10 +68,6 @@ int main() {
         //std::cout << "B: "; for (auto x : shapeB) std::cout << x << ' '; std::cout << "\n";
 
         assert((shapeA == std::vector<size_t>{3}));
-        //assert((shapeB == std::vector<size_t>{5, 6, 7}));
-
-        /*std::cout << "Total B (avec vides) = " << db.getCurrentTotalSize("B") << " (doit être 18)\n";
-        assert(db.getCurrentTotalSize("B") == 18);*/
 
         auto shapeB_in_A0 = db.getAOSShape("A/0/B");
         auto shapeB_in_A1 = db.getAOSShape("A/1/B");
