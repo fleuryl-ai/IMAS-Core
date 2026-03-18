@@ -643,7 +643,15 @@ hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative
         opened_IDS_files[IDS_link_name] = IDS_file_id;
     }
 
+    //printf("IDS file for %s opened with file_id=%d\n", ctx->getDataobjectName().c_str(), file_id);
+
     *IDS_group_id = openHDF5Group(ctx->getDataobjectName().c_str(), file_id);
+    if (*IDS_group_id < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to open group for IDS: %s\n", ctx->getDataobjectName().c_str());
+        H5Eprint2(H5E_DEFAULT, stderr);
+        throw ALBackendException(error_message, LOG);
+    }
 }
 
 void HDF5Utils::showStatus(hid_t file_id) {
