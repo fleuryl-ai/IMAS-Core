@@ -10,6 +10,7 @@
 #include <numeric>
 #include <algorithm> 
 #include <unordered_map>
+#include <unordered_set>
 #include <list>
 #include <map>
 
@@ -102,7 +103,7 @@ struct ArrayLevel {
     size_t actual_count = 0;
     bool had_write = false;
     
-    // ✅ Full path of the AoS (for lookup in aos_time_counters)
+    // Full path of the AoS (for lookup in aos_time_counters)
     std::string aos_full_path;
 };
 
@@ -260,6 +261,8 @@ private:
     mutable std::vector<int32_t> scratch_i32; // Not used in current code but ready
     mutable std::vector<std::complex<double>> scratch_c128;
     mutable std::vector<std::string> scratch_str;
+
+    std::unordered_set<std::string> written_metadata_schema_paths;
 
     mutable bool time_index_valid = false;
     
@@ -705,6 +708,19 @@ public:
      * @return True if not inside any AoS, false otherwise.
      */
     bool isArrayStackEmpty() const { return array_stack.empty(); }
+
+    /**
+     * @brief Utility to convert an instance path (e.g. "A/0/B/signal") to a schema path ("A/B/signal").
+     * Removes all purely numeric path segments. Useful for retrieving shared metadata.
+     */
+    static std::string stripIndices(const std::string& path);
+
+    /**
+     * @brief Writes a set of metadata for a given path.
+     * @param path The base path (e.g., "profiles_1d/t_e")
+     * @param metadata_map Map containing {metadata_name, value} pairs
+     */
+    void writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map);
 
 private:
     void restoreTimeContext();

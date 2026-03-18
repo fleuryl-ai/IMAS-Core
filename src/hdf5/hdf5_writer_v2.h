@@ -9,6 +9,8 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <map>
+
 #include "panzerdb.h"
 
 
@@ -19,6 +21,8 @@ private:
    std::unique_ptr<PanzerDB> panzer_db_ptr;
    ArraystructContext *getDynamicAOS(Context *ctx);
    std::unordered_set<ArraystructContext*> initialized_aos;
+
+   const std::map<std::string, std::string> metadata_map;
 
 public:
   HDF5Writer_v2(std::pair<int,int> backend_version_);

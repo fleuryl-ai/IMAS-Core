@@ -95,7 +95,7 @@ void HDF5Writer_v2::beginWriteArraystructAction(ArraystructContext *ctx,
                              "HDF5Writer_v2::beginWriteArraystructAction()",
                              LOG);
 
-  // ✅ SYNCHRONISATION : Nécessaire pour les AOS imbriqués
+  // SYNCHRONISATION : Nécessaire pour les AOS imbriqués
   // Si on ouvre un AOS B à l'intérieur d'un AOS A, il faut que PanzerDB
   // connaisse l'index courant de A avant de créer B
   if (panzer_db_ptr) {
@@ -202,7 +202,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
   }
 
 
-  // ✅ SYNCHRONISATION COMPLÈTE : Reconstruire l'état de PanzerDB depuis le contexte AL
+  // SYNCHRONISATION COMPLÈTE : Reconstruire l'état de PanzerDB depuis le contexte AL
   if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE && panzer_db_ptr) {
       std::vector<std::string> aos_names;
       std::vector<int> indices;
@@ -239,11 +239,6 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
       
       // Synchroniser PanzerDB avec ces indices
       if (!aos_names.empty()) {
-          /*printf("[DEBUG write_ND_Data] Synchronizing before writing '%s'\n", dataset_name_copy.c_str());
-          for (size_t i = 0; i < aos_names.size(); ++i) {
-              printf("[DEBUG write_ND_Data]   AoS[%zu]: '%s' at index %d\n", 
-                     i, aos_names[i].c_str(), indices[i]);
-          }*/
           panzer_db_ptr->synchronizeArrayStack(aos_names, indices);
       }
   }
@@ -306,6 +301,9 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
       }
   }
 
+    // Writing metadata for this node
+    panzer_db_ptr->writeMetadata(dataset_name_copy, metadata_map);
+
   // ========== TYPES NUMÉRIQUES (DOUBLE) ==========
   if (datatype == alconst::double_data) {
     
@@ -314,7 +312,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
         size_t n_slices_dyn = 1;
         std::vector<size_t> base_shape;
 
-        // ✅ DÉTECTION AUTOMATIQUE du mode :
+        // DÉTECTION AUTOMATIQUE du mode :
         // Si on est dans un AOS dynamique, alors l'itération est EXTERNE
         // → dim contient UNIQUEMENT les dimensions spatiales
         // → n_slices = 1 (on écrit la slice courante)
@@ -346,7 +344,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
     else if (is_in_dynamic_aos) {
         DEBUG_PRINT("Data is inside dynamic AoS, writing as a single slice.");
         
-        // ✅ shape contient TOUTES les dimensions spatiales
+        // shape contient TOUTES les dimensions spatiales
         panzer_db_ptr->writeDataSlices(dataset_name_copy, shape, 
                                        static_cast<const double*>(data), 
                                        1, aos_timebase);
@@ -393,7 +391,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
     else if (is_in_dynamic_aos) {
       DEBUG_PRINT("Data is inside dynamic AoS, writing as a single slice.");
       
-      // ✅ FIX : 1 seule slice avec shape complète
+      // 1 seule slice avec shape complète
       panzer_db_ptr->writeDataSlices(dataset_name_copy, shape, 
                                      static_cast<const int32_t*>(data), 
                                      1, aos_timebase);
@@ -423,7 +421,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
         else if (is_in_dynamic_aos) {
             DEBUG_PRINT("String scalar in dynamic AoS, writing as a single slice.");
             
-            // ✅ FIX : 1 seule slice (scalaire)
+            // 1 seule slice (scalaire)
             panzer_db_ptr->writeDataSlices(dataset_name_copy, {}, 
                                           &c_str_data, 1, aos_timebase);
         } 
@@ -450,11 +448,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
 
         if (!timebasename_copy.empty()) {
             // Signal temporel avec timebase explicite
-            // ❌ ANCIEN CODE :
-            // panzer_db_ptr->writeDataSlices(dataset_name_copy, {(size_t)size[0]}, 
-            //                               converted_data, 1, timebasename_copy);
-            
-            // ✅ NOUVEAU : Si dim=2 avec timebase, c'est probablement [count, temps]
+            // Si dim=2 avec timebase, c'est probablement [count, temps]
             // Il faut déterminer si size[1] est la dimension temporelle ou la longueur max
             // HEURISTIQUE : Si size[1] ressemble à une longueur de buffer (>20), 
             // c'est une liste de strings sur 1 pas de temps
@@ -472,7 +466,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
         else if (is_in_dynamic_aos) {
             DEBUG_PRINT("String list in dynamic AoS, writing as a single slice.");
             
-            // ✅ FIX : 1 seule slice de size[0] strings
+            // 1 seule slice de size[0] strings
             panzer_db_ptr->writeDataSlices(dataset_name_copy, {(size_t)size[0]}, 
                                           converted_data, 1, aos_timebase);
         } 
@@ -519,7 +513,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
       else if (is_in_dynamic_aos) {
           DEBUG_PRINT("Complex data in dynamic AoS, writing as a single slice.");
           
-          // ✅ FIX : 1 seule slice avec shape complète
+          // 1 seule slice avec shape complète
           panzer_db_ptr->writeDataSlices(dataset_name_copy, shape, 
                                          static_cast<const std::complex<double>*>(data), 
                                          1, aos_timebase);
@@ -542,7 +536,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
 void HDF5Writer_v2::endAction(Context *ctx) {
   
   if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-    // ✅ IMPORTANT : Ne PAS synchroniser ici !
+    // IMPORTANT : Ne PAS synchroniser ici !
     // La synchronisation a déjà eu lieu lors des write_ND_Data précédents
     // et dans beginWriteArraystructAction pour les enfants.
     // 
@@ -556,7 +550,7 @@ void HDF5Writer_v2::endAction(Context *ctx) {
 
     ArraystructContext* arrCtx = static_cast<ArraystructContext*>(ctx);
     
-    // ✅ FIX : Ne fermer que si on a ouvert
+    // Ne fermer que si on a ouvert
     if (initialized_aos.count(arrCtx) > 0) {
         //printf("[DEBUG endAction] Closing AoS '%s'\n", arrCtx->getPath().c_str());
         if (panzer_db_ptr) panzer_db_ptr->endArray();

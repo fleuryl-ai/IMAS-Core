@@ -11,6 +11,9 @@
 #include <cstring>
 #include <iomanip>
 #include <string_view>
+#include <sstream>
+#include <string>
+#include <map>
 
 /*
  * ###############################################################################
@@ -106,6 +109,7 @@ void PanzerDB::init(OpenMode mode) {
     if (mode == OpenMode::READ) {
         usage_hint = "interactive";  // Mode lecture privilégie accès rapide
     }
+
     configureChunking(usage_hint);
 
      // OPTIMIZATION: Create a DAPL (Dataset Access Property List) with a large cache
@@ -3144,6 +3148,58 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
     return full_signal;
 }
 
+std::string PanzerDB::stripIndices(const std::string& path) {
+    std::string result;
+    result.reserve(path.size());
+    
+    std::stringstream ss(path);
+    std::string segment;
+    
+    bool first = true;
+    while(std::getline(ss, segment, '/')) {
+        if (segment.empty()) continue;
+        
+        // Check if numeric (heuristic for index)
+        bool is_index = !segment.empty() && std::all_of(segment.begin(), segment.end(), ::isdigit);
+        
+        if (!is_index) {
+            if (!first) result += '/';
+            result += segment;
+            first = false;
+        }
+    }
+    return result;
+}
+
+void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map) {
+    // The 'path' argument is the leaf name, e.g., "t_e"
+    const std::string& name = path;
+
+    // 1. Construct the schema path.
+    // The internal `path_prefix` is the current AoS path, e.g., "profiles_1d/0/ion/1".
+    // We strip the numeric indices to get the schema prefix.
+    std::string schema_path_prefix = stripIndices(path_prefix);
+    std::string schema_path = schema_path_prefix;
+    if (!schema_path.empty()) schema_path += "/";
+    schema_path += name;
+    
+    // 2. Check if we have already written metadata for this schema path.
+    if ( written_metadata_schema_paths.count(schema_path)) {
+        return; // Already written, do nothing.
+    }
+
+    // 3. Write metadata and record it.
+    for (auto const& [key, value] : metadata_map) {
+        // The metadata path itself is a schema path.
+        std::string metadata_path = schema_path + "@" + key;
+        const char* valueStr = value.c_str();
+        // writeData for a static scalar string.
+        this->writeData(metadata_path.c_str(), {}, &valueStr, 1);
+    }
+
+    written_metadata_schema_paths.insert(schema_path);
+
+}
 
 void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
                                      const std::vector<int>& indices) {
