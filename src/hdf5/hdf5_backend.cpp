@@ -5,16 +5,18 @@
 #include "hdf5_utils.h"
 #include "hdf5_backend_factory.h"
 
+#define IMAS_HDF5_BACKEND_VERSION "IMAS_HDF5_BACKEND_VERSION"
+
+
 HDF5Backend::HDF5Backend()
 :  file_id(-1), pulseFilePath(""), opened_IDS_files()
 {
-    //H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
     createBackendComponents(getVersion());
 }
 
 HDF5Backend::HDF5Backend(Backend * targetB)
 {
-    //H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+
 }
 
 HDF5Backend::~HDF5Backend()
@@ -37,9 +39,10 @@ void
 std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
 {
   std::pair<int,int> version;
+  bool masterFileAlreadyOpened = (this->file_id != -1);
 
-  if (getenv("IMAS_HDF5_BACKEND_VERSION") != NULL) {
-      std::string env_version_str(getenv("IMAS_HDF5_BACKEND_VERSION"));
+  if (getenv(IMAS_HDF5_BACKEND_VERSION) != NULL) {
+      std::string env_version_str(getenv(IMAS_HDF5_BACKEND_VERSION));
       size_t dot_pos = env_version_str.find('.');
       if (dot_pos != std::string::npos) {
         int major = std::stoi(env_version_str.substr(0, dot_pos));
@@ -52,8 +55,7 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
       version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
     }
   if(ctx!=NULL){ 
-
-     std::string backend_version_from_file = "-1";
+    std::string backend_version_from_file = "-1";
     try {
      
         files_path_strategy = HDF5Utils::MODIFIED_MDSPLUS_STRATEGY;
@@ -63,19 +65,17 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
       
         }
       catch (std::exception &e) {
-            /*char error_message[200];
-            sprintf(error_message, "Unable to get backend required version: %s\n", e.what());
-            throw ALBackendException(error_message, LOG);*/
-            //backend_version_from_file = -1;
+            char error_message[200];
+            sprintf(error_message, "Unable to get backend version: %s\n", e.what());
+            throw ALBackendException(error_message, LOG)
       }
       if (!backend_version_from_file.empty() && backend_version_from_file != "-1") {
         version = HDF5BackendFactory::getRequiredVersion(backend_version_from_file);
-        printf("Required backend components will be created for version: %d.%d\n", version.first, version.second);
       } 
 
       HDF5BackendFactory backendFactory(version);
       auto hdf5Reader_version = backendFactory.createReader();
-      bool masterFileAlreadyOpened = (this->file_id != -1);
+      
       if (!masterFileAlreadyOpened) //the master pulse file is closed only if it was already closed before to call the getVersion() method
         hdf5Reader_version->closePulse(ctx, OPEN_PULSE, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
     }
