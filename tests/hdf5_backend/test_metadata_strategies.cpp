@@ -95,20 +95,31 @@ int main() {
                 write_meta(backend, &opCtx, "static_1d_signal@units", "m");
                 write_meta(backend, &opCtx, "static_1d_signal@coordinate1", "space");
 
+                ArraystructContext profilesCtx(&opCtx, "profiles_1d", "time");
+                std::vector<double> te_val(spatial_size);
+                double t = 0;
+                for(int x=0; x<spatial_size; ++x) te_val[x] = 1000.0 + t*10.0 + x;
+                int te_dim = 1; int te_size[] = {spatial_size};
+                backend.writeData(&profilesCtx, "t_e", "", te_val.data(), alconst::double_data, te_dim, te_size);
+                // Write Metadata for Dynamic Signals (Once)
+                write_meta(backend, &opCtx, "profiles_1d/t_e@units", "eV");
+                write_meta(backend, &opCtx, "profiles_1d/t_e@description", "Electron Temperature");
+                write_meta(backend, &opCtx, "profiles_1d/t_e@type", "dynamic");
+
                 backend.endAction(&opCtx);
             }
 
             // 1.2 SLICE WRITE (Dynamic Data)
             {
                 std::cout << "  -> Writing Dynamic Data (Slices)...\n";
-                OperationContext opCtx(&dataEntryCtx, "core_profiles", "", WRITE_OP);
+
+                double time = alconst::undefined_time;
+                int interpmode = alconst::undefined_interp;
+                OperationContext opCtx(&dataEntryCtx, "core_profiles", WRITE_OP,
+                           alconst::slice_op, time, interpmode);
+
                 backend.beginAction(&opCtx);
-
-                // Write Metadata for Dynamic Signals (Once)
-                write_meta(backend, &opCtx, "profiles_1d/t_e@units", "eV");
-                write_meta(backend, &opCtx, "profiles_1d/t_e@description", "Electron Temperature");
-                write_meta(backend, &opCtx, "profiles_1d/t_e@type", "dynamic");
-
+                
                 // Write time array (global)
                 std::vector<double> time_values(time_steps);
                 for(int i=0; i<time_steps; ++i) time_values[i] = i * 0.1;
@@ -119,7 +130,7 @@ int main() {
                 int p_size = time_steps;
                 backend.beginArraystructAction(&profilesCtx, &p_size);
 
-                for(int t=0; t<time_steps; ++t) {
+                for(int t=1; t<time_steps; ++t) {
                     // t_e (1D dynamic)
                     std::vector<double> te_val(spatial_size);
                     for(int x=0; x<spatial_size; ++x) te_val[x] = 1000.0 + t*10.0 + x;

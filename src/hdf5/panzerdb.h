@@ -720,7 +720,8 @@ public:
      * @param path The base path (e.g., "profiles_1d/t_e")
      * @param metadata_map Map containing {metadata_name, value} pairs
      */
-    void writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map);
+    void writeMetaData(const std::string& path, const std::string& value);
+    
 
     /**
      * @brief Reads metadata associated with a dataset instance.

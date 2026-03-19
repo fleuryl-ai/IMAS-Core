@@ -3171,7 +3171,7 @@ std::string PanzerDB::stripIndices(const std::string& path) {
     return result;
 }
 
-void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map) {
+/*void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map) {
     // The 'path' argument is the leaf name, e.g., "t_e"
     const std::string& name = path;
 
@@ -3199,6 +3199,33 @@ void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string
 
     written_metadata_schema_paths.insert(schema_path);
 
+}*/
+
+void PanzerDB::writeMetaData(const std::string& path, const std::string& value) { 
+    // The 'path' argument is the leaf name, e.g., "t_e"
+    const std::string& name = path;
+    std::string schema_path = stripIndices(path);
+
+    // 1. Trouver la position du caractère '@'
+    size_t pos = path.find('@');
+
+    // 2. Vérifier si le caractère a été trouvé
+    if (pos != std::string::npos) {
+        // On récupère tout ce qui suit la position (pos + 1)
+        //std::string value = path.substr(pos + 1);
+        const char* valueStr = value.c_str();
+        this->writeData(schema_path.c_str(), {}, &valueStr, 1);
+        //std::cout << "Valeur extraite : " << value << std::endl;
+    } else {
+        //std::cerr << "Erreur : Séparateur '@' non trouvé !" << std::endl;
+        throw ALLowlevelException("writeMetadata: Invalid path format, missing '@' separator", LOG);
+    }
+    
+    // 2. Check if we have already written metadata for this schema path.
+    if ( written_metadata_schema_paths.count(schema_path)) {
+        return; // Already written, do nothing.
+    }
+    written_metadata_schema_paths.insert(schema_path);
 }
 
 std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& instance_path) {

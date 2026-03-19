@@ -22,7 +22,7 @@ private:
    ArraystructContext *getDynamicAOS(Context *ctx);
    std::unordered_set<ArraystructContext*> initialized_aos;
 
-   const std::map<std::string, std::string> metadata_map;
+   //std::map<std::string, std::string> metadata_map;
 
 public:
   HDF5Writer_v2(std::pair<int,int> backend_version_);

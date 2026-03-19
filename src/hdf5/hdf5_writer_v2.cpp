@@ -65,6 +65,9 @@ void HDF5Writer_v2::setWriteStrategy(int write_mode, hid_t loc_id) {
   // ✅ Toujours recréer (l'ancienne instance sera automatiquement détruite)
   if (write_mode == GLOBAL_OP) {
     panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::WRITE, true, false);
+    /*bool index_exists = H5Lexists(loc_id, "index", H5P_DEFAULT) > 0;
+    auto mode = index_exists ? PanzerDB::OpenMode::APPEND : PanzerDB::OpenMode::WRITE;
+    panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, mode, true, false);*/
   } else if (write_mode == SLICE_OP) {
       DEBUG_PRINT("Write mode is SLICE_OP");
       panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::APPEND, true, false);
@@ -188,6 +191,10 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
                                const std::string &timebasename, int datatype,
                                int dim, int *size, void *data) {
 
+  bool is_metadata = dataset_name.find('@') != std::string::npos;
+  printf("[DEBUG write_ND_Data] Called with dataset_name='%s', timebasename='%s', datatype=%d, dim=%d, is_metadata=%s\n",
+         dataset_name.c_str(), timebasename.c_str(), datatype, dim, is_metadata ? "true" : "false");
+
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
 
@@ -302,7 +309,12 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
   }
 
     // Writing metadata for this node
-    panzer_db_ptr->writeMetadata(dataset_name_copy, metadata_map);
+    if (is_metadata) {
+        DEBUG_PRINT("Writing metadata: " << dataset_name_copy.c_str() << " = " 
+                    << (datatype == alconst::char_data ? std::string(static_cast<const char*>(data), size[0]) : "<non-string data>"));
+        panzer_db_ptr->writeMetaData(dataset_name_copy, std::string(static_cast<const char*>(data), size[0]));
+        return;
+    }
 
   // ========== TYPES NUMÉRIQUES (DOUBLE) ==========
   if (datatype == alconst::double_data) {
