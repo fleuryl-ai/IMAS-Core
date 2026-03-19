@@ -67,7 +67,7 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
       catch (std::exception &e) {
             char error_message[200];
             sprintf(error_message, "Unable to get backend version: %s\n", e.what());
-            throw ALBackendException(error_message, LOG)
+            throw ALBackendException(error_message, LOG);
       }
       if (!backend_version_from_file.empty() && backend_version_from_file != "-1") {
         version = HDF5BackendFactory::getRequiredVersion(backend_version_from_file);
