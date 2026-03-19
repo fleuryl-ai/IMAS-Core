@@ -13,6 +13,7 @@
 #include <complex>
 #include "al_defs.h"
 #include <set>
+#include <map>
 
 // Forward declarations
 class Context;
@@ -738,24 +739,24 @@ public:
 
         try {
             if (datatype == alconst::double_data) {
-                *data = new double[leaf->count];
+                *data = malloc(leaf->count * sizeof(double));
                 panzer_db_ptr->readTensor<double>(*leaf, static_cast<double*>(*data));
             } else if (datatype == alconst::integer_data) {
-                *data = new int32_t[leaf->count];
+                *data = malloc(leaf->count * sizeof(int32_t));
                 panzer_db_ptr->readTensor<int32_t>(*leaf, static_cast<int32_t*>(*data));
             } else if (datatype == alconst::complex_data) {
-                *data = new std::complex<double>[leaf->count];
+                *data = malloc(leaf->count * sizeof(std::complex<double>));
                 panzer_db_ptr->readTensor<std::complex<double>>(*leaf, static_cast<std::complex<double>*>(*data));
             } else if (datatype == alconst::char_data) {
                 if (leaf->shape.size() <= 1) { // Liste 1D ou Scalaire
                     std::vector<std::string> str_list(leaf->count);
                     panzer_db_ptr->readTensor<std::string>(*leaf, str_list.data());
                     
-                    *data = new char*[leaf->count];
+                    *data = malloc(leaf->count * sizeof(char*));
                     char** out_ptr = static_cast<char**>(*data);
                     for (size_t i = 0; i < leaf->count; ++i) {
                          size_t len = str_list[i].size() + 1;
-                         out_ptr[i] = new char[len];
+                         out_ptr[i] = (char*)malloc(len);
                          std::memcpy(out_ptr[i], str_list[i].c_str(), len);
                     }
                 } else {
@@ -872,6 +873,13 @@ public:
         ss_specific << clean_ds_name;
         std::string specific_path = ss_specific.str();
 
+        // --- METADATA HANDLING ---
+        // Try to read metadata for this path (once per schema)
+        std::map<std::string, std::string> meta = panzer_db_ptr->readMetadata(specific_path);
+        if (!meta.empty()) {
+            DEBUG_PRINT("Loaded " << meta.size() << " metadata entries for " << specific_path);
+        }
+
         std::vector<const PanzerDB::Leaf*> sorted_leaves;
         bool found = false;
 
@@ -927,15 +935,40 @@ public:
             // Fallback : Recherche linéaire pour les signaux dynamiques lus depuis un parent
             // (ex: lire "profiles_1d/signal" depuis la racine)
             // Note: Ce cas est rare si on utilise correctement les contextes.
-            DEBUG_PRINT("Leaf not found for: " << specific_path << " or generic variant");
-            return 0;
+            
+            // ✅ FIX: FALLBACK LINEAR SEARCH IS NECESSARY!
+            const auto& leaves = panzer_db_ptr->getLeaves();
+            for (const auto& leaf : leaves) {
+                if (target_time_index != -1 && leaf.time_index != static_cast<uint64_t>(target_time_index)) continue;
+                
+                // Check if path ends with dataset name
+                if (leaf.path == clean_ds_name || 
+                    (leaf.path.size() > clean_ds_name.size() && 
+                     leaf.path.compare(leaf.path.size() - clean_ds_name.size(), clean_ds_name.size(), clean_ds_name) == 0 &&
+                     leaf.path[leaf.path.size() - clean_ds_name.size() - 1] == '/')) {
+                    
+                    // Check if path starts with context prefix (if any)
+                    if (!context_prefix.empty()) {
+                        if (leaf.path.compare(0, context_prefix.size(), context_prefix) == 0) {
+                            sorted_leaves.push_back(&leaf);
+                        }
+                    } else {
+                        sorted_leaves.push_back(&leaf);
+                    }
+                }
+            }
+            
+            if (sorted_leaves.empty()) {
+                DEBUG_PRINT("Leaf not found for: " << specific_path << " or generic variant (after fallback)");
+                return 0;
+            }
         }
         else {
             DEBUG_PRINT("Number of candidate leaves found: " << sorted_leaves.size());
         }
 
         std::sort(sorted_leaves.begin(), sorted_leaves.end(), 
-            [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
+             [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
                 return a->time_index < b->time_index;
             });
 

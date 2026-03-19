@@ -722,6 +722,14 @@ public:
      */
     void writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map);
 
+    /**
+     * @brief Reads metadata associated with a dataset instance.
+     * Checks if metadata for the corresponding schema has already been read to avoid redundancy.
+     * @param instance_path The full path of the data instance (e.g. "profiles_1d/0/t_e")
+     * @return A map of metadata key-values found (e.g. {"units": "eV"}).
+     */
+    std::map<std::string, std::string> readMetadata(const std::string& instance_path);
+
 private:
     void restoreTimeContext();
     void init(OpenMode mode);

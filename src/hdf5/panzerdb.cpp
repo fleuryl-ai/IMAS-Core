@@ -3201,6 +3201,37 @@ void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string
 
 }
 
+std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& instance_path) {
+    std::map<std::string, std::string> metadata;
+
+    // 1. Convert to schema path (remove indices)
+    std::string schema_path = stripIndices(instance_path);
+
+    // 2. Check cache to avoid redundant reads
+    if (written_metadata_schema_paths.count(schema_path)) {
+        return metadata; // Already processed, return empty (or cached if we stored it)
+    }
+
+    // 3. Scan for metadata leaves (schema_path + "@key")
+    std::string prefix = schema_path + "@";
+    const auto& leaves = getLeaves();
+    
+    for (const auto& leaf : leaves) {
+        // Check if leaf path starts with prefix
+        if (leaf.path.rfind(prefix, 0) == 0) {
+            std::string key = std::string(leaf.path.substr(prefix.length()));
+            std::string value;
+            readTensor<std::string>(leaf, &value);
+            metadata[key] = value;
+            // std::cout << "[PanzerDB] Read metadata for " << schema_path << ": " << key << " = " << value << std::endl;
+        }
+    }
+
+    // 4. Mark as processed
+    written_metadata_schema_paths.insert(schema_path);
+    return metadata;
+}
+
 void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
                                      const std::vector<int>& indices) {
     if (aos_names.size() != indices.size()) {

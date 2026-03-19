@@ -343,6 +343,12 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
             std::string full_path = buildFullPath(ctx, dataset_name);
             const char* c_full_path = full_path.c_str();
 
+            // --- METADATA HANDLING ---
+            std::map<std::string, std::string> meta = panzer_db_ptr->readMetadata(full_path);
+            if (!meta.empty()) {
+                DEBUG_PRINT("Loaded " << meta.size() << " metadata entries for " << full_path);
+            }
+
             int res = panzer_db_ptr->readInterpolatedData(
                 c_full_path,
                 requested_time,

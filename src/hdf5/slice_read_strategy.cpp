@@ -130,6 +130,13 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
     std::string full_path = buildFullPath(ctx, dataset_name);
     const char* c_full_path = full_path.c_str();
 
+    // --- METADATA HANDLING ---
+    // Try to read metadata for this path
+    std::map<std::string, std::string> meta = panzer_db_ptr->readMetadata(full_path);
+    if (!meta.empty()) {
+        // printf("[SliceReadStrategy] Loaded %zu metadata entries for %s\n", meta.size(), c_full_path);
+    }
+
     int res = panzer_db_ptr->readInterpolatedData(
         c_full_path,
         time,
