@@ -46,7 +46,7 @@ int main() {
         std::cout << "Shape of A: { " << shapeA[0] << " } (expected: { 5 })\n";
 
         auto shapeB = db.getAOSShape("A/0/B");
-        printf("shapeB[0]=%d\n", shapeB[0]);
+        printf("shapeB[0]=%ld\n", shapeB[0]);
         assert(shapeB[0] == 1 && "La taille de B doit être 1.");    
 
         auto shape1B = db.getAOSShape("A/1/B");

@@ -235,6 +235,111 @@ int main() {
             std::cout << GREEN << "[OK] Phase 4 Completed.\n" << RESET;
         }
 
+        // =================================================================================
+        // PHASE 5: WRITING STATIC AoS WITH METADATA
+        // =================================================================================
+        const int aos_size = 5;
+        const int vec_size = 3;
+        {
+            std::cout << "\n--- Phase 5: Writing Static AoS with Metadata ---\n";
+            DataEntryContext dataEntryCtx(URI);
+            HDF5Backend backend;
+            backend.openPulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+
+            OperationContext opCtx(&dataEntryCtx, "core_profiles", "", WRITE_OP);
+            backend.beginAction(&opCtx);
+
+            // Write metadata for the static AoS signals
+            write_meta(backend, &opCtx, "my_static_aos/scalar_signal@units", "V");
+            write_meta(backend, &opCtx, "my_static_aos/scalar_signal@description", "A scalar value in an AoS");
+            write_meta(backend, &opCtx, "my_static_aos/vector_signal@units", "m/s");
+            write_meta(backend, &opCtx, "my_static_aos/vector_signal@description", "A vector value in an AoS");
+
+            ArraystructContext aosCtx(&opCtx, "my_static_aos", "");
+            backend.beginArraystructAction(&aosCtx, (int*)&aos_size);
+
+            for (int i = 0; i < aos_size; ++i) {
+                // 0D Signal
+                double scalar_val = 100.0 + i;
+                backend.writeData(&aosCtx, "scalar_signal", "", &scalar_val, alconst::double_data, 0, nullptr);
+
+                // 1D Signal
+                std::vector<double> vec_val(vec_size);
+                for(int j=0; j<vec_size; ++j) vec_val[j] = (100.0 + i) * 10 + j;
+                int vec_dim = 1;
+                int vec_size_arr[] = {vec_size};
+                backend.writeData(&aosCtx, "vector_signal", "", vec_val.data(), alconst::double_data, vec_dim, vec_size_arr);
+
+                if (i < aos_size - 1) aosCtx.nextIndex(1);
+            }
+
+            backend.endAction(&aosCtx);
+            backend.endAction(&opCtx);
+            backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
+            std::cout << GREEN << "[OK] Phase 5 Completed.\n" << RESET;
+        }
+
+        // =================================================================================
+        // PHASE 6: READING STATIC AoS WITH METADATA
+        // =================================================================================
+        {
+            std::cout << "\n--- Phase 6: Reading Static AoS with Metadata ---\n";
+            DataEntryContext dataEntryCtx(URI);
+            HDF5Backend backend;
+            backend.openPulse(&dataEntryCtx, OPEN_PULSE);
+
+            OperationContext opCtx(&dataEntryCtx, "core_profiles", "", READ_OP);
+            backend.beginAction(&opCtx);
+
+            // Verify metadata
+            verify_meta(backend, &opCtx, "my_static_aos/scalar_signal@units", "V");
+            verify_meta(backend, &opCtx, "my_static_aos/scalar_signal@description", "A scalar value in an AoS");
+            verify_meta(backend, &opCtx, "my_static_aos/vector_signal@units", "m/s");
+            verify_meta(backend, &opCtx, "my_static_aos/vector_signal@description", "A vector value in an AoS");
+
+            // Verify data
+            ArraystructContext aosCtx(&opCtx, "my_static_aos", "");
+            int read_aos_size = 0;
+            backend.beginArraystructAction(&aosCtx, &read_aos_size);
+            assert(read_aos_size == aos_size);
+
+            for (int i = 0; i < read_aos_size; ++i) {
+                // Read 0D Signal
+                void* scalar_data = nullptr;
+                int scalar_type = alconst::double_data;
+                int scalar_dim = 0;
+                int scalar_size[H5S_MAX_RANK];
+                backend.readData(&aosCtx, "scalar_signal", "", &scalar_data, &scalar_type, &scalar_dim, scalar_size);
+                double scalar_val = *(double*)scalar_data;
+                double expected_scalar = 100.0 + i;
+                assert(std::abs(scalar_val - expected_scalar) < 1e-9);
+                free(scalar_data);
+
+                // Read 1D Signal
+                void* vec_data = nullptr;
+                int vec_type = alconst::double_data;
+                int vec_dim = 0;
+                int vec_size_arr[H5S_MAX_RANK];
+                backend.readData(&aosCtx, "vector_signal", "", &vec_data, &vec_type, &vec_dim, vec_size_arr);
+                double* vec_vals = (double*)vec_data;
+                assert(vec_dim == 1);
+                assert(vec_size_arr[0] == vec_size);
+                for(int j=0; j<vec_size; ++j) {
+                    double expected_vec_val = (100.0 + i) * 10 + j;
+                    assert(std::abs(vec_vals[j] - expected_vec_val) < 1e-9);
+                }
+                free(vec_data);
+
+                if (i < read_aos_size - 1) aosCtx.nextIndex(1);
+            }
+             std::cout << "    [Data] Static AoS signals verified.\n";
+
+            backend.endAction(&aosCtx);
+            backend.endAction(&opCtx);
+            backend.closePulse(&dataEntryCtx, OPEN_PULSE);
+            std::cout << GREEN << "[OK] Phase 6 Completed.\n" << RESET;
+        }
+
     } catch (const std::exception& e) {
         std::cerr << RED << "Exception: " << e.what() << RESET << std::endl;
         return 1;
