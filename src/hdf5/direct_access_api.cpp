@@ -49,7 +49,6 @@ void collect_leaf_paths_recursive(
     std::string new_path_base = current_path.empty() ? seg.node_name : current_path + "/" + seg.node_name;
 
     if (seg.selection != SelectionType::NONE) {
-        // Gère les sélections explicites comme profiles_1d[1:3]
         size_t start = 0;
         size_t end = 0;
 
@@ -62,9 +61,18 @@ void collect_leaf_paths_recursive(
         if (seg.selection == SelectionType::INDEX) {
             start = seg.index;
             end = start + 1;
-        } else { // SLICE ou ALL
+        } else if (seg.selection == SelectionType::SLICE || seg.selection == SelectionType::ALL) {
             start = seg.has_start ? seg.start_index : 0;
             end = seg.has_end ? seg.end_index : aos_size;
+        } else if (seg.selection == SelectionType::TIME_SLICE) {
+            // ** Logique pour la sélection temporelle **
+            // 1. Trouver le chemin de la time base pour cet AoS.
+            //    (Suppose une méthode db.getAOSTimeBasePath())
+            std::string time_path = new_path_base + "/time"; // Hypothèse sur le nom de la time base
+
+            // 2. Convertir le temps en indice.
+            start = seg.has_start_time ? db.getTimeIndex(time_path, seg.start_time, 0) : 0;
+            end = seg.has_end_time ? db.getTimeIndex(time_path, seg.end_time, 0) + 1 : aos_size;
         }
         
         selection_dims.push_back(end - start);
@@ -74,10 +82,8 @@ void collect_leaf_paths_recursive(
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
         }
     } else {
-        // Gère les sélections implicites (comme 'ion') et les feuilles.
         std::vector<size_t> aos_shape = db.getAOSShape(new_path_base);
         if (!aos_shape.empty() && segment_idx < segments.size() - 1) {
-            // C'est un AoS statique qui doit être entièrement parcouru.
             size_t aos_size = aos_shape[0];
             selection_dims.push_back(aos_size);
             for (size_t i = 0; i < aos_size; ++i) {
@@ -85,7 +91,6 @@ void collect_leaf_paths_recursive(
                 collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
             }
         } else {
-            // C'est une feuille simple ou le dernier segment du chemin.
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
         }
     }
