@@ -132,5 +132,5 @@ endmacro()
 
 # Test pour le Path Parser
 al_add_hdf5_test(test_path_parser)
-# Test d'intégration de l'API
-al_add_hdf5_test(test_direct_api)
+# Test d'intégration et de validation de l'API
+al_add_hdf5_test(test_direct_api_validation)

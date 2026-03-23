@@ -2,9 +2,10 @@
 #define DIRECT_READER_H
 
 #include "direct_access_api.h"
+#include "path_parser.h" // Inclure pour PathSegment
 #include <string>
 #include <vector>
-#include <hdf5.h> // Inclure directement l'en-tête HDF5
+#include <hdf5.h>
 
 namespace imas {
 namespace direct_access {
@@ -16,33 +17,25 @@ namespace direct_access {
 class DirectReader {
 public:
     /**
-     * @brief Constructeur. Ouvre une connexion à un IDS.
+     * @brief Constructeur.
      * @param ids_name Le nom de l'IDS à lire.
      */
     explicit DirectReader(const std::string& ids_name);
 
     /**
-     * @brief Destructeur. Ferme les ressources.
+     * @brief Destructeur.
      */
     ~DirectReader();
 
     /**
-     * @brief Lit un tenseur basé sur un chemin et des indices.
-     * @param path_template Le chemin vers les données, avec placeholders.
-     * @param aos_indices Les indices à appliquer.
+     * @brief Lit un tenseur basé sur une séquence de segments de chemin analysés.
+     * @param segments Les segments du chemin analysés par PathParser.
      * @return Un TensorView avec les données lues.
      */
-    TensorView read(const std::string& path_template, const std::vector<int>& aos_indices);
+    TensorView read(const std::vector<PathSegment>& segments);
 
 private:
-    // Méthodes internes pour interagir avec HDF5
-    void open_ids();
-    DataType get_data_type(const std::string& path);
-    std::vector<size_t> get_dimensions(const std::string& path);
-
-
     std::string ids_name_;
-    hid_t file_id_ = -1; // Handle HDF5
 };
 
 } // namespace direct_access
