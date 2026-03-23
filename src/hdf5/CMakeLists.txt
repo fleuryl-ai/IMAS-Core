@@ -31,6 +31,7 @@ target_sources( al PRIVATE
     slice_read_strategy.cpp
     timerange_read_strategy.h
     timerange_read_strategy.cpp
+    direct_access_api.cpp
     path_parser.cpp
     direct_reader.cpp
 )
@@ -128,5 +129,8 @@ endmacro()
     al_add_hdf5_test(test_timerange)
     al_add_hdf5_test(test_slice_op2)
     al_add_hdf5_test(test_metadata_strategies)
-    #Test pour le Path Parser
-    al_add_hdf5_test(test_path_parser)
+
+# Test pour le Path Parser
+al_add_hdf5_test(test_path_parser)
+# Test d'intégration de l'API
+al_add_hdf5_test(test_direct_api)

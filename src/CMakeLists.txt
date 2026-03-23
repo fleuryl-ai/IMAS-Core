@@ -12,7 +12,6 @@ target_sources( al PRIVATE
     access_layer_plugin_manager.cpp
     flexbuffers_backend.cpp
     data_interpolation.cpp
-    direct_access_api.cpp
 )
 
 target_include_directories( al PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} )

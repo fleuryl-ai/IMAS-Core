@@ -1,61 +1,103 @@
 #include "direct_reader.h"
+#include "panzerdb.h" // Inclure l'en-tête de PanzerDB
 #include <stdexcept>
-
-// Pour l'instant, on inclut les headers HDF5 ici.
-// Si le problème de build persiste, il faudra trouver une autre stratégie.
-// #include "hdf5.h" 
+#include <numeric> // Pour std::accumulate
 
 namespace imas {
 namespace direct_access {
 
+// --- Constructeur/Destructeur ---
 DirectReader::DirectReader(const std::string& ids_name) : ids_name_(ids_name) {
-    // La logique d'ouverture de fichier ira ici
-    // open_ids();
+    // La logique d'ouverture sera gérée par l'objet PanzerDB
 }
 
 DirectReader::~DirectReader() {
-    // La logique de fermeture de fichier ira ici
-    // if (file_id_ >= 0) {
-    //     H5Fclose(file_id_);
-    // }
+    // La fermeture est gérée par le destructeur de l'objet PanzerDB
 }
 
-void DirectReader::open_ids() {
-    // TODO: Déterminer le nom du fichier HDF5 à partir du nom de l'IDS
-    // std::string filename = ids_name_ + ".h5"; // Simplification
-    // file_id_ = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    // if (file_id_ < 0) {
-    //     throw std::runtime_error("Failed to open IDS file for: " + ids_name_);
-    // }
-    throw std::runtime_error("HDF5 backend is currently disabled.");
-}
 
+// --- Implémentation de la lecture ---
 TensorView DirectReader::read(const std::string& path_template, const std::vector<int>& aos_indices) {
-    // 1. Transformer le path template et les indices en un chemin HDF5 complet
-    // Ex: "A[:]/B[:]/data" + {3, 5} -> "A/3/B/5/data"
     
-    // 2. Récupérer le type et les dimensions
-    // DataType type = get_data_type(hdf5_path);
-    // std::vector<size_t> dims = get_dimensions(hdf5_path);
+    // ÉTAPE 1: Instancier PanzerDB
+    // Pour l'instant, on ne peut pas le faire car HDF5 n'est pas lié.
+    // PanzerDB panzer_db(ids_name_ + ".h5", PanzerDB::OpenMode::READ);
+    
+    // --- SIMULATION (à remplacer par le code réel) ---
+    // throw std::runtime_error("DirectReader::read not implemented due to HDF5 build issue.");
+    // --- FIN SIMULATION ---
 
-    // 3. Créer une sélection (hyperslab)
-    // ...
 
-    // 4. Lire les données
-    // ...
+    // ÉTAPE 2: Construire le chemin de recherche plat
+    std::string target_path = "";
+    auto indices_it = aos_indices.begin();
+    size_t start = 0;
+    size_t end = path_template.find("[:]");
+    
+    while (end != std::string::npos) {
+        target_path += path_template.substr(start, end - start);
+        if (indices_it != aos_indices.end()) {
+            if (*indices_it != -1) { // -1 est la convention pour "tous"
+                target_path += std::to_string(*indices_it);
+            }
+            indices_it++;
+        } else {
+            throw std::runtime_error("Mismatched number of indices and placeholders '[:]' in path.");
+        }
+        start = end + 3; // On saute le "[:]"
+        end = path_template.find("[:]", start);
+    }
+    target_path += path_template.substr(start);
 
-    // 5. Retourner le TensorView
-    throw std::runtime_error("DirectReader::read not implemented.");
-}
+    // ÉTAPE 3: Obtenir les "leaves" et trouver la bonne
+    // const auto& leaves = panzer_db.getLeaves();
+    // const PanzerDB::Leaf* target_leaf = nullptr;
+    // for (const auto& leaf : leaves) {
+    //     if (leaf.path == target_path) {
+    //         target_leaf = &leaf;
+    //         break;
+    //     }
+    // }
 
-DataType DirectReader::get_data_type(const std::string& path) {
-    // Lire l'attribut de type depuis le dataset HDF5
-    return DataType::UNKNOWN;
-}
+    // if (!target_leaf) {
+    //     throw std::runtime_error("Data not found at path: " + target_path);
+    // }
 
-std::vector<size_t> DirectReader::get_dimensions(const std::string& path) {
-    // Lire l'attribut de dimension ou l'espace de données HDF5
-    return {};
+    // ÉTAPE 4: Extraire les métadonnées
+    // const std::vector<size_t>& dims = target_leaf->shape;
+    // PanzerDB::DataType pz_type = static_cast<PanzerDB::DataType>(target_leaf->flags & 0xFF); // Supposition
+    
+    // DataType api_type = convert_panzer_type_to_api(pz_type);
+    
+    // size_t total_elements = std::accumulate(dims.begin(), dims.end(), 1, std::multiplies<size_t>());
+    // if (dims.empty() && target_leaf->count > 0) {
+    //     total_elements = target_leaf->count;
+    // }
+
+    // ÉTAPE 5 & 6: Allouer le buffer et lire les données
+    // std::unique_ptr<char[]> buffer = nullptr;
+
+    // switch (pz_type) {
+    //     case PanzerDB::DataType::FLOAT64: {
+    //         buffer = std::make_unique<char[]>(total_elements * sizeof(double));
+    //         panzer_db.readTensor(*target_leaf, reinterpret_cast<double*>(buffer.get()));
+    //         break;
+    //     }
+    //     case PanzerDB::DataType::INT32: {
+    //         buffer = std::make_unique<char[]>(total_elements * sizeof(int32_t));
+    //         panzer_db.readTensor(*target_leaf, reinterpret_cast<int32_t*>(buffer.get()));
+    //         break;
+    //     }
+    //     // ... autres types
+    //     default:
+    //         throw std::runtime_error("Unsupported data type for direct read.");
+    // }
+    
+    // ÉTAPE 7: Retourner le TensorView
+    // return TensorView(std::move(buffer), dims, api_type);
+    
+    // En attendant que HDF5 soit fonctionnel
+    throw std::runtime_error("DirectReader::read not implemented yet because HDF5 dependencies are missing.");
 }
 
 
