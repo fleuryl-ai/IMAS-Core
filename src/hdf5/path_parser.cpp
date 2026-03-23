@@ -14,12 +14,12 @@ const std::vector<PathSegment>& PathParser::segments() const {
 }
 
 void PathParser::parse() {
-    // Regex étendue pour capturer les slices:
-    // - Groupe 1: ([\w-]+) -> Nom du nœud
-    // - Groupe 2: \[(...?)\] -> Contenu de la sélection (non-gourmand)
-    //   - Groupe 3: (\d+:\d*|\d*:\d+|\d+|:) -> Le contenu effectif : "3:10", "5:", ":20", "3", ":"
+    // Regex pour un segment complet, ex: "node[...]"
     std::regex segment_regex("([\\w-]+)(?:\\[(.*?)\\])?");
-    std::regex slice_regex("(\\d+)?:(\\d+)?"); // Pour analyser le contenu d'une slice
+    
+    // Regex pour les différents types de sélections à l'intérieur de [...]
+    std::regex time_slice_regex("time=([\\d\\.]+)?:([\\d\\.]+)?"); // Ex: "time=1.2:3.4", "time=5.0:", "time=:10.0"
+    std::regex index_slice_regex("(\\d+)?:(\\d+)?");           // Ex: "3:10", "5:", ":20"
 
     std::string path_to_parse = raw_path_;
     
@@ -36,32 +36,44 @@ void PathParser::parse() {
 
             if (match[2].matched) { // Si une sélection [...] est présente
                 std::string sel_content = match[2].str();
+                std::smatch content_match;
                 
-                if (sel_content == ":") {
+                if (sel_content.rfind("time=", 0) == 0) { // Démarre par "time="
+                    segment.selection = SelectionType::TIME_SLICE;
+                    if (std::regex_match(sel_content, content_match, time_slice_regex)) {
+                        if (content_match[1].matched) {
+                            segment.start_time = std::stod(content_match[1].str());
+                            segment.has_start_time = true;
+                        }
+                        if (content_match[2].matched) {
+                            segment.end_time = std::stod(content_match[2].str());
+                            segment.has_end_time = true;
+                        }
+                    } else {
+                        throw std::runtime_error("Invalid time slice format: " + sel_content);
+                    }
+                } else if (sel_content == ":") {
                     segment.selection = SelectionType::ALL;
                 } else if (sel_content.find(':') != std::string::npos) {
                     segment.selection = SelectionType::SLICE;
-                    std::smatch slice_match;
-                    if (std::regex_match(sel_content, slice_match, slice_regex)) {
-                        if (slice_match[1].matched) {
-                            segment.start_index = std::stoul(slice_match[1].str());
+                    if (std::regex_match(sel_content, content_match, index_slice_regex)) {
+                        if (content_match[1].matched) {
+                            segment.start_index = std::stoul(content_match[1].str());
                             segment.has_start = true;
                         }
-                        if (slice_match[2].matched) {
-                            segment.end_index = std::stoul(slice_match[2].str());
+                        if (content_match[2].matched) {
+                            segment.end_index = std::stoul(content_match[2].str());
                             segment.has_end = true;
                         }
                     } else {
-                        throw std::runtime_error("Invalid slice format in path: " + part);
+                        throw std::runtime_error("Invalid index slice format: " + sel_content);
                     }
-                } else {
+                } else { // C'est un simple indice
                     try {
                         segment.selection = SelectionType::INDEX;
                         segment.index = std::stoul(sel_content);
-                    } catch (const std::invalid_argument&) {
-                        throw std::runtime_error("Invalid index format in path: " + part);
-                    } catch (const std::out_of_range&) {
-                        throw std::runtime_error("Index value '" + sel_content + "' is too large.");
+                    } catch (const std::exception&) {
+                        throw std::runtime_error("Invalid index format: " + sel_content);
                     }
                 }
             } else {
@@ -83,7 +95,6 @@ void PathParser::parse() {
         throw std::runtime_error("Path parsing failed to produce any segments for non-empty path.");
     }
 }
-
 
 } // namespace direct_access
 } // namespace imas

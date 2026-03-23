@@ -13,17 +13,18 @@ namespace direct_access {
  * @brief Définit le type de sélection appliqué à un segment de chemin.
  */
 enum class SelectionType {
-    NONE,  // Aucune sélection, ex: "data"
-    ALL,   // Sélection de tous les éléments, ex: "node[:]"
-    INDEX, // Sélection par un indice unique, ex: "node[3]"
-    SLICE  // Sélection par une tranche, ex: "node[2:10]", "node[5:]", "node[:20]"
+    NONE,       // Aucune sélection, ex: "data"
+    ALL,        // Sélection de tous les éléments, ex: "node[:]"
+    INDEX,      // Sélection par un indice unique, ex: "node[3]"
+    SLICE,      // Sélection par une tranche d'indices, ex: "node[2:10]"
+    TIME_SLICE  // Sélection par une tranche temporelle, ex: "node[time=1.2:3.4]"
 };
 
 /**
  * @struct PathSegment
  * @brief Représente un segment unique d'un chemin d'accès.
  *
- * Un chemin comme "A[3]/B[5:10]/data" est décomposé en trois segments.
+ * Un chemin comme "A[3]/B[time=1.0:2.0]/data" est décomposé en trois segments.
  */
 struct PathSegment {
     std::string node_name;
@@ -32,11 +33,17 @@ struct PathSegment {
     // Utilisé pour INDEX
     size_t index = 0;
 
-    // Utilisé pour SLICE
+    // Utilisé pour SLICE (par indice)
     size_t start_index = 0;
     size_t end_index = 0;
     bool has_start = false;
     bool has_end = false;
+
+    // Utilisé pour TIME_SLICE
+    double start_time = 0.0;
+    double end_time = 0.0;
+    bool has_start_time = false;
+    bool has_end_time = false;
 };
 
 /**
@@ -66,6 +73,12 @@ private:
     std::string raw_path_;
     std::vector<PathSegment> segments_;
 };
+
+// Fonction utilitaire pour utiliser le parser plus simplement
+inline std::vector<PathSegment> parse_path(const std::string& path) {
+    PathParser parser(path);
+    return parser.segments();
+}
 
 } // namespace direct_access
 } // namespace imas
