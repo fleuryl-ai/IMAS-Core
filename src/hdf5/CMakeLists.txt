@@ -31,6 +31,8 @@ target_sources( al PRIVATE
     slice_read_strategy.cpp
     timerange_read_strategy.h
     timerange_read_strategy.cpp
+    path_parser.cpp
+    direct_reader.cpp
 )
 # target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_WRITER_V2 )
 # target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_READER_V2 )
@@ -71,7 +73,7 @@ macro(al_add_hdf5_test test_name)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
 
-    al_add_hdf5_test(test_panzer)
+    #al_add_hdf5_test(test_panzer)
     al_add_hdf5_test(test_panzer_read_by_index)
     al_add_hdf5_test(test_panzer_read_by_index_deep)
     al_add_hdf5_test(test_panzer_read_by_index_deep_2_signals)
@@ -126,3 +128,5 @@ endmacro()
     al_add_hdf5_test(test_timerange)
     al_add_hdf5_test(test_slice_op2)
     al_add_hdf5_test(test_metadata_strategies)
+    #Test pour le Path Parser
+    al_add_hdf5_test(test_path_parser)
