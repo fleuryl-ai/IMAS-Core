@@ -3,6 +3,7 @@
 #include "al_exception.h"
 #include "path_parser.h"
 #include "panzerdb.h"
+#include "al_const.h" // Pour CLOSEST_INTERP
 
 #include <vector>
 #include <string>
@@ -65,14 +66,13 @@ void collect_leaf_paths_recursive(
             start = seg.has_start ? seg.start_index : 0;
             end = seg.has_end ? seg.end_index : aos_size;
         } else if (seg.selection == SelectionType::TIME_SLICE) {
-            // ** Logique pour la sélection temporelle **
-            // 1. Trouver le chemin de la time base pour cet AoS.
-            //    (Suppose une méthode db.getAOSTimeBasePath())
-            std::string time_path = new_path_base + "/time"; // Hypothèse sur le nom de la time base
-
-            // 2. Convertir le temps en indice.
+            std::string time_path = new_path_base + "/time";
             start = seg.has_start_time ? db.getTimeIndex(time_path, seg.start_time, 0) : 0;
             end = seg.has_end_time ? db.getTimeIndex(time_path, seg.end_time, 0) + 1 : aos_size;
+        } else if (seg.selection == SelectionType::TIME_INTERP) {
+            std::string time_path = new_path_base + "/time";
+            start = db.getTimeIndex(time_path, seg.start_time, CLOSEST_INTERP);
+            end = start + 1;
         }
         
         selection_dims.push_back(end - start);
@@ -124,8 +124,27 @@ TensorView read_typed_tensor(
             } else {
                 final_data_ptr[i] = std::numeric_limits<double>::quiet_NaN();
             }
-        } else {
-             throw std::runtime_error("Unsupported type in read_typed_tensor.");
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            std::complex<double>* temp_data = nullptr;
+            int status = db.pz_readComplexData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
+            if (status == 0 && temp_data != nullptr) {
+                final_data_ptr[i] = temp_data[0];
+                free(temp_data);
+            } else {
+                final_data_ptr[i] = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
+            }
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            char* temp_data = nullptr;
+            int status = db.pz_readStringData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
+             if (status == 0 && temp_data != nullptr) {
+                final_data_ptr[i] = temp_data;
+                free(temp_data);
+            } else {
+                final_data_ptr[i] = "";
+            }
+        }
+        else {
+             throw std::runtime_error("Unsupported type in read_typed_tensor. INT32 reading is not supported by PanzerDB API.");
         }
     }
     

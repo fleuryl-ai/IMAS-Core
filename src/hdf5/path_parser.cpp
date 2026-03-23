@@ -14,12 +14,12 @@ const std::vector<PathSegment>& PathParser::segments() const {
 }
 
 void PathParser::parse() {
-    // Regex pour un segment complet, ex: "node[...]"
     std::regex segment_regex("([\\w-]+)(?:\\[(.*?)\\])?");
     
-    // Regex pour les différents types de sélections à l'intérieur de [...]
-    std::regex time_slice_regex("time=([\\d\\.]+)?:([\\d\\.]+)?"); // Ex: "time=1.2:3.4", "time=5.0:", "time=:10.0"
-    std::regex index_slice_regex("(\\d+)?:(\\d+)?");           // Ex: "3:10", "5:", ":20"
+    // Regex étendues
+    std::regex time_interp_regex("time=([\\d\\.]+)");             // time=2.3
+    std::regex time_slice_regex("time=([\\d\\.]+)?:([\\d\\.]+)?"); // time=1.2:3.4
+    std::regex index_slice_regex("(\\d+)?:(\\d+)?");              // 3:10
 
     std::string path_to_parse = raw_path_;
     
@@ -34,23 +34,29 @@ void PathParser::parse() {
             PathSegment segment;
             segment.node_name = match[1].str();
 
-            if (match[2].matched) { // Si une sélection [...] est présente
+            if (match[2].matched) {
                 std::string sel_content = match[2].str();
                 std::smatch content_match;
                 
-                if (sel_content.rfind("time=", 0) == 0) { // Démarre par "time="
-                    segment.selection = SelectionType::TIME_SLICE;
-                    if (std::regex_match(sel_content, content_match, time_slice_regex)) {
-                        if (content_match[1].matched) {
-                            segment.start_time = std::stod(content_match[1].str());
-                            segment.has_start_time = true;
-                        }
-                        if (content_match[2].matched) {
-                            segment.end_time = std::stod(content_match[2].str());
-                            segment.has_end_time = true;
+                if (sel_content.rfind("time=", 0) == 0) {
+                    if (sel_content.find(':') != std::string::npos) {
+                        segment.selection = SelectionType::TIME_SLICE;
+                        if (std::regex_match(sel_content, content_match, time_slice_regex)) {
+                            if (content_match[1].matched) {
+                                segment.start_time = std::stod(content_match[1].str());
+                                segment.has_start_time = true;
+                            }
+                            if (content_match[2].matched) {
+                                segment.end_time = std::stod(content_match[2].str());
+                                segment.has_end_time = true;
+                            }
                         }
                     } else {
-                        throw std::runtime_error("Invalid time slice format: " + sel_content);
+                        segment.selection = SelectionType::TIME_INTERP;
+                        if (std::regex_match(sel_content, content_match, time_interp_regex)) {
+                           segment.start_time = std::stod(content_match[1].str());
+                           segment.has_start_time = true;
+                        }
                     }
                 } else if (sel_content == ":") {
                     segment.selection = SelectionType::ALL;
@@ -65,16 +71,10 @@ void PathParser::parse() {
                             segment.end_index = std::stoul(content_match[2].str());
                             segment.has_end = true;
                         }
-                    } else {
-                        throw std::runtime_error("Invalid index slice format: " + sel_content);
                     }
-                } else { // C'est un simple indice
-                    try {
-                        segment.selection = SelectionType::INDEX;
-                        segment.index = std::stoul(sel_content);
-                    } catch (const std::exception&) {
-                        throw std::runtime_error("Invalid index format: " + sel_content);
-                    }
+                } else {
+                    segment.selection = SelectionType::INDEX;
+                    segment.index = std::stoul(sel_content);
                 }
             } else {
                 segment.selection = SelectionType::NONE;
@@ -84,15 +84,9 @@ void PathParser::parse() {
             throw std::runtime_error("Invalid path segment format: " + part);
         }
 
-        if (end == std::string::npos) {
-            break;
-        }
+        if (end == std::string::npos) break;
         start = end + 1;
         end = path_to_parse.find('/', start);
-    }
-
-    if (segments_.empty() && !raw_path_.empty()) {
-        throw std::runtime_error("Path parsing failed to produce any segments for non-empty path.");
     }
 }
 
