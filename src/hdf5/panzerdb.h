@@ -14,6 +14,9 @@
 #include <list>
 #include <map>
 
+// Ajout pour la nouvelle méthode get_leaf_type
+#include "direct_access_api.h"
+
 /**
  * @class PanzerDB
  * @brief A high-performance HDF5-based data storage engine.
@@ -550,6 +553,14 @@ public:
      * @return The current OpenMode (READ, WRITE, or APPEND).
      */
     OpenMode getOpenMode() const { return mode; }
+
+    /**
+     * @brief Détermine le type de donnée d'une feuille (dataset) à partir de son chemin.
+     * @param path Le chemin complet vers le dataset dans le fichier HDF5.
+     * @return Le type de la donnée sous forme d'enum DataType.
+     */
+    imas::direct_access::DataType get_leaf_type(const std::string& path);
+
 
     //==========================================================================
     // Read API - Data Retrieval

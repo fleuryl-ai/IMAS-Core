@@ -3307,3 +3307,48 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
         path_prefix = buildPathFromStack(array_stack);
     }
 }
+
+/**
+ * @brief Détermine le type de donnée d'une feuille à partir de son chemin en utilisant
+ * l'index en mémoire de PanzerDB. C'est la méthode correcte et performante.
+ * @param path Le chemin logique complet vers le nœud de données.
+ * @return Le type de la donnée sous forme d'enum DataType.
+ */
+ imas::direct_access::DataType PanzerDB::get_leaf_type(const std::string& path)
+ {
+     // 1. Récupère l'index en mémoire (très rapide, utilise un cache).
+     const auto& leaves = getLeaves();
+ 
+     // 2. Recherche la feuille en utilisant la table de lookup optimisée de PanzerDB.
+     auto it = leaf_lookup.find(std::string_view(path));
+     if (it != leaf_lookup.end() && !it->second.empty()) {
+         // Un chemin peut avoir plusieurs entrées (ex: séries temporelles).
+         // Le type est le même pour toutes, donc on prend la première.
+         const Leaf& leaf = leaves[it->second[0]];
+ 
+         // 3. Décode le type de données depuis le membre 'flags'.
+         // Le type est encodé dans les bits de poids fort.
+         uint64_t type_bits = (leaf.flags >> 4);
+         PanzerDB::DataType pz_type = static_cast<PanzerDB::DataType>(type_bits);
+ 
+         // 4. Fait la correspondance entre le type interne de PanzerDB et celui de l'API.
+         switch (pz_type) {
+             case PanzerDB::DataType::FLOAT64:
+                 return imas::direct_access::DataType::DOUBLE;
+             case PanzerDB::DataType::INT32:
+                 return imas::direct_access::DataType::INT32;
+             case PanzerDB::DataType::COMPLEX128:
+                 return imas::direct_access::DataType::COMPLEX_DOUBLE;
+             case PanzerDB::DataType::STRING:
+                 return imas::direct_access::DataType::STRING;
+             default:
+                 throw std::runtime_error("Type de donnée inconnu dans les flags de la feuille pour le chemin : " + path);
+         }
+     }
+ 
+     // Si la feuille n'est pas trouvée dans l'index, c'est une erreur.
+     throw std::runtime_error("Chemin non trouvé dans l'index de PanzerDB : " + path);
+ }
+ 
+ 
+ 
