@@ -16,24 +16,27 @@ enum class SelectionType {
     NONE,  // Aucune sélection, ex: "data"
     ALL,   // Sélection de tous les éléments, ex: "node[:]"
     INDEX, // Sélection par un indice unique, ex: "node[3]"
-    SLICE  // Sélection par une tranche (pour usage futur), ex: "node[2:]"
+    SLICE  // Sélection par une tranche, ex: "node[2:10]", "node[5:]", "node[:20]"
 };
 
 /**
  * @struct PathSegment
  * @brief Représente un segment unique d'un chemin d'accès.
  *
- * Un chemin comme "A[3]/B[:]/data" est décomposé en trois segments.
+ * Un chemin comme "A[3]/B[5:10]/data" est décomposé en trois segments.
  */
 struct PathSegment {
     std::string node_name;
     SelectionType selection = SelectionType::NONE;
+    
+    // Utilisé pour INDEX
     size_t index = 0;
 
-    // Champs pour la gestion future des slices avancées
-    // size_t start_index;
-    // size_t end_index;
-    // size_t step;
+    // Utilisé pour SLICE
+    size_t start_index = 0;
+    size_t end_index = 0;
+    bool has_start = false;
+    bool has_end = false;
 };
 
 /**

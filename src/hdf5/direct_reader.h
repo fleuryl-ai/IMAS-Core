@@ -4,9 +4,7 @@
 #include "direct_access_api.h"
 #include <string>
 #include <vector>
-
-// Forward declare HDF5 types pour ne pas inclure hdf5.h dans le header
-using hid_t = int;
+#include <hdf5.h> // Inclure directement l'en-tête HDF5
 
 namespace imas {
 namespace direct_access {
@@ -14,10 +12,6 @@ namespace direct_access {
 /**
  * @class DirectReader
  * @brief Gère la lecture de données directement depuis le backend de stockage.
- *
- * Cette classe est responsable de l'ouverture des fichiers, de la lecture
- * des métadonnées (dimensions, types) et de l'extraction de sous-ensembles
- * de données (slices, tenseurs) en utilisant les API bas niveau du backend.
  */
 class DirectReader {
 public:

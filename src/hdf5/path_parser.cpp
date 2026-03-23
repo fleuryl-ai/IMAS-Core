@@ -14,41 +14,55 @@ const std::vector<PathSegment>& PathParser::segments() const {
 }
 
 void PathParser::parse() {
-    // Regex pour capturer le nom du nœud et la sélection (optionnelle)
-    // - Groupe 1: ([\w-]+) -> Nom du nœud (lettres, chiffres, '_', '-')
-    // - Groupe 2: (\[(\d*|:|\d*:\d*)\])? -> Sélection optionnelle
-    //   - Groupe 3: (\d*|:|\d*:\d*) -> Contenu de la sélection (ex: "3", ":", "1:5")
-    std::regex segment_regex("([\\w-]+)(\\[(\\d*|:)\\])?");
+    // Regex étendue pour capturer les slices:
+    // - Groupe 1: ([\w-]+) -> Nom du nœud
+    // - Groupe 2: \[(...?)\] -> Contenu de la sélection (non-gourmand)
+    //   - Groupe 3: (\d+:\d*|\d*:\d+|\d+|:) -> Le contenu effectif : "3:10", "5:", ":20", "3", ":"
+    std::regex segment_regex("([\\w-]+)(?:\\[(.*?)\\])?");
+    std::regex slice_regex("(\\d+)?:(\\d+)?"); // Pour analyser le contenu d'une slice
 
     std::string path_to_parse = raw_path_;
     
-    // Divise le chemin par le délimiteur '/'
     size_t start = 0;
     size_t end = path_to_parse.find('/');
-    while (end != std::string::npos || start < path_to_parse.length()) {
-        std::string part = path_to_parse.substr(start, end - start);
-        if(end == std::string::npos) {
-             part = path_to_parse.substr(start);
-        }
-
+    
+    while (start < path_to_parse.length()) {
+        std::string part = path_to_parse.substr(start, (end == std::string::npos) ? std::string::npos : (end - start));
+        
         std::smatch match;
         if (std::regex_match(part, match, segment_regex)) {
             PathSegment segment;
             segment.node_name = match[1].str();
 
             if (match[2].matched) { // Si une sélection [...] est présente
-                std::string selection_content = match[3].str();
-                if (selection_content == ":") {
+                std::string sel_content = match[2].str();
+                
+                if (sel_content == ":") {
                     segment.selection = SelectionType::ALL;
-                } else if (!selection_content.empty()) {
-                    segment.selection = SelectionType::INDEX;
-                    try {
-                        segment.index = std::stoul(selection_content);
-                    } catch (const std::out_of_range&) {
-                        throw std::runtime_error("Index value '" + selection_content + "' is too large.");
+                } else if (sel_content.find(':') != std::string::npos) {
+                    segment.selection = SelectionType::SLICE;
+                    std::smatch slice_match;
+                    if (std::regex_match(sel_content, slice_match, slice_regex)) {
+                        if (slice_match[1].matched) {
+                            segment.start_index = std::stoul(slice_match[1].str());
+                            segment.has_start = true;
+                        }
+                        if (slice_match[2].matched) {
+                            segment.end_index = std::stoul(slice_match[2].str());
+                            segment.has_end = true;
+                        }
+                    } else {
+                        throw std::runtime_error("Invalid slice format in path: " + part);
                     }
                 } else {
-                     throw std::runtime_error("Invalid selection format in path: " + part);
+                    try {
+                        segment.selection = SelectionType::INDEX;
+                        segment.index = std::stoul(sel_content);
+                    } catch (const std::invalid_argument&) {
+                        throw std::runtime_error("Invalid index format in path: " + part);
+                    } catch (const std::out_of_range&) {
+                        throw std::runtime_error("Index value '" + sel_content + "' is too large.");
+                    }
                 }
             } else {
                 segment.selection = SelectionType::NONE;
@@ -69,6 +83,7 @@ void PathParser::parse() {
         throw std::runtime_error("Path parsing failed to produce any segments for non-empty path.");
     }
 }
+
 
 } // namespace direct_access
 } // namespace imas
