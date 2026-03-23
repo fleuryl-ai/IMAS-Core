@@ -16,13 +16,12 @@ const std::vector<PathSegment>& PathParser::segments() const {
 void PathParser::parse() {
     std::regex segment_regex("([\\w-]+)(?:\\[(.*?)\\])?");
     
-    // Regex étendues
-    std::regex time_interp_regex("time=([\\d\\.]+)");             // time=2.3
-    std::regex time_slice_regex("time=([\\d\\.]+)?:([\\d\\.]+)?"); // time=1.2:3.4
-    std::regex index_slice_regex("(\\d+)?:(\\d+)?");              // 3:10
+    // Regex pour les différentes parties de la sélection
+    std::regex time_regex("time=([\\d\\.]+)?:?([\\d\\.]+)?");
+    std::regex interp_regex("interp=(\\w+)");
+    std::regex index_slice_regex("(\\d+)?:(\\d+)?");
 
     std::string path_to_parse = raw_path_;
-    
     size_t start = 0;
     size_t end = path_to_parse.find('/');
     
@@ -36,12 +35,15 @@ void PathParser::parse() {
 
             if (match[2].matched) {
                 std::string sel_content = match[2].str();
-                std::smatch content_match;
                 
-                if (sel_content.rfind("time=", 0) == 0) {
-                    if (sel_content.find(':') != std::string::npos) {
-                        segment.selection = SelectionType::TIME_SLICE;
-                        if (std::regex_match(sel_content, content_match, time_slice_regex)) {
+                // Diviser le contenu par des virgules (ex: "time=2.7,interp=linear")
+                std::string token;
+                std::stringstream ss(sel_content);
+                while(std::getline(ss, token, ',')) {
+                    std::smatch content_match;
+                    if (token.rfind("time=", 0) == 0) {
+                        segment.selection = SelectionType::TIME;
+                        if (std::regex_match(token, content_match, time_regex)) {
                             if (content_match[1].matched) {
                                 segment.start_time = std::stod(content_match[1].str());
                                 segment.has_start_time = true;
@@ -51,31 +53,32 @@ void PathParser::parse() {
                                 segment.has_end_time = true;
                             }
                         }
+                    } else if (std::regex_match(token, content_match, interp_regex)) {
+                        std::string method = content_match[1].str();
+                        if (method == "linear") {
+                            segment.interp = InterpolationMethod::LINEAR;
+                        } else if (method == "closest") {
+                            segment.interp = InterpolationMethod::CLOSEST;
+                        }
+                    } else if (token == ":") {
+                        segment.selection = SelectionType::ALL;
+                    } else if (token.find(':') != std::string::npos) {
+                        segment.selection = SelectionType::SLICE;
+                        if (std::regex_match(token, content_match, index_slice_regex)) {
+                           if (content_match[1].matched) { segment.start_index = std::stoul(content_match[1].str()); segment.has_start = true; }
+                           if (content_match[2].matched) { segment.end_index = std::stoul(content_match[2].str()); segment.has_end = true; }
+                        }
                     } else {
-                        segment.selection = SelectionType::TIME_INTERP;
-                        if (std::regex_match(sel_content, content_match, time_interp_regex)) {
-                           segment.start_time = std::stod(content_match[1].str());
-                           segment.has_start_time = true;
-                        }
+                        segment.selection = SelectionType::INDEX;
+                        segment.index = std::stoul(token);
                     }
-                } else if (sel_content == ":") {
-                    segment.selection = SelectionType::ALL;
-                } else if (sel_content.find(':') != std::string::npos) {
-                    segment.selection = SelectionType::SLICE;
-                    if (std::regex_match(sel_content, content_match, index_slice_regex)) {
-                        if (content_match[1].matched) {
-                            segment.start_index = std::stoul(content_match[1].str());
-                            segment.has_start = true;
-                        }
-                        if (content_match[2].matched) {
-                            segment.end_index = std::stoul(content_match[2].str());
-                            segment.has_end = true;
-                        }
-                    }
-                } else {
-                    segment.selection = SelectionType::INDEX;
-                    segment.index = std::stoul(sel_content);
                 }
+
+                // Définir la méthode d'interpolation par défaut si nécessaire
+                if (segment.selection == SelectionType::TIME && !segment.has_end_time && segment.interp == InterpolationMethod::NONE) {
+                    segment.interp = InterpolationMethod::CLOSEST;
+                }
+
             } else {
                 segment.selection = SelectionType::NONE;
             }

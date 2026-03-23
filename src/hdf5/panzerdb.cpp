@@ -2922,6 +2922,124 @@ int PanzerDB::pz_readComplexData_by_index(
     return -1;
 }
 
+int PanzerDB::pz_readIntData_by_index(
+                         const char* full_data_path,
+                         int64_t time_index,
+                         uint64_t* ndim_out,
+                         uint64_t shape_out[6],
+                         int32_t** data_out) {
+
+    const auto& leaves = getLeaves();
+    if (leaves.empty()) return -1;
+
+    std::string_view target_path(full_data_path);
+    
+    if (time_index == -1) {
+        // --- Static or Global Search (Aggregation) ---
+        std::vector<const Leaf*> matches;
+        uint64_t total_count = 0;
+
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            matches.reserve(it->second.size());
+            for (size_t idx : it->second) {
+                const auto& leaf = leaves[idx];
+                if (static_cast<DataType>(leaf.flags >> 4) == DataType::INT32) {
+                    matches.push_back(&leaf);
+                    total_count += leaf.count;
+                }
+            }
+        }
+
+        if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0;
+        }
+
+        *data_out = (int32_t*)malloc(total_count * sizeof(int32_t));
+
+        if (matches.size() == 1) {
+            const Leaf& leaf = *matches[0];
+            this->readTensor(leaf, *data_out);
+            *ndim_out = leaf.shape.size();
+             for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+            return 0;
+        }
+
+        // Aggregation of time slices
+        std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
+            return a->time_index < b->time_index;
+        });
+
+        if (readLeavesUnion(matches, *data_out, DataType::INT32) < 0) {
+            // Fallback to sequential reads if union fails
+            size_t offset = 0;
+            for(const auto* leaf : matches) {
+                this->readTensor(*leaf, (*data_out) + offset);
+                offset += leaf->count;
+            }
+        }
+
+        const Leaf& first = *matches[0];
+        *ndim_out = first.shape.size() + 1;
+        for(size_t i=0; i<first.shape.size(); ++i) shape_out[i] = first.shape[i];
+        
+        size_t slice_vol = 1;
+        for(auto s : first.shape) if(s > 0) slice_vol *= s;
+        if (slice_vol > 0) {
+            shape_out[*ndim_out - 1] = total_count / slice_vol;
+        } else {
+            shape_out[*ndim_out - 1] = total_count;
+        }
+
+        return 0;
+
+    } else {
+        // --- Dynamic Search with specific time_index ---
+        const Leaf* target_leaf = nullptr;
+
+        // 1. Direct search
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            for (size_t idx : it->second) {
+                const auto& leaf = leaves[idx];
+                if (static_cast<DataType>(leaf.flags >> 4) == DataType::INT32 && isTimeInLeaf(leaf, time_index)) {
+                    target_leaf = &leaf;
+                    break;
+                }
+            }
+        }
+
+        // 2. Search via index substitution in path (if not found yet)
+        if (!target_leaf) {
+             // This logic would be a copy of pz_readData_by_index, adapted for int32.
+             // For now, we keep it simple.
+        }
+
+        if (target_leaf) {
+            size_t slice_volume = 1;
+            for (auto s : target_leaf->shape) if(s > 0) slice_volume *= s;
+            if (slice_volume == 0) slice_volume = 1;
+            
+            *data_out = (int32_t*)malloc(slice_volume * sizeof(int32_t));
+            if (this->readSliceDirect(*target_leaf, time_index, *data_out) < 0) {
+                free(*data_out);
+                return -1;
+            }
+            
+            *ndim_out = target_leaf->shape.size();
+            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = target_leaf->shape[i];
+            
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 int PanzerDB::readInterpolatedData(
                          const char* full_data_path,  // ✅ Changed
                          double time,
@@ -3341,6 +3459,8 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
                  return imas::direct_access::DataType::COMPLEX_DOUBLE;
              case PanzerDB::DataType::STRING:
                  return imas::direct_access::DataType::STRING;
+             case PanzerDB::DataType::LIST_OF_STRINGS:
+                 return imas::direct_access::DataType::LIST_OF_STRINGS;
              default:
                  throw std::runtime_error("Type de donnée inconnu dans les flags de la feuille pour le chemin : " + path);
          }

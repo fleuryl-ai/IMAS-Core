@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <complex>
 #include <memory>
 #include <stdexcept>
 
@@ -26,6 +27,7 @@ enum class DataType {
     STRING,
     COMPLEX_FLOAT,
     COMPLEX_DOUBLE,
+    LIST_OF_STRINGS, // Ajout pour gérer les tableaux de chaînes de caractères
     UNKNOWN
 };
 
@@ -70,14 +72,37 @@ public:
     void* data() { return buffer_.get(); }
 
     /**
-     * @brief Retourne la taille totale du buffer en octets.
-     */
-    size_t size_in_bytes() const;
+    * @brief Retourne la taille totale du buffer en octets.
+    */
+    size_t size_in_bytes() const {
+        size_t element_size = 0;
+        switch (data_type_) {
+            case DataType::FLOAT:         element_size = sizeof(float); break;
+            case DataType::DOUBLE:        element_size = sizeof(double); break;
+            case DataType::INT32:         element_size = sizeof(int32_t); break;
+            case DataType::INT64:         element_size = sizeof(int64_t); break;
+            case DataType::COMPLEX_FLOAT: element_size = sizeof(std::complex<float>); break;
+            case DataType::COMPLEX_DOUBLE:element_size = sizeof(std::complex<double>); break;
+            case DataType::STRING:        element_size = sizeof(char); break; // Buffer de char
+            case DataType::LIST_OF_STRINGS: element_size = sizeof(char); break; // Buffer de char
+            default:                      element_size = 0; break;
+        }
+        return total_elements() * element_size;
+    }
 
     /**
-     * @brief Retourne le nombre total d'éléments dans le tenseur.
-     */
-    size_t total_elements() const;
+    * @brief Retourne le nombre total d'éléments dans le tenseur.
+    */
+    size_t total_elements() const {
+        if (dimensions_.empty()) {
+            return 0;
+        }
+        size_t total = 1;
+        for (size_t dim : dimensions_) {
+            total *= dim;
+        }
+        return total;
+    }
 
     /**
      * @brief Accesseur typé aux données.

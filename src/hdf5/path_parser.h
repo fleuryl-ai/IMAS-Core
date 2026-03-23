@@ -13,13 +13,19 @@ enum class SelectionType {
     ALL,
     INDEX,
     SLICE,
-    TIME_SLICE,
-    TIME_INTERP // Nouveau pour l'interpolation
+    TIME // Un seul type pour toutes les sélections temporelles
+};
+
+enum class InterpolationMethod {
+    NONE,    // Pour les plages de temps [time=1:2]
+    CLOSEST, // Valeur par défaut pour un temps unique [time=2.7]
+    LINEAR   // Pour [time=2.7,interp=linear]
 };
 
 struct PathSegment {
     std::string node_name;
     SelectionType selection = SelectionType::NONE;
+    InterpolationMethod interp = InterpolationMethod::NONE;
     
     // Pour INDEX
     size_t index = 0;
@@ -30,7 +36,7 @@ struct PathSegment {
     bool has_start = false;
     bool has_end = false;
 
-    // Pour TIME_SLICE / TIME_INTERP
+    // Pour TIME
     double start_time = 0.0;
     double end_time = 0.0;
     bool has_start_time = false;

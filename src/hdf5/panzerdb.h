@@ -693,6 +693,16 @@ public:
         uint64_t shape_out[6],
         std::complex<double>** data_out);
 
+    /**
+     * @brief C-style API to read 32-bit integer data by path and time index.
+     */
+     int pz_readIntData_by_index(
+        const char* full_data_path,
+        int64_t time_index,
+        uint64_t* ndim_out,
+        uint64_t shape_out[6],
+        int32_t** data_out);
+
     void advanceTimebase(const std::string& timebase_name, uint64_t n_steps = 1);
     std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
 

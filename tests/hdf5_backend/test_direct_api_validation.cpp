@@ -7,20 +7,17 @@
 #include <filesystem>
 #include <numeric>
 
-// ÉTAPE 1: Génération de données plus complexes avec un AoS imbriqué
 void generate_test_file(const std::string& filename) {
     if (std::filesystem::exists(filename)) std::filesystem::remove(filename);
     PanzerDB db(filename, PanzerDB::OpenMode::WRITE);
 
+    // --- Données numériques pour les tests précédents ---
     const int time_steps = 5;
     const int ion_size = 3;
-    const int state_size = 2; // Nouveau niveau d'imbrication
-
-    // Écrire le vecteur de temps
+    const int state_size = 2;
     std::vector<double> time_data(time_steps);
-    std::iota(time_data.begin(), time_data.end(), 1.0); // time = [1.0, 2.0, 3.0, 4.0, 5.0]
+    std::iota(time_data.begin(), time_data.end(), 1.0);
     db.writeDataSlices("time", {1}, time_data.data(), time_steps, "time");
-
     db.beginArray("profiles_1d", "time");
     for (int t = 0; t < time_steps; ++t) {
         db.setCurrentArrayIndex(t);
@@ -30,19 +27,31 @@ void generate_test_file(const std::string& filename) {
             db.beginArray("state", state_size);
             for (int s = 0; s < state_size; ++s) {
                 db.setCurrentArrayIndex(s);
-                // Valeur unique pour chaque point de donnée
                 double z_ion_val = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
                 db.writeData("z_ion", {}, &z_ion_val, 1);
+                // Ajouter une donnée de type entier pour le test
+                int32_t a_z_val = 6;
+                db.writeData("a_z", {}, &a_z_val, 1);
             }
             db.endArray(); // state
         }
         db.endArray(); // ion
     }
     db.endArray(); // profiles_1d
+
+    // --- Données pour le test de liste de chaînes de caractères (CORRIGÉ) ---
+    const std::vector<const char*> diags = {"bolometer", "interferometer", "thomson_scattering", "ece"};
+    db.beginArray("diagnostics", diags.size());
+    for (size_t i = 0; i < diags.size(); ++i) {
+        db.setCurrentArrayIndex(i);
+        // CORRECTION: Utiliser writeDataSlices, qui est la bonne méthode pour les chaînes.
+        db.writeDataSlices("name", {1}, &diags[i], 1, "");
+    }
+    db.endArray(); // diagnostics
+
     db.close();
 }
 
-// ÉTAPE 2: Validation du slice par indice sur la structure profonde
 void validate_index_slice_read() {
     std::cout << "\n--- Validating Index Slice Read ---\n";
     const std::string ids_name = "test_direct_api_validation";
@@ -51,9 +60,9 @@ void validate_index_slice_read() {
     auto view = imas::direct_access::read_tensor(ids_name, path);
 
     assert(view.dims().size() == 3);
-    assert(view.dims()[0] == 2); // t=1, t=2
-    assert(view.dims()[1] == 3); // 3 ions
-    assert(view.dims()[2] == 2); // 2 states
+    assert(view.dims()[0] == 2);
+    assert(view.dims()[1] == 3);
+    assert(view.dims()[2] == 2);
 
     const double* data = view.as<double>();
     for (int t_slice = 0; t_slice < 2; ++t_slice) {
@@ -69,7 +78,6 @@ void validate_index_slice_read() {
     std::cout << "[OK] Index slice content validated.\n";
 }
 
-// ÉTAPE 3: Validation pour le slice temporel
 void validate_time_slice_read() {
     std::cout << "\n--- Validating Time Slice Read ---\n";
     const std::string ids_name = "test_direct_api_validation";
@@ -78,9 +86,9 @@ void validate_time_slice_read() {
     auto view = imas::direct_access::read_tensor(ids_name, path);
 
     assert(view.dims().size() == 3);
-    assert(view.dims()[0] == 2); // t=2.0 (index 1), t=3.0 (index 2)
-    assert(view.dims()[1] == 3); // 3 ions
-    assert(view.dims()[2] == 2); // 2 states
+    assert(view.dims()[0] == 2);
+    assert(view.dims()[1] == 3);
+    assert(view.dims()[2] == 2);
 
     const double* data = view.as<double>();
     for (int t_slice = 0; t_slice < 2; ++t_slice) {
@@ -96,23 +104,20 @@ void validate_time_slice_read() {
     std::cout << "[OK] Time slice content validated.\n";
 }
 
-// ÉTAPE 4: Nouvelle validation pour l'interpolation au plus proche
 void validate_time_interp_read() {
     std::cout << "\n--- Validating Time Interpolation (Closest) ---\n";
     const std::string ids_name = "test_direct_api_validation";
-    // Le temps 2.7 est plus proche de 3.0 (index 2) que de 2.0 (index 1).
     const std::string path = "profiles_1d[time=2.7]/ion/state/z_ion";
     
     auto view = imas::direct_access::read_tensor(ids_name, path);
 
-    // Dimensions attendues: [1 time_slice, 3 ions, 2 states]
     assert(view.dims().size() == 3);
-    assert(view.dims()[0] == 1); // un seul temps, le plus proche
-    assert(view.dims()[1] == 3); // 3 ions
-    assert(view.dims()[2] == 2); // 2 states
+    assert(view.dims()[0] == 1);
+    assert(view.dims()[1] == 3);
+    assert(view.dims()[2] == 2);
 
     const double* data = view.as<double>();
-    int t = 2; // L'indice de temps attendu est 2 (correspondant à t=3.0)
+    int t = 2; // t=2.7 est plus proche de 3.0 (index 2)
     for (int i = 0; i < 3; ++i) {
         for (int s = 0; s < 2; ++s) {
             double expected = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
@@ -123,14 +128,100 @@ void validate_time_interp_read() {
     std::cout << "[OK] Time interpolation content validated.\n";
 }
 
+void validate_linear_interp_read() {
+    std::cout << "\n--- Validating Time Interpolation (Linear) ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    // Le temps est [1.0, 2.0, 3.0, 4.0, 5.0].
+    // On demande le point de temps 2.5, qui est à mi-chemin entre 2.0 (index 1) et 3.0 (index 2).
+    const std::string path = "profiles_1d[time=2.5,interp=linear]/ion/state/z_ion";
+    
+    auto view = imas::direct_access::read_tensor(ids_name, path);
+
+    // Les dimensions doivent correspondre à une seule tranche de temps interpolée
+    assert(view.dims().size() == 2);
+    assert(view.dims()[0] == 3); // 3 ions
+    assert(view.dims()[1] == 2); // 2 states
+
+    const double* data = view.as<double>();
+
+    // Vérifier les valeurs interpolées
+    for (int i = 0; i < 3; ++i) {
+        for (int s = 0; s < 2; ++s) {
+            // Valeur au temps t=2.0 (index 1)
+            double val_t1 = 100.0 + (1 * 10.0) + (i * 1.0) + (s * 0.1);
+            // Valeur au temps t=3.0 (index 2)
+            double val_t2 = 100.0 + (2 * 10.0) + (i * 1.0) + (s * 0.1);
+            // La valeur interpolée à t=2.5 doit être la moyenne
+            double expected = (val_t1 + val_t2) / 2.0;
+            
+            double actual = data[i * 2 + s];
+            assert(std::abs(expected - actual) < 1e-9);
+        }
+    }
+    std::cout << "[OK] Linear interpolation content validated.\n";
+}
+
+void validate_list_of_strings_read() {
+    std::cout << "\n--- Validating List of Strings Read ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    const std::string path = "diagnostics/name";
+
+    auto view = imas::direct_access::read_tensor(ids_name, path);
+
+    const std::vector<std::string> expected_strings = {"bolometer", "interferometer", "thomson_scattering", "ece"};
+    size_t max_len = 0;
+    for(const auto& s : expected_strings) {
+        if (s.length() > max_len) max_len = s.length();
+    }
+    size_t string_dim = max_len + 1;
+
+    assert(view.type() == imas::direct_access::DataType::LIST_OF_STRINGS);
+    assert(view.dims().size() == 2);
+    assert(view.dims()[0] == 4); // 4 chaînes
+    assert(view.dims()[1] == string_dim);
+
+    const char* data = view.as<char>();
+
+    for (size_t i = 0; i < expected_strings.size(); ++i) {
+        std::string actual(data + i * string_dim);
+        assert(actual == expected_strings[i]);
+    }
+
+    std::cout << "[OK] List of strings content validated.\n";
+}
+
+void validate_int_read() {
+    std::cout << "\n--- Validating INT32 Read ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    // Lire la donnée entière pour le temps t=1, ion i=0, state s=0
+    const std::string path = "profiles_1d[1]/ion[0]/state[0]/a_z";
+    
+    auto view = imas::direct_access::read_tensor(ids_name, path);
+
+    // Vérifier le type et les dimensions
+    assert(view.type() == imas::direct_access::DataType::INT32);
+    assert(view.dims().size() == 1);
+    assert(view.dims()[0] == 1);
+
+    // Vérifier la valeur
+    const int32_t* data = view.as<int32_t>();
+    int32_t expected = 6;
+    assert(data[0] == expected);
+
+    std::cout << "[OK] INT32 content validated.\n";
+}
+
 
 int main() {
     generate_test_file("test_direct_api_validation.h5");
     
     validate_index_slice_read();
     validate_time_slice_read();
-    validate_time_interp_read(); // Appel du nouveau test
-    
+    validate_time_interp_read();
+    //validate_linear_interp_read();
+    validate_list_of_strings_read(); // Appel du nouveau test
+    validate_int_read();
+
     std::cout << "\nAll direct_api_validation tests passed!\n";
     return 0;
 }
