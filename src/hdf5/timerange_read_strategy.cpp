@@ -67,10 +67,10 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
 
 void TimeRangeReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
+        // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
         //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
+        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump leaf cache for debugging
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
     }
   else{
@@ -142,7 +142,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
     bool is_dynamic = timebasename.compare("") != 0 ? true : false;
     std::vector<int> ctx_indices;
-        // On récupère les indices sans forcer l'index temporel (il sera géré par readInterpolatedData)
+        // We get the indices without forcing the time index (it will be handled by readInterpolatedData)
     int dynamic_index = -1;
     ctx_indices = getIndices(ctx, &dynamic_index);
 

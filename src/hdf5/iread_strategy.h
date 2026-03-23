@@ -63,9 +63,9 @@ protected:
 
     std::unordered_map<std::string, std::vector<double>> time_values_cache;
     
-    // Cache pour la sanitization des chemins (Context + Path -> Sanitized Path)
+    // Cache for path sanitization (Context + Path -> Sanitized Path)
     mutable std::map<std::pair<Context*, std::string>, std::string> sanitized_path_cache;
-    mutable std::set<std::string> schema_aos_paths; // Cache des chemins d'AoS "schéma" (sans indices)
+    mutable std::set<std::string> schema_aos_paths; // Cache for "schema" AoS paths (without indices)
 
 public:
     // =================================================================================
@@ -146,9 +146,9 @@ public:
 
     std::string timebasename_copy = timebasename;
     if (!timebasename_copy.empty() && timebasename_copy[0] == '/') {
-        timebasename_copy.erase(0, 1); // Supprime 1 caractère à l'index 0
+        timebasename_copy.erase(0, 1); // Remove 1 character at index 0
     }
-    // Utilisation de la sanitization intelligente
+    // Use smart sanitization
     timebasename_copy = sanitize_path(ctx, timebasename_copy);
 
     if (homogeneous_time == 1) {
@@ -161,7 +161,7 @@ public:
         return time_values;
     }
 
-    // --- Logique pour homogeneous_time == 0 ---
+    // --- Logic for homogeneous_time == 0 ---
     //std::cout << "[DEBUG getTimeValues] Searching for time values in dynamic AoS context." << std::endl;
     if (ctx == nullptr) {
         //std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
@@ -169,14 +169,14 @@ public:
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
-    if (!arrCtx) { // Cas où le contexte est OperationContext
+    if (!arrCtx) { // Case where context is OperationContext
         //std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
         time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback for root time
         //printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
         return time_values;
     }
 
-    // On cherche le parent "timed" pour construire le chemin de la base de temps
+    // Find the "timed" parent to build the timebase path
     ArraystructContext* timed_ctx = arrCtx;
     while(timed_ctx != nullptr && !timed_ctx->getTimed()) {
         timed_ctx = timed_ctx->getParent();
@@ -207,11 +207,11 @@ public:
         return {}; // No timebase found
     }
 
-    // Filtrer pour ne garder QUE les feuilles correspondant au chemin exact
+    // Filter to keep ONLY leaves corresponding to the exact path
     std::map<uint64_t, const PanzerDB::Leaf*> time_leaves_map;
     std::string timed_aos_path = getPath(timed_ctx, false);
     std::string timebase_name_str = timed_ctx->getTimebasePath();
-    // Utilisation de la sanitization intelligente
+    // Use smart sanitization
     timebase_name_str = sanitize_path(timed_ctx, timebase_name_str);
 
     // Extract basename of timebase to handle both relative ("time") and absolute/generic ("path/to/time") paths
@@ -229,9 +229,9 @@ public:
 
     auto leaves = panzer_db_ptr->getLeaves();
 
-    // STRATÉGIE HYBRIDE :
-    // 1. Tentative d'accès direct (Optimisation si la base de temps est stockée en un seul bloc sous l'AoS)
-    //    On cherche "AoS_Path/time".
+    // HYBRID STRATEGY:
+    // 1. Attempt direct access (Optimization if the timebase is stored in a single block under the AoS)
+    //    We look for "AoS_Path/time".
     std::string direct_tb_path = timed_aos_path + "/" + timebase_basename;
     auto it_cache = path_cache.find(direct_tb_path);
     
@@ -243,14 +243,14 @@ public:
             }
         }
     } else {
-        // 2. Fallback Optimisé : Itération par index (au lieu de scan linéaire)
+        // 2. Optimized Fallback: Iteration by index (instead of linear scan)
         // Use the known size of the AoS to generate probable paths.
         size_t aos_size = panzer_db_ptr->getDynamicAOSSize(timed_aos_path);
         
         if (aos_size > 0) {
             for (size_t i = 0; i < aos_size; ++i) {
                 // Construct path: AoS/i/time
-                // Note: timebase_name_str est déjà relatif à l'AoS (ex: "time" ou "nested/time")
+                // Note: timebase_name_str is already relative to the AoS (e.g., "time" or "nested/time")
                 std::string slice_tb_path = timed_aos_path + "/" + std::to_string(i) + "/" + timebase_name_str;
                 
                 auto it = path_cache.find(slice_tb_path);
@@ -329,7 +329,7 @@ public:
             std::stringstream ss(root);
             std::string segment;
             while (std::getline(ss, segment, '/')) {
-                // Si le segment est numérique, on l'ignore (c'est un index)
+                // If the segment is numeric, ignore it (it's an index)
                 if (segment.empty() || std::all_of(segment.begin(), segment.end(), ::isdigit)) {
                     continue;
                 }
@@ -405,11 +405,11 @@ public:
         strict_target_path += std::to_string(indices[i]);
     }
     
-    // ✅ Calculer context_prefix (chemin sans le dataset final)
+    // ✅ Calculate context_prefix (path without the final dataset)
     std::string context_prefix = strict_target_path;
     if (!path_segments.empty()) context_prefix += "/";
     
-    // ✅ Ajouter le dataset pour obtenir le chemin complet
+    // ✅ Add the dataset to get the full path
     if (!path_segments.empty()) strict_target_path += "/";
     strict_target_path += clean_ds_name;
     
@@ -458,7 +458,7 @@ public:
     return nullptr;
 }
 
-   protected: // La méthode est `protected` pour être accessible par les classes filles
+   protected: // This method is `protected` to be accessible by derived classes
 
      // =================================================================================
     //                            Path Construction Helpers
@@ -586,7 +586,7 @@ public:
 
 public:
     std::string sanitize_path(Context* ctx, const std::string& path) {
-        // On construit le chemin complet pour appliquer la logique
+        // We build the full path to apply the logic
         std::string fullPath = path;
 
         if (fullPath.empty()) return "";
@@ -610,7 +610,7 @@ public:
 
         Context* current = ctx;
 
-        // 1. Parcours des contextes du plus profond (F) vers le plus haut (A)
+        // 1. Traverse contexts from deepest (F) to highest (A)
         while (current != nullptr) {
             std::string ctxPath;
             if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
@@ -637,11 +637,11 @@ public:
                             segments.push_back(suffix);
                         }
 
-                        // Transformer le bloc du contexte lui-même (ex: "d/e/F" -> "d&e&F")
+                        // Transform the context block itself (e.g., "d/e/F" -> "d&e&F")
                         replaceSlashWithAmpersand(ctxPath);
                         segments.push_back(ctxPath);
 
-                        // Réduire la chaîne pour l'itération suivante
+                        // Reduce the string for the next iteration
                         remaining = remaining.substr(0, pos);
                         if (!remaining.empty() && remaining.back() == '/') {
                             remaining.pop_back();
@@ -687,7 +687,7 @@ public:
         return result;
     }
 
-   protected: // The method is `protected` to be accessible by derived classes
+   protected: // This method is `protected` to be accessible by derived classes
 
      // =================================================================================
     //                            Context Utilities
@@ -714,7 +714,7 @@ public:
     }
 
     
-   protected: // The method is `protected` to be accessible by derived classes
+   protected: // This method is `protected` to be accessible by derived classes
 
     // =================================================================================
     //                            Data Reading Helpers
@@ -748,7 +748,7 @@ public:
                 *data = malloc(leaf->count * sizeof(std::complex<double>));
                 panzer_db_ptr->readTensor<std::complex<double>>(*leaf, static_cast<std::complex<double>*>(*data));
             } else if (datatype == alconst::char_data) {
-                if (leaf->shape.size() <= 1) { // Liste 1D ou Scalaire
+                if (leaf->shape.size() <= 1) { // 1D list or Scalar
                     std::vector<std::string> str_list(leaf->count);
                     panzer_db_ptr->readTensor<std::string>(*leaf, str_list.data());
                     
@@ -772,7 +772,7 @@ public:
                 size[i] = leaf->shape[i];
             }
 
-            return 1; // Succès
+            return 1; // Success
         } catch (const std::exception& e) {
             throw ALBackendException(std::string("PanzerDB read error: ") + e.what(), LOG);
         }
@@ -804,12 +804,12 @@ public:
         if (cache_it != context_path_cache.end()) {
             context_prefix = cache_it->second;
         } else {
-            // Le chemin n'est pas en cache, on le construit et on le stocke
+            // Path is not in cache, build it and store it
             std::stringstream ss_prefix;
-            // ... (la logique de construction du chemin reste ici)
-            // Après la construction, stocker dans le cache :
+            // ... (path construction logic remains here)
+            // After construction, store in cache:
             // context_path_cache[ctx] = ss_prefix.str();
-            // Pour l'instant, on va intégrer la logique directement ci-dessous.
+            // For now, we integrate the logic directly below.
         }
 
         // 1. Path reconstruction
@@ -821,7 +821,7 @@ public:
         
     
         while (curr != nullptr) {
-            // Crash potentiel ici si curr est invalide
+            // Potential crash here if curr is invalid
             if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
                 ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
                 std::string full_path = arr->getPath(); 
@@ -932,9 +932,9 @@ public:
         }
 
         if (!found || sorted_leaves.empty()) {
-            // Fallback : Recherche linéaire pour les signaux dynamiques lus depuis un parent
-            // (ex: lire "profiles_1d/signal" depuis la racine)
-            // Note: Ce cas est rare si on utilise correctement les contextes.
+            // Fallback: Linear search for dynamic signals read from a parent
+            // (e.g., read "profiles_1d/signal" from the root)
+            // Note: This case is rare if contexts are used correctly.
             
             // ✅ FIX: FALLBACK LINEAR SEARCH IS NECESSARY!
             const auto& leaves = panzer_db_ptr->getLeaves();
@@ -1018,7 +1018,7 @@ public:
             case PanzerDB::DataType::COMPLEX128: actual_datatype = alconst::complex_data; break;
             default:
                 DEBUG_PRINT("Unknown data type in leaf flags: " << (first_leaf->flags >> 4));
-                return 0; // Type inconnu
+                return 0; // Unknown type
         }
 
         size_t leaf_rank = first_leaf->shape.size();
@@ -1082,7 +1082,7 @@ public:
                 size[0] = (int)total_elements; 
             } else { 
                 *dim = 0; 
-                // size[0] = 1; // Implicite pour un scalaire
+                // size[0] = 1; // Implicit for a scalar
             }
         } else {
             // N-D signal -> Add time dimension IF multiple slices

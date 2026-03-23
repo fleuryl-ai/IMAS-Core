@@ -9,7 +9,7 @@
 #define HOMOGENEOUS_TIME_FIELD_NAME "ids_properties&homogeneous_time"
 #define HOMOGENEOUS_TIME_BASIS_FIELD_NAME "time"
 
-// Macro de debug
+// Debug macro
 #ifdef DEBUG_HDF5_READER_V2
 #define DEBUG_PRINT(msg) \
   std::cerr << "[DEBUG " << __func__ << "] " << msg << std::endl
@@ -38,10 +38,10 @@ void GlobalReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int
 
 void GlobalReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        // En mode lecture, panzer_db_ptr->endArray() n'est pas nécessaire car array_stack n'est pas utilisé.
+        // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
         //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
+        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump leaf cache for debugging
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
     }
   else{
@@ -51,6 +51,6 @@ void GlobalReadStrategy::endAction(Context *ctx) {
 int GlobalReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                      int *datatype, void **data, int *dim, int *size) {
 
-    // Utilisation de la méthode commune définie dans IReadStrategy
+    // Use the common method defined in IReadStrategy
     return read_dataset_globally(ctx, dataset_name, datatype, data, dim, size);
 }
