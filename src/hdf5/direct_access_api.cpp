@@ -155,7 +155,8 @@ TensorView read_typed_tensor(
     PanzerDB& db,
     const std::vector<std::string>& leaf_paths,
     const std::vector<size_t>& final_dims,
-    DataType data_type)
+    DataType data_type,
+    const std::map<std::string, std::string>& metadata)
 {
     size_t total_elements = std::accumulate(final_dims.begin(), final_dims.end(), 1, std::multiplies<size_t>());
     if (total_elements == 0) total_elements = leaf_paths.size();
@@ -208,14 +209,15 @@ TensorView read_typed_tensor(
         }
     }
     
-    return TensorView(std::move(final_buffer), final_dims, data_type);
+    return TensorView(std::move(final_buffer), final_dims, data_type, metadata);
 }
 
 // Nouvelle fonction dédiée à la lecture des listes de chaînes de caractères
 TensorView read_list_of_strings(
     PanzerDB& db,
     const std::vector<std::string>& leaf_paths,
-    const std::vector<size_t>& selection_dims)
+    const std::vector<size_t>& selection_dims,
+    const std::map<std::string, std::string>& metadata)
 {
     std::vector<std::string> temp_strings;
     size_t max_len = 0;
@@ -257,7 +259,7 @@ TensorView read_list_of_strings(
     }
     final_dims.push_back(string_dim);
     
-    return TensorView(std::move(final_buffer), final_dims, DataType::LIST_OF_STRINGS);
+    return TensorView(std::move(final_buffer), final_dims, DataType::LIST_OF_STRINGS, metadata);
 }
 
 // Fonction corrigée pour gérer la logique d'interpolation linéaire
@@ -346,7 +348,7 @@ TensorView read_interpolated_tensor(
     auto final_buffer = std::shared_ptr<char[]>(reinterpret_cast<char*>(interpolated_data), [](char* p){ free(p); });
     std::vector<size_t> final_dims = view_inf.dims();
     
-    return TensorView(std::move(final_buffer), final_dims, view_inf.type());
+    return TensorView(std::move(final_buffer), final_dims, view_inf.type(), view_inf.metadata());
 }
 
 // Le nouveau "chef d'orchestre"
@@ -379,28 +381,27 @@ TensorView read_tensor_impl_core(PanzerDB& db, const std::vector<PathSegment>& s
         return TensorView();
     }
 
-    DataType data_type = db.get_leaf_type(leaf_paths[0]);
+    // --- NOUVEAU: Lire les métadonnées ---
+    auto metadata = db.readMetadata(leaf_paths[0]);
 
+    DataType data_type = db.get_leaf_type(leaf_paths[0]);
     std::vector<size_t> final_dims = selection_dims;
     
     switch (data_type) {
         case DataType::DOUBLE:
-            return read_typed_tensor<double>(db, leaf_paths, final_dims, data_type);
+            return read_typed_tensor<double>(db, leaf_paths, final_dims, data_type, metadata); // Passe metadata
         case DataType::INT32:
-            return read_typed_tensor<int>(db, leaf_paths, final_dims, data_type);
+            return read_typed_tensor<int>(db, leaf_paths, final_dims, data_type, metadata); // Passe metadata
         case DataType::COMPLEX_DOUBLE:
-            return read_typed_tensor<std::complex<double>>(db, leaf_paths, final_dims, data_type);
-    
-        // CORRECTION: Dévier tous les types de chaînes vers la fonction correcte
+            return read_typed_tensor<std::complex<double>>(db, leaf_paths, final_dims, data_type, metadata); // Passe metadata
         case DataType::STRING:
         case DataType::LIST_OF_STRINGS:
-            return read_list_of_strings(db, leaf_paths, selection_dims);
-    
+            return read_list_of_strings(db, leaf_paths, selection_dims, metadata); // Passe metadata
         default:
             throw std::runtime_error("Unsupported data type for direct tensor read.");
     }
-    
 }
+
 
 TensorView read_tensor(const std::string& ids_name, const std::string& path)
 {

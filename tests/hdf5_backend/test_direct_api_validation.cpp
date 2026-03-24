@@ -60,7 +60,7 @@ void generate_test_file(const std::string& filename) {
         db.writeDataSlices("name", {1}, &diags[i], 1, "");
     }
     db.endArray(); // diagnostics
-
+    db.writeMetaData("profiles_1d/ion/state/z_ion@units", "eV");
     db.close();
 }
 
@@ -270,6 +270,24 @@ void validate_int_read() {
     std::cout << "[OK] INT32 content validated.\n";
 }
 
+void validate_metadata_read() {
+    std::cout << "\n--- Validating Metadata Read ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    // On lit n'importe quelle instance de z_ion, les métadonnées sont les mêmes pour toutes.
+    const std::string path = "profiles_1d[0]/ion[0]/state[0]/z_ion";
+    
+    auto view = imas::direct_access::read_tensor(ids_name, path);
+
+    // Récupérer et valider les métadonnées
+    const auto& metadata = view.metadata();
+    assert(!metadata.empty());
+    assert(metadata.count("units") == 1);
+    assert(metadata.at("units") == "eV");
+
+    std::cout << "[OK] Metadata content validated.\n";
+}
+
+
 int main() {
     generate_test_file("test_direct_api_validation.h5");
     
@@ -280,6 +298,7 @@ int main() {
     validate_list_of_strings_read();
     validate_int_read();
     validate_in_memory_slice();
+    validate_metadata_read();
 
     std::cout << "\nAll direct_api_validation tests passed!\n";
     return 0;

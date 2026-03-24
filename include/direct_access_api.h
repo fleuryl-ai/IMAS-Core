@@ -5,6 +5,7 @@
 #include <string>
 #include <complex>
 #include <memory>
+#include <map>
 #include <stdexcept>
 
 // Forward declaration pour éviter d'inclure al_const.h dans un header public si possible
@@ -56,27 +57,30 @@ private:
             default:                      return 0;
         }
     }
+    std::map<std::string, std::string> metadata_;
     
 public:
     TensorView() : data_type_(DataType::UNKNOWN) {}
 
-    TensorView(std::shared_ptr<char[]> buffer, std::vector<size_t> dims, DataType type)
+    TensorView(std::shared_ptr<char[]> buffer, std::vector<size_t> dims, DataType type, std::map<std::string, std::string> metadata = {})
     : buffer_(std::move(buffer)), dimensions_(std::move(dims)), data_type_(type), offset_in_bytes_(0) {
     
-    // Calcule automatiquement les strides pour un bloc de mémoire contigu
-    if (!dimensions_.empty()) {
-        strides_in_bytes_.resize(dimensions_.size());
-        size_t element_size = get_element_size(type);
-        if (element_size == 0) {
-            throw std::runtime_error("Impossible de calculer les strides pour un type de donnée inconnu.");
-        }
-        
-        strides_in_bytes_.back() = element_size;
-        for (int i = dimensions_.size() - 2; i >= 0; --i) {
-            strides_in_bytes_[i] = strides_in_bytes_[i + 1] * dimensions_[i + 1];
+        // Calcule automatiquement les strides pour un bloc de mémoire contigu
+        if (!dimensions_.empty()) {
+            strides_in_bytes_.resize(dimensions_.size());
+            size_t element_size = get_element_size(type);
+            if (element_size == 0) {
+                throw std::runtime_error("Impossible de calculer les strides pour un type de donnée inconnu.");
+            }
+            
+            strides_in_bytes_.back() = element_size;
+            for (int i = dimensions_.size() - 2; i >= 0; --i) {
+                strides_in_bytes_[i] = strides_in_bytes_[i + 1] * dimensions_[i + 1];
+            }
         }
     }
-}
+
+    const std::map<std::string, std::string>& metadata() const { return metadata_; }
 
     const std::vector<size_t>& dims() const { return dimensions_; }
     DataType type() const { return data_type_; }
@@ -160,13 +164,13 @@ public:
         }
         
         // Appel du constructeur privé pour créer la nouvelle vue.
-        return TensorView(buffer_, new_dims, data_type_, new_strides, new_offset);
+        return TensorView(buffer_, new_dims, data_type_, new_strides, new_offset, metadata_);
     }
 
 private:
 private:
     // Constructeur pour les vues dérivées (utilisé par slice())
-    TensorView(std::shared_ptr<char[]> buffer, std::vector<size_t> dims, DataType type, std::vector<size_t> strides, size_t offset)
+    TensorView(std::shared_ptr<char[]> buffer, std::vector<size_t> dims, DataType type, std::vector<size_t> strides, size_t offset, const std::map<std::string, std::string>& metadata)
     : buffer_(std::move(buffer)), dimensions_(std::move(dims)), data_type_(type), strides_in_bytes_(std::move(strides)), offset_in_bytes_(offset) {}
 
     std::shared_ptr<char[]> buffer_;
