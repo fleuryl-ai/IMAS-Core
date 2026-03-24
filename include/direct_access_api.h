@@ -8,6 +8,7 @@
 #include <map>
 #include <stdexcept>
 
+
 // Forward declaration pour éviter d'inclure al_const.h dans un header public si possible
 namespace alconst {
     enum data_type : int;
@@ -39,6 +40,19 @@ struct SliceSelection {
     static SliceSelection to(size_t end) { return {Type::Range, 0, {0, end}}; }
     static SliceSelection between(size_t start, size_t end) { return {Type::Range, 0, {start, end}}; }
     static SliceSelection all() { return {Type::All, 0, {0,0}}; }
+};
+
+enum class NodeType {
+    DATASET,
+    AOS_STATIC,
+    AOS_DYNAMIC
+};
+
+struct NodeInfo {
+    std::string path;
+    NodeType type;
+    std::vector<size_t> dims;
+    bool is_in_dynamic_aos = false; // Pour un dataset: est-il dans un AoS dynamique?
 };
 
 class TensorView {
@@ -187,6 +201,11 @@ TensorView read_tensor(
     const std::string& path_template,
     const std::vector<int>& aos_indices
 );
+
+// Retourne à la fois les nœuds et une map des chemins d'AOS pour aider à l'affichage
+std::pair<std::vector<NodeInfo>, std::map<std::string, NodeType>>
+list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show_metadata);
+
 
 } // namespace direct_access
 } // namespace imas

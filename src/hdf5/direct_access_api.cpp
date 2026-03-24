@@ -12,6 +12,10 @@
 #include <stdexcept>
 #include <memory>
 #include <limits>
+#include <set>
+#include <map>
+#include <algorithm>
+#include <sstream>
 
 namespace imas {
 namespace direct_access {
@@ -108,28 +112,31 @@ void collect_leaf_paths_recursive(
         if (seg.selection == SelectionType::INDEX) {
             start = seg.index;
             end = start + 1;
+            // Une sélection par INDEX unique supprime la dimension, on n'ajoute rien à selection_dims.
         } else if (seg.selection == SelectionType::SLICE || seg.selection == SelectionType::ALL) {
             start = seg.has_start ? seg.start_index : 0;
             end = seg.has_end ? seg.end_index : aos_size;
+            // CORRECTION: Ajouter la dimension uniquement si c'est le premier passage à ce niveau
+            if (selection_dims.size() <= segment_idx) {
+                selection_dims.push_back(end - start);
+            }
         } else if (seg.selection == SelectionType::TIME) {
             std::vector<double> time_values = get_time_vector(db, new_path_base, aos_size);
-            if (time_values.empty()) {
-                throw std::runtime_error("Could not resolve time vector for path: " + new_path_base);
-            }
-
             DataInterpolation interpolator;
-            std::map<std::string, int> times_indices; // Dummy map required by the interpolator API
+            std::map<std::string, int> times_indices;
 
-            if (seg.interp == InterpolationMethod::NONE) { // Time range [start:end]
+            if (seg.interp == InterpolationMethod::NONE) {
                 start = seg.has_start_time ? interpolator.getSlicesTimesIndices(seg.start_time, time_values, times_indices, CLOSEST_INTERP) : 0;
                 end = seg.has_end_time ? interpolator.getSlicesTimesIndices(seg.end_time, time_values, times_indices, CLOSEST_INTERP) + 1 : aos_size;
-            } else { // Interpolation point (CLOSEST or LINEAR)
+                if (selection_dims.size() <= segment_idx) {
+                    selection_dims.push_back(end - start);
+                }
+            } else {
                 start = interpolator.getSlicesTimesIndices(seg.start_time, time_values, times_indices, CLOSEST_INTERP);
                 end = start + 1;
+                // L'interpolation produit une seule tranche, la dimension est supprimée (ou de taille 1).
             }
         }
-
-        selection_dims.push_back(end - start);
         
         for (size_t i = start; i < end; ++i) {
             std::string indexed_path = new_path_base + "/" + std::to_string(i);
@@ -139,12 +146,20 @@ void collect_leaf_paths_recursive(
         std::vector<size_t> aos_shape = db.getAOSShape(new_path_base);
         if (!aos_shape.empty() && segment_idx < segments.size() - 1) {
             size_t aos_size = aos_shape[0];
-            selection_dims.push_back(aos_size);
+            // CORRECTION: Ajouter la dimension uniquement si c'est le premier passage à ce niveau
+            if (selection_dims.size() <= segment_idx) {
+                selection_dims.push_back(aos_size);
+            }
             for (size_t i = 0; i < aos_size; ++i) {
                 std::string indexed_path = new_path_base + "/" + std::to_string(i);
                 collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
             }
         } else {
+            // Dans le cas d'une descente sans AOS, on assure la cohérence des indices de dimensions
+            if (selection_dims.size() <= segment_idx) {
+                // On pourrait ajouter un placeholder ici si nécessaire, 
+                // mais pour l'instant on se contente de continuer.
+            }
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
         }
     }
@@ -159,58 +174,44 @@ TensorView read_typed_tensor(
     const std::map<std::string, std::string>& metadata)
 {
     size_t total_elements = std::accumulate(final_dims.begin(), final_dims.end(), 1, std::multiplies<size_t>());
-    if (total_elements == 0) total_elements = leaf_paths.size();
+    if (total_elements == 0 && !leaf_paths.empty()) total_elements = leaf_paths.size();
     
     size_t total_bytes = total_elements * sizeof(T);
-    
     auto final_buffer = std::shared_ptr<char[]>(new char[total_bytes], std::default_delete<char[]>());
     T* final_data_ptr = reinterpret_cast<T*>(final_buffer.get());
 
+    size_t global_offset = 0;
     for (size_t i = 0; i < leaf_paths.size(); ++i) {
         uint64_t ndim = 0;
         uint64_t shape[6] = {0};
-
+        
         if constexpr (std::is_same_v<T, double>) {
             double* temp_data = nullptr;
-            int status = db.pz_readData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
-            if (status == 0 && temp_data != nullptr) {
-                final_data_ptr[i] = temp_data[0];
+            if (db.pz_readData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data) == 0 && temp_data) {
+                size_t count = 1;
+                for(uint64_t d=0; d<ndim; ++d) count *= shape[d];
+                size_t to_copy = std::min(count, total_elements - global_offset);
+                std::copy(temp_data, temp_data + to_copy, final_data_ptr + global_offset);
+                global_offset += to_copy;
                 free(temp_data);
-            } else {
-                final_data_ptr[i] = std::numeric_limits<double>::quiet_NaN();
             }
         } else if constexpr (std::is_same_v<T, int>) {
             int32_t* temp_data = nullptr;
-            int status = db.pz_readIntData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
-            if (status == 0 && temp_data != nullptr) {
-                final_data_ptr[i] = temp_data[0];
+            if (db.pz_readIntData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data) == 0 && temp_data) {
+                size_t count = 1;
+                for(uint64_t d=0; d<ndim; ++d) count *= shape[d];
+                size_t to_copy = std::min(count, total_elements - global_offset);
+                std::copy(temp_data, temp_data + to_copy, final_data_ptr + global_offset);
+                global_offset += to_copy;
                 free(temp_data);
-            } else {
-                final_data_ptr[i] = 0; // Valeur par défaut en cas d'erreur
-            }
-        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
-            std::complex<double>* temp_data = nullptr;
-            int status = db.pz_readComplexData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
-            if (status == 0 && temp_data != nullptr) {
-                final_data_ptr[i] = temp_data[0];
-                free(temp_data);
-            } else {
-                final_data_ptr[i] = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
-            }
-        } else if constexpr (std::is_same_v<T, std::string>) {
-            char* temp_data = nullptr;
-            int status = db.pz_readStringData_by_index(leaf_paths[i].c_str(), -1, &ndim, shape, &temp_data);
-             if (status == 0 && temp_data != nullptr) {
-                final_data_ptr[i] = temp_data;
-                free(temp_data);
-            } else {
-                final_data_ptr[i] = "";
             }
         }
     }
     
     return TensorView(std::move(final_buffer), final_dims, data_type, metadata);
 }
+
+
 
 // Nouvelle fonction dédiée à la lecture des listes de chaînes de caractères
 TensorView read_list_of_strings(
@@ -351,7 +352,82 @@ TensorView read_interpolated_tensor(
     return TensorView(std::move(final_buffer), final_dims, view_inf.type(), view_inf.metadata());
 }
 
-// Le nouveau "chef d'orchestre"
+std::pair<std::vector<NodeInfo>, std::map<std::string, NodeType>>
+list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show_metadata) {
+    PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
+    const auto& leaves = db.getLeaves();
+
+    std::map<std::string, NodeType> aos_schemas;
+    std::map<std::string, const PanzerDB::Leaf*> dataset_schemas;
+
+    // 1. Identification
+    for (const auto& leaf : leaves) {
+        std::string schema = PanzerDB::stripIndices(std::string(leaf.path));
+        if (leaf.flags == 2 || leaf.flags == 3) {
+            aos_schemas[schema] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
+        } else if ((leaf.flags & 0xF) == 0) {
+            if (!show_metadata && schema.find('@') != std::string::npos) continue;
+            if (dataset_schemas.find(schema) == dataset_schemas.end()) dataset_schemas[schema] = &leaf;
+        }
+    }
+
+    std::vector<NodeInfo> result;
+
+    // 2. Build Dataset Info
+    for (const auto& pair : dataset_schemas) {
+        const std::string& schema_path = pair.first;
+        const PanzerDB::Leaf* rep_leaf = pair.second;
+        
+        std::vector<size_t> logical_dims;
+        bool is_dyn = false;
+        
+        std::string instance_prefix;
+        std::stringstream ss(schema_path);
+        std::string segment;
+        std::string current_schema;
+        
+        while(std::getline(ss, segment, '/') && ss.peek() != EOF) {
+            current_schema += (current_schema.empty() ? "" : "/") + segment;
+            if (aos_schemas.count(current_schema)) {
+                // Use getAOSShape on a representative instance path
+                auto shape = db.getAOSShape(instance_prefix + segment);
+                if (!shape.empty()) logical_dims.push_back(shape[0]);
+                if (aos_schemas[current_schema] == NodeType::AOS_DYNAMIC) is_dyn = true;
+                instance_prefix += segment + "/0/";
+            } else {
+                instance_prefix += segment + "/";
+            }
+        }
+        
+        // Root dynamic datasets (like 'time')
+        if (logical_dims.empty()) {
+            size_t total = 0;
+            for(const auto& l : leaves) if (PanzerDB::stripIndices(std::string(l.path)) == schema_path) total += l.count;
+            if (total > 1) { logical_dims.push_back(total); is_dyn = true; }
+        }
+        
+        // Add leaf shape if not scalar (ignores {1} or {})
+        if (!rep_leaf->shape.empty() && !(rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1)) {
+            logical_dims.insert(logical_dims.end(), rep_leaf->shape.begin(), rep_leaf->shape.end());
+        }
+
+        result.push_back({schema_path, NodeType::DATASET, logical_dims, is_dyn});
+    }
+
+    if (show_aos) {
+        for (const auto& p : aos_schemas) result.push_back({p.first, p.second, {}, false});
+    }
+    
+    std::sort(result.begin(), result.end(), [](const NodeInfo& a, const NodeInfo& b) { return a.path < b.path; });
+    
+    if (!recursive) {
+        std::vector<NodeInfo> filtered;
+        for (const auto& n : result) if (n.path.find('/') == std::string::npos) filtered.push_back(n);
+        return {filtered, aos_schemas};
+    }
+    return {result, aos_schemas};
+}
+
 TensorView read_tensor_impl(const std::string& ids_name, const std::vector<PathSegment>& segments)
 {
     PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
