@@ -173,6 +173,53 @@ void validate_linear_interp_read() {
     std::cout << "[OK] Linear interpolation content validated.\n";
 }
 
+void validate_in_memory_slice() {
+    std::cout << "\n--- Validating In-Memory Slicing ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    // 1. Lire un bloc de données multidimensionnel en mémoire
+    const std::string path = "profiles_1d[1:3]/ion/state/z_ion"; // Dims: {2, 3, 2}
+    auto view_orig = imas::direct_access::read_tensor(ids_name, path);
+
+    // 2. Test 1: Extraire la première tranche de temps (indice 0 de la vue)
+    // Cela correspond au temps d'origine t=1
+    auto view_t1 = view_orig.slice({ imas::direct_access::SliceSelection::at(0) });
+    
+    assert(view_t1.dims().size() == 2);
+    assert(view_t1.dims()[0] == 3); // 3 ions
+    assert(view_t1.dims()[1] == 2); // 2 states
+
+    const double* data_t1 = view_t1.as<double>();
+    int t = 1; // Temps d'origine
+    for (int i = 0; i < 3; ++i) {
+        for (int s = 0; s < 2; ++s) {
+            double expected = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
+            double actual = data_t1[i * 2 + s];
+            assert(std::abs(expected - actual) < 1e-9);
+        }
+    }
+    std::cout << "[OK] In-memory slice on first dimension validated.\n";
+
+    // 3. Test 2: Extraire le deuxième ion (indice 1) sur tous les temps
+    // C'est un test important car les données ne sont pas contiguës dans le buffer d'origine
+    auto view_i1 = view_orig.slice({ imas::direct_access::SliceSelection::all(), imas::direct_access::SliceSelection::at(1) });
+
+    assert(view_i1.dims().size() == 2);
+    assert(view_i1.dims()[0] == 2); // 2 tranches de temps
+    assert(view_i1.dims()[1] == 2); // 2 states
+
+    const double* data_i1 = view_i1.as<double>();
+    int i = 1; // Ion d'origine
+    for (int t_slice = 0; t_slice < 2; ++t_slice) {
+        t = 1 + t_slice;
+        for (int s = 0; s < 2; ++s) {
+            double expected = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
+            double actual = data_i1[t_slice * 2 + s];
+            assert(std::abs(expected - actual) < 1e-9);
+        }
+    }
+    std::cout << "[OK] In-memory slice on middle dimension (non-contiguous) validated.\n";
+}
+
 void validate_list_of_strings_read() {
     std::cout << "\n--- Validating List of Strings Read ---\n";
     const std::string ids_name = "test_direct_api_validation";
@@ -223,7 +270,6 @@ void validate_int_read() {
     std::cout << "[OK] INT32 content validated.\n";
 }
 
-
 int main() {
     generate_test_file("test_direct_api_validation.h5");
     
@@ -231,8 +277,9 @@ int main() {
     validate_time_slice_read();
     validate_time_interp_read();
     validate_linear_interp_read();
-    validate_list_of_strings_read(); // Appel du nouveau test
+    validate_list_of_strings_read();
     validate_int_read();
+    validate_in_memory_slice();
 
     std::cout << "\nAll direct_api_validation tests passed!\n";
     return 0;
