@@ -3469,6 +3469,26 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
      // Si la feuille n'est pas trouvée dans l'index, c'est une erreur.
      throw std::runtime_error("Chemin non trouvé dans l'index de PanzerDB : " + path);
  }
- 
- 
- 
+
+ bool PanzerDB::is_dynamic_aos(const std::string& aos_path) const
+{
+    // S'assure que l'index est chargé en mémoire.
+    const auto& leaves = getLeaves();
+
+    // Utilise la table de lookup optimisée pour trouver la feuille correspondant au chemin.
+    auto it = leaf_lookup.find(std::string_view(aos_path));
+    if (it != leaf_lookup.end() && !it->second.empty()) {
+        // Un chemin doit identifier de manière unique un méta-nœud d'AoS,
+        // donc nous prenons la première correspondance.
+        const Leaf& leaf = leaves[it->second[0]];
+
+        // Le flag '3' est utilisé dans l'index de PanzerDB pour marquer
+        // un méta-nœud d'AoS dynamique.
+        if (leaf.flags == 3) {
+            return true;
+        }
+    }
+
+    // Si le chemin n'est pas trouvé ou si ce n'est pas un AoS dynamique.
+    return false;
+}

@@ -561,6 +561,12 @@ public:
      */
     imas::direct_access::DataType get_leaf_type(const std::string& path);
 
+    /**
+     * @brief Checks if a given path corresponds to a dynamic Array of Structures (AoS).
+     * @param aos_path The full path to the AoS meta-node (e.g., "profiles_1d").
+     * @return True if the path points to a dynamic AoS, false otherwise.
+     */
+     bool is_dynamic_aos(const std::string& aos_path) const;
 
     //==========================================================================
     // Read API - Data Retrieval

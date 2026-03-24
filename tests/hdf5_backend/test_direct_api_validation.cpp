@@ -11,26 +11,38 @@ void generate_test_file(const std::string& filename) {
     if (std::filesystem::exists(filename)) std::filesystem::remove(filename);
     PanzerDB db(filename, PanzerDB::OpenMode::WRITE);
 
-    // --- Données numériques pour les tests précédents ---
+    // --- Écrire la propriété homogeneous_time ---
+    int32_t homogeneous_time_val = 0; 
+    db.writeData("ids_properties/homogeneous_time", {}, &homogeneous_time_val, 1);
+
+    // --- Données pour les tests ---
     const int time_steps = 5;
     const int ion_size = 3;
     const int state_size = 2;
-    std::vector<double> time_data(time_steps);
-    std::iota(time_data.begin(), time_data.end(), 1.0);
-    db.writeDataSlices("time", {1}, time_data.data(), time_steps, "time");
+
+    std::vector<double> global_time_data(time_steps);
+    std::iota(global_time_data.begin(), global_time_data.end(), 10.0);
+    db.writeDataSlices("time", {1}, global_time_data.data(), time_steps, "time");
+
     db.beginArray("profiles_1d", "time");
     for (int t = 0; t < time_steps; ++t) {
         db.setCurrentArrayIndex(t);
+        double time_val = static_cast<double>(t + 1);
+        db.writeData("time", {}, &time_val, 1);
+
         db.beginArray("ion", ion_size);
         for (int i = 0; i < ion_size; ++i) {
             db.setCurrentArrayIndex(i);
             db.beginArray("state", state_size);
             for (int s = 0; s < state_size; ++s) {
                 db.setCurrentArrayIndex(s);
+                
+                // Écrire la donnée double
                 double z_ion_val = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
                 db.writeData("z_ion", {}, &z_ion_val, 1);
-                // Ajouter une donnée de type entier pour le test
-                int32_t a_z_val = 6;
+                
+                // CORRECTION : Écrire la donnée entière qui manquait
+                int32_t a_z_val = t * 100 + i * 10 + s; // Valeur unique pour le test
                 db.writeData("a_z", {}, &a_z_val, 1);
             }
             db.endArray(); // state
@@ -218,7 +230,7 @@ int main() {
     validate_index_slice_read();
     validate_time_slice_read();
     validate_time_interp_read();
-    //validate_linear_interp_read();
+    validate_linear_interp_read();
     validate_list_of_strings_read(); // Appel du nouveau test
     validate_int_read();
 
