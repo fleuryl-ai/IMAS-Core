@@ -1,0 +1,3 @@
+python extract_relevant_XML.py IDSDef.xml plasma_profiles.xml plasma_profiles
+python extract_relevant_XML.py IDSDef.xml distributions.xml distributions
+
