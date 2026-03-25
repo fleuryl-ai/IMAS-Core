@@ -43,6 +43,30 @@ void collect_leaf_paths(
     collect_leaf_paths_recursive(db, segments, 0, "", leaf_paths, selection_dims);
 }
 
+// Helper ultra-robuste pour trouver la taille réelle d'un AoS en inspectant les chemins
+size_t get_actual_aos_size(PanzerDB& db, const std::string& aos_path) {
+    size_t max_idx = 0;
+    bool found = false;
+    std::string search_str = aos_path + "/";
+    for (const auto& leaf : db.getLeaves()) {
+        if (leaf.path.compare(0, search_str.length(), search_str) == 0) {
+            std::string remainder = std::string(leaf.path).substr(search_str.length());
+            size_t slash_pos = remainder.find('/');
+            std::string idx_str = (slash_pos != std::string::npos) ? remainder.substr(0, slash_pos) : remainder;
+            if (!idx_str.empty() && std::isdigit(idx_str[0])) {
+                try {
+                    size_t idx = std::stoul(idx_str);
+                    if (idx >= max_idx) { max_idx = idx; found = true; }
+                } catch(...) {}
+            }
+        }
+    }
+    if (found) return max_idx + 1;
+    
+    auto shape = db.getAOSShape(aos_path);
+    return shape.empty() ? 0 : shape[0];
+}
+
 // Helper function to resolve the time vector based on the rules.
 std::vector<double> get_time_vector(PanzerDB& db, const std::string& aos_path, size_t aos_size) {
     int status = 0;
@@ -103,22 +127,19 @@ void collect_leaf_paths_recursive(
         size_t start = 0;
         size_t end = 0;
 
-        std::vector<size_t> aos_shape = db.getAOSShape(new_path_base);
-        if (aos_shape.empty()) {
+        size_t aos_size = get_actual_aos_size(db, new_path_base);
+        if (aos_size == 0 && seg.selection != SelectionType::INDEX) {
             throw std::runtime_error("Could not determine size of AoS for path: " + new_path_base);
         }
-        size_t aos_size = aos_shape[0];
 
         if (seg.selection == SelectionType::INDEX) {
             start = seg.index;
             end = start + 1;
-            // Une sélection par INDEX unique supprime la dimension, on n'ajoute rien à selection_dims.
         } else if (seg.selection == SelectionType::SLICE || seg.selection == SelectionType::ALL) {
             start = seg.has_start ? seg.start_index : 0;
             end = seg.has_end ? seg.end_index : aos_size;
-            // CORRECTION: Ajouter la dimension uniquement si c'est le premier passage à ce niveau
             if (selection_dims.size() <= segment_idx) {
-                selection_dims.push_back(end - start);
+                selection_dims.push_back(end - start); // Ajouter la dim qu'une seule fois
             }
         } else if (seg.selection == SelectionType::TIME) {
             std::vector<double> time_values = get_time_vector(db, new_path_base, aos_size);
@@ -128,13 +149,10 @@ void collect_leaf_paths_recursive(
             if (seg.interp == InterpolationMethod::NONE) {
                 start = seg.has_start_time ? interpolator.getSlicesTimesIndices(seg.start_time, time_values, times_indices, CLOSEST_INTERP) : 0;
                 end = seg.has_end_time ? interpolator.getSlicesTimesIndices(seg.end_time, time_values, times_indices, CLOSEST_INTERP) + 1 : aos_size;
-                if (selection_dims.size() <= segment_idx) {
-                    selection_dims.push_back(end - start);
-                }
+                if (selection_dims.size() <= segment_idx) selection_dims.push_back(end - start);
             } else {
                 start = interpolator.getSlicesTimesIndices(seg.start_time, time_values, times_indices, CLOSEST_INTERP);
                 end = start + 1;
-                // L'interpolation produit une seule tranche, la dimension est supprimée (ou de taille 1).
             }
         }
         
@@ -143,23 +161,16 @@ void collect_leaf_paths_recursive(
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
         }
     } else {
-        std::vector<size_t> aos_shape = db.getAOSShape(new_path_base);
-        if (!aos_shape.empty() && segment_idx < segments.size() - 1) {
-            size_t aos_size = aos_shape[0];
-            // CORRECTION: Ajouter la dimension uniquement si c'est le premier passage à ce niveau
+        size_t aos_size = get_actual_aos_size(db, new_path_base);
+        if (aos_size > 0 && segment_idx < segments.size() - 1) {
             if (selection_dims.size() <= segment_idx) {
-                selection_dims.push_back(aos_size);
+                selection_dims.push_back(aos_size); // Ajouter la dim qu'une seule fois
             }
             for (size_t i = 0; i < aos_size; ++i) {
                 std::string indexed_path = new_path_base + "/" + std::to_string(i);
                 collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
             }
         } else {
-            // Dans le cas d'une descente sans AOS, on assure la cohérence des indices de dimensions
-            if (selection_dims.size() <= segment_idx) {
-                // On pourrait ajouter un placeholder ici si nécessaire, 
-                // mais pour l'instant on se contente de continuer.
-            }
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
         }
     }
@@ -357,75 +368,90 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
     PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
     const auto& leaves = db.getLeaves();
 
-    std::map<std::string, NodeType> aos_schemas;
-    std::map<std::string, const PanzerDB::Leaf*> dataset_schemas;
+    std::map<std::string, NodeType> aos_paths;
+    std::map<std::string, const PanzerDB::Leaf*> schema_to_leaf_map;
 
-    // 1. Identification
     for (const auto& leaf : leaves) {
-        std::string schema = PanzerDB::stripIndices(std::string(leaf.path));
         if (leaf.flags == 2 || leaf.flags == 3) {
-            aos_schemas[schema] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
-        } else if ((leaf.flags & 0xF) == 0) {
-            if (!show_metadata && schema.find('@') != std::string::npos) continue;
-            if (dataset_schemas.find(schema) == dataset_schemas.end()) dataset_schemas[schema] = &leaf;
+            std::string schema_aos = PanzerDB::stripIndices(std::string(leaf.path));
+            aos_paths[schema_aos] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
+        }
+        
+        if ((leaf.flags & 0xF) != 0) continue;
+        std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
+        if (!show_metadata && schema_path.find('@') != std::string::npos) continue;
+
+        if (schema_to_leaf_map.find(schema_path) == schema_to_leaf_map.end()) {
+            schema_to_leaf_map[schema_path] = &leaf;
         }
     }
 
     std::vector<NodeInfo> result;
 
-    // 2. Build Dataset Info
-    for (const auto& pair : dataset_schemas) {
+    for (const auto& pair : schema_to_leaf_map) {
         const std::string& schema_path = pair.first;
         const PanzerDB::Leaf* rep_leaf = pair.second;
         
         std::vector<size_t> logical_dims;
-        bool is_dyn = false;
+        bool is_in_dynamic_aos = false;
         
+        std::string schema_prefix;
         std::string instance_prefix;
         std::stringstream ss(schema_path);
         std::string segment;
-        std::string current_schema;
         
         while(std::getline(ss, segment, '/') && ss.peek() != EOF) {
-            current_schema += (current_schema.empty() ? "" : "/") + segment;
-            if (aos_schemas.count(current_schema)) {
-                // Use getAOSShape on a representative instance path
-                auto shape = db.getAOSShape(instance_prefix + segment);
-                if (!shape.empty()) logical_dims.push_back(shape[0]);
-                if (aos_schemas[current_schema] == NodeType::AOS_DYNAMIC) is_dyn = true;
+            schema_prefix += (schema_prefix.empty() ? "" : "/") + segment;
+            std::string query_path = instance_prefix + segment;
+
+            if (aos_paths.count(schema_prefix)) {
+                if (aos_paths.at(schema_prefix) == NodeType::AOS_DYNAMIC) is_in_dynamic_aos = true;
+                
+                size_t shape = get_actual_aos_size(db, query_path);
+                if (shape > 0) logical_dims.push_back(shape);
+                
                 instance_prefix += segment + "/0/";
             } else {
                 instance_prefix += segment + "/";
             }
         }
         
-        // Root dynamic datasets (like 'time')
-        if (logical_dims.empty()) {
-            size_t total = 0;
-            for(const auto& l : leaves) if (PanzerDB::stripIndices(std::string(l.path)) == schema_path) total += l.count;
-            if (total > 1) { logical_dims.push_back(total); is_dyn = true; }
+        if (logical_dims.empty() && !is_in_dynamic_aos) {
+            size_t total_count = 0;
+            for(const auto& leaf : leaves) {
+                if (PanzerDB::stripIndices(std::string(leaf.path)) == schema_path) total_count += leaf.count;
+            }
+            if (total_count > 1) {
+                logical_dims.push_back(total_count);
+                is_in_dynamic_aos = true;
+            }
         }
         
-        // Add leaf shape if not scalar (ignores {1} or {})
-        if (!rep_leaf->shape.empty() && !(rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1)) {
+        bool is_scalar_leaf = rep_leaf->shape.empty() || (rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1);
+        if (!is_scalar_leaf) {
             logical_dims.insert(logical_dims.end(), rep_leaf->shape.begin(), rep_leaf->shape.end());
         }
 
-        result.push_back({schema_path, NodeType::DATASET, logical_dims, is_dyn});
+        result.push_back({schema_path, NodeType::DATASET, logical_dims, is_in_dynamic_aos});
     }
 
     if (show_aos) {
-        for (const auto& p : aos_schemas) result.push_back({p.first, p.second, {}, false});
+        for (const auto& pair : aos_paths) {
+            result.push_back({pair.first, pair.second, {}, false});
+        }
     }
     
     std::sort(result.begin(), result.end(), [](const NodeInfo& a, const NodeInfo& b) { return a.path < b.path; });
-    
+
     if (!recursive) {
-        std::vector<NodeInfo> filtered;
-        for (const auto& n : result) if (n.path.find('/') == std::string::npos) filtered.push_back(n);
-        return {filtered, aos_schemas};
+        std::vector<NodeInfo> filtered_result;
+        for (const auto& node : result) {
+            if (node.path.find('/') == std::string::npos) filtered_result.push_back(node);
+        }
+        return {filtered_result, aos_paths};
     }
-    return {result, aos_schemas};
+    
+    return {result, aos_paths};
 }
 
 TensorView read_tensor_impl(const std::string& ids_name, const std::vector<PathSegment>& segments)
