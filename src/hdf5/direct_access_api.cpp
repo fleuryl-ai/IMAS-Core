@@ -20,9 +20,6 @@
 namespace imas {
 namespace direct_access {
 
-// Déclaration anticipée pour résoudre l'ambiguïté de nom avec uri_parser.h
-//std::vector<PathSegment> parse_path(const std::string& path);
-
 TensorView read_tensor_impl_core(PanzerDB& db, const std::vector<PathSegment>& segments);
 
 
@@ -222,9 +219,7 @@ TensorView read_typed_tensor(
     return TensorView(std::move(final_buffer), final_dims, data_type, metadata);
 }
 
-
-
-// Nouvelle fonction dédiée à la lecture des listes de chaînes de caractères
+// Fonction dédiée à la lecture des listes de chaînes de caractères
 TensorView read_list_of_strings(
     PanzerDB& db,
     const std::vector<std::string>& leaf_paths,
@@ -308,7 +303,7 @@ TensorView read_interpolated_tensor(
         throw std::runtime_error("Impossible de récupérer le vecteur de temps pour l'interpolation.");
     }
 
-    // 3. CORRECTION: Appeler getSlicesTimesIndices une seule fois et utiliser la map
+    // 3. Appeler getSlicesTimesIndices une seule fois et utiliser la map
     DataInterpolation interpolator;
     std::map<std::string, int> times_indices; // Cette map sera remplie par la fonction
     interpolator.getSlicesTimesIndices(interp_segment->start_time, time_values, times_indices, LINEAR_INTERP);
@@ -371,13 +366,14 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
     std::map<std::string, NodeType> aos_paths;
     std::map<std::string, const PanzerDB::Leaf*> schema_to_leaf_map;
 
+    // 1. Collecter les schémas et identifier les AOS de manière fiable
     for (const auto& leaf : leaves) {
         if (leaf.flags == 2 || leaf.flags == 3) {
             std::string schema_aos = PanzerDB::stripIndices(std::string(leaf.path));
             aos_paths[schema_aos] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
         }
         
-        if ((leaf.flags & 0xF) != 0) continue;
+        if ((leaf.flags & 0xF) != 0) continue; // Uniquement les données
         std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
         if (!show_metadata && schema_path.find('@') != std::string::npos) continue;
 
@@ -388,53 +384,64 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
 
     std::vector<NodeInfo> result;
 
+    // 2. Construire le NodeInfo pour les datasets
     for (const auto& pair : schema_to_leaf_map) {
         const std::string& schema_path = pair.first;
         const PanzerDB::Leaf* rep_leaf = pair.second;
         
         std::vector<size_t> logical_dims;
         bool is_in_dynamic_aos = false;
+        bool is_metadata = (schema_path.find('@') != std::string::npos);
         
-        std::string schema_prefix;
-        std::string instance_prefix;
-        std::stringstream ss(schema_path);
-        std::string segment;
-        
-        while(std::getline(ss, segment, '/') && ss.peek() != EOF) {
-            schema_prefix += (schema_prefix.empty() ? "" : "/") + segment;
-            std::string query_path = instance_prefix + segment;
+        // Les métadonnées sont toujours scalaires globales, on ne remonte pas les AOS pour elles
+        if (!is_metadata) {
+            std::string schema_prefix;
+            std::string instance_prefix;
+            std::stringstream ss(schema_path);
+            std::string segment;
+            
+            while(std::getline(ss, segment, '/') && ss.peek() != EOF) {
+                schema_prefix += (schema_prefix.empty() ? "" : "/") + segment;
+                std::string query_path = instance_prefix + segment;
 
-            if (aos_paths.count(schema_prefix)) {
-                if (aos_paths.at(schema_prefix) == NodeType::AOS_DYNAMIC) is_in_dynamic_aos = true;
-                
-                size_t shape = get_actual_aos_size(db, query_path);
-                if (shape > 0) logical_dims.push_back(shape);
-                
-                instance_prefix += segment + "/0/";
-            } else {
-                instance_prefix += segment + "/";
+                if (aos_paths.count(schema_prefix)) {
+                    if (aos_paths.at(schema_prefix) == NodeType::AOS_DYNAMIC) {
+                        is_in_dynamic_aos = true;
+                    }
+                    size_t aos_size = get_actual_aos_size(db, query_path);
+                    if (aos_size > 0) logical_dims.push_back(aos_size);
+                    
+                    instance_prefix += segment + "/0/";
+                } else {
+                    instance_prefix += segment + "/";
+                }
             }
-        }
-        
-        if (logical_dims.empty() && !is_in_dynamic_aos) {
-            size_t total_count = 0;
-            for(const auto& leaf : leaves) {
-                if (PanzerDB::stripIndices(std::string(leaf.path)) == schema_path) total_count += leaf.count;
+            
+            // Cas du signal dynamique autonome (ex: "time" global)
+            if (logical_dims.empty() && !is_in_dynamic_aos) {
+                size_t total_count = 0;
+                for(const auto& leaf : leaves) {
+                    if ((leaf.flags & 0xF) == 0 && PanzerDB::stripIndices(std::string(leaf.path)) == schema_path) {
+                        total_count += leaf.count;
+                    }
+                }
+                if (total_count > 1) {
+                    logical_dims.push_back(total_count);
+                    is_in_dynamic_aos = true; // Force l'affichage du /Inf
+                }
             }
-            if (total_count > 1) {
-                logical_dims.push_back(total_count);
-                is_in_dynamic_aos = true;
+            
+            // Ajouter la forme intrinsèque si ce n'est pas un scalaire
+            bool is_scalar_leaf = rep_leaf->shape.empty() || (rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1);
+            if (!is_scalar_leaf) {
+                logical_dims.insert(logical_dims.end(), rep_leaf->shape.begin(), rep_leaf->shape.end());
             }
-        }
-        
-        bool is_scalar_leaf = rep_leaf->shape.empty() || (rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1);
-        if (!is_scalar_leaf) {
-            logical_dims.insert(logical_dims.end(), rep_leaf->shape.begin(), rep_leaf->shape.end());
         }
 
         result.push_back({schema_path, NodeType::DATASET, logical_dims, is_in_dynamic_aos});
     }
 
+    // 3. Ajouter les AOS si demandé
     if (show_aos) {
         for (const auto& pair : aos_paths) {
             result.push_back({pair.first, pair.second, {}, false});
@@ -453,6 +460,7 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
     
     return {result, aos_paths};
 }
+
 
 TensorView read_tensor_impl(const std::string& ids_name, const std::vector<PathSegment>& segments)
 {
