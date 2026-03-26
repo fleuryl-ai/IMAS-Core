@@ -5,15 +5,14 @@
 #include <hdf5.h>
 #include "hdf5_writer.h"
 
-
 #include <memory>
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <string>
 
 #include "panzerdb.h"
-
-
+#include "metadata/metadata_extractor.h"
 
 class HDF5Writer_v2 : public HDF5Writer {
 
@@ -21,19 +20,17 @@ private:
    std::unique_ptr<PanzerDB> panzer_db_ptr;
    ArraystructContext *getDynamicAOS(Context *ctx);
    std::unordered_set<ArraystructContext*> initialized_aos;
-
-   //std::map<std::string, std::string> metadata_map;
+   std::map<std::string, std::string> metadata_map;
 
 public:
   HDF5Writer_v2(std::pair<int,int> backend_version_);
   ~HDF5Writer_v2();
 
-
   static bool compression_enabled;
   static size_t read_chunk_cache_size;
   static size_t write_chunk_cache_size;
 
-  void setWriteStrategy(int write_mode, hid_t loc_id) override;
+  void setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id) override;
 
   void write_ND_Data(Context *ctx, const std::string &att_name,
                      const std::string &timebasename, int datatype, int dim,

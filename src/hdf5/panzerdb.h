@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include "metadata/metadata_extractor.h"
 
 // Ajout pour la nouvelle méthode get_leaf_type
 #include "direct_access_api.h"
@@ -266,6 +267,7 @@ private:
     mutable std::vector<std::string> scratch_str;
 
     std::unordered_set<std::string> written_metadata_schema_paths;
+    std::map<std::string, std::string> metadata_map;
 
     mutable bool time_index_valid = false;
     

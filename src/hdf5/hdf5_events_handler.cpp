@@ -21,7 +21,7 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 	strategy_set = false;
 	if (ctx->getAccessmode() == WRITE_OP && ctx->getRangemode() == GLOBAL_OP) {
 		writer.create_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path, access_mode, &loc_id);
-		writer.setWriteStrategy(GLOBAL_OP, loc_id);
+		writer.setWriteStrategy(ctx, GLOBAL_OP, loc_id);
 		strategy_set = true;
 	} else if (ctx->getAccessmode() == WRITE_OP && ctx->getRangemode() == SLICE_OP) {
 		std::string IDS_link_name = ctx->getDataobjectName();
@@ -31,7 +31,7 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 		bool call_put_required = false;
 		if (hdf5_utils.pulseFileExists(IDS_pulse_file)) {
 			writer.open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path, &loc_id);
-			writer.setWriteStrategy(SLICE_OP, loc_id);
+			writer.setWriteStrategy(ctx, SLICE_OP, loc_id);
 			strategy_set = true;
 			if (loc_id == -1) {
 				call_put_required = true;
@@ -50,13 +50,13 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 			//hid_t loc_id = -1;
 			writer.create_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path, access_mode, &loc_id);	
 			if (!strategy_set) {
-				writer.setWriteStrategy(GLOBAL_OP, loc_id);
+				writer.setWriteStrategy(ctx, GLOBAL_OP, loc_id);
 				strategy_set = true;
 			}
 		}
 		else {
 			if (!strategy_set) {
-				writer.setWriteStrategy(SLICE_OP, loc_id);
+				writer.setWriteStrategy(ctx, SLICE_OP, loc_id);
 				strategy_set = true;
 			}
 		}

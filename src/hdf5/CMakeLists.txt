@@ -137,3 +137,4 @@ al_add_hdf5_test(test_direct_api_validation)
 
 # Ajouter les outils HDF5
 add_subdirectory(tools)
+add_subdirectory(metadata )

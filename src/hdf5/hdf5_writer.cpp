@@ -42,7 +42,7 @@ bool HDF5Writer::useBuffering = true;
 size_t HDF5Writer::read_chunk_cache_size = READ_CHUNK_CACHE_SIZE;
 size_t HDF5Writer::write_chunk_cache_size = WRITE_CHUNK_CACHE_SIZE;
 
-void HDF5Writer::setWriteStrategy(int write_mode, hid_t loc_id) {
+void HDF5Writer::setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id) {
    slice_mode = write_mode;
 }
 

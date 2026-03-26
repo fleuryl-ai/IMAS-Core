@@ -49,7 +49,7 @@ class HDF5Writer {
     virtual void beginWriteArraystructAction(ArraystructContext * ctx, int *size);
     virtual void endAction(Context * ctx);
 
-    virtual void setWriteStrategy(int write_mode, hid_t loc_id);
+    virtual void setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id);
 	  void setSliceMode(int slice_mode);
     void write_buffers();
     void read_homogeneous_time(int* homogenenous_time, hid_t gid);

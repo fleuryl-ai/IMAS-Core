@@ -59,15 +59,17 @@ void HDF5Writer_v2::read_homogeneous_time(int *homogenenous_time, hid_t gid) {
    panzer_db.close();
 }
 
-void HDF5Writer_v2::setWriteStrategy(int write_mode, hid_t loc_id) {
+void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id) {
   DEBUG_PRINT("Setting write strategy to PanzerDB (mode: " << write_mode << ")");
   
-  // ✅ Always recreate (the old instance will be automatically destroyed)
   if (write_mode == GLOBAL_OP) {
     panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::WRITE, true, false);
-    /*bool index_exists = H5Lexists(loc_id, "index", H5P_DEFAULT) > 0;
-    auto mode = index_exists ? PanzerDB::OpenMode::APPEND : PanzerDB::OpenMode::WRITE;
-    panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, mode, true, false);*/
+    const char* imas_prefix = std::getenv("IMAS_PREFIX");
+    if (imas_prefix) {
+        std::string xml_path = std::string(imas_prefix) + "/include/IDSDef.xml";
+        MetadataExtractor extractor(xml_path);
+        metadata_map = extractor.extract_metadata(ctx->getDataobjectName());
+    }
   } else if (write_mode == SLICE_OP) {
       DEBUG_PRINT("Write mode is SLICE_OP");
       panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::APPEND, true, false);
@@ -270,6 +272,33 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
     int *v = (int *)data;
     homogeneous_time = v[0];
   }
+
+  // --- START: NEW METADATA HANDLING LOGIC ---
+
+  // Only write metadata for actual data nodes, not for other metadata attributes.
+  if (!is_metadata) {
+    // Convert the instance path (e.g., "flux_loop/0/field") to a schema path ("flux_loop/field").
+    // The schema path is used to find all associated metadata attributes.
+    std::string schema_path = PanzerDB::stripIndices(dataset_name_copy);
+
+    // Search the full metadata map for attributes related to this specific schema path.
+    for (const auto& meta_entry : metadata_map) {
+        const std::string& full_meta_path = meta_entry.first;  // e.g., "flux_loop/field@units"
+        const std::string& meta_value = meta_entry.second;     // e.g., "T"
+
+        size_t at_pos = full_meta_path.find('@');
+        if (at_pos != std::string::npos) {
+            // Extract the base path from the metadata key.
+            std::string meta_base_path = full_meta_path.substr(0, at_pos);
+
+            // If the metadata's base path matches the current data's schema path, write it.
+            if (meta_base_path == schema_path) {
+                panzer_db_ptr->writeMetaData(full_meta_path, meta_value);
+            }
+        }
+    }
+  }
+// --- END: NEW METADATA HANDLING LOGIC ---
   
   DEBUG_PRINT("\n**************************************************************"
               "******************");

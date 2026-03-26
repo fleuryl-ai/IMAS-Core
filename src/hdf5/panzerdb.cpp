@@ -3289,62 +3289,28 @@ std::string PanzerDB::stripIndices(const std::string& path) {
     return result;
 }
 
-/*void PanzerDB::writeMetadata(const std::string& path, const std::map<std::string, std::string>& metadata_map) {
-    // The 'path' argument is the leaf name, e.g., "t_e"
-    const std::string& name = path;
+void PanzerDB::writeMetaData(const std::string& path, const std::string& value) {
+    // path is the full metadata key, e.g., "flux_loop/field@units"
+    // value is the metadata value, e.g., "T"
 
-    // 1. Construct the schema path.
-    // The internal `path_prefix` is the current AoS path, e.g., "profiles_1d/0/ion/1".
-    // We strip the numeric indices to get the schema prefix.
-    std::string schema_path_prefix = stripIndices(path_prefix);
-    std::string schema_path = schema_path_prefix;
-    if (!schema_path.empty()) schema_path += "/";
-    schema_path += name;
-    
-    // 2. Check if we have already written metadata for this schema path.
-    if ( written_metadata_schema_paths.count(schema_path)) {
-        return; // Already written, do nothing.
+    // Use the set to avoid writing the same metadata attribute more than once.
+    // This is critical for efficiency and for APPEND mode.
+    if (written_metadata_schema_paths.count(path)) {
+        return; // Already written for this schema, do nothing.
     }
 
-    // 3. Write metadata and record it.
-    for (auto const& [key, value] : metadata_map) {
-        // The metadata path itself is a schema path.
-        std::string metadata_path = schema_path + "@" + key;
-        const char* valueStr = value.c_str();
-        // writeData for a static scalar string.
-        this->writeData(metadata_path.c_str(), {}, &valueStr, 1);
-    }
+    // Treat the metadata entry as a single, static string.
+    const char* value_cstr = value.c_str();
 
-    written_metadata_schema_paths.insert(schema_path);
+    // Write the string using the specialized writeData template.
+    // The 'path' itself serves as the unique dataset name for the metadata.
+    // Shape is empty for a scalar, count is 1, and timebase is empty for static data.
+    this->writeData<const char*>(path, {}, &value_cstr, 1, "");
 
-}*/
-
-void PanzerDB::writeMetaData(const std::string& path, const std::string& value) { 
-    // The 'path' argument is the leaf name, e.g., "t_e"
-    const std::string& name = path;
-    std::string schema_path = stripIndices(path);
-
-    // 1. Trouver la position du caractère '@'
-    size_t pos = path.find('@');
-
-    // 2. Vérifier si le caractère a été trouvé
-    if (pos != std::string::npos) {
-        // On récupère tout ce qui suit la position (pos + 1)
-        //std::string value = path.substr(pos + 1);
-        const char* valueStr = value.c_str();
-        this->writeData(schema_path.c_str(), {}, &valueStr, 1);
-        //std::cout << "Valeur extraite : " << value << std::endl;
-    } else {
-        //std::cerr << "Erreur : Séparateur '@' non trouvé !" << std::endl;
-        throw ALLowlevelException("writeMetadata: Invalid path format, missing '@' separator", LOG);
-    }
-    
-    // 2. Check if we have already written metadata for this schema path.
-    if ( written_metadata_schema_paths.count(schema_path)) {
-        return; // Already written, do nothing.
-    }
-    written_metadata_schema_paths.insert(schema_path);
+    // Mark this metadata path as written to prevent duplicates.
+    written_metadata_schema_paths.insert(path);
 }
+
 
 std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& instance_path) {
     std::map<std::string, std::string> metadata;
