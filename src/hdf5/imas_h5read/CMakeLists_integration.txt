@@ -1,0 +1,48 @@
+# --- Snippet pour l'intégration de imas_h5read dans CMake ---
+
+# =============================================================================
+# 1. PARTIE C++ (Socle commun)
+# =============================================================================
+# target_sources(al PRIVATE 
+#    imas_h5read/imas_h5read.cpp
+#    imas_h5read/imas_h5read_c.cpp  # Nécessaire pour Fortran
+# )
+
+# =============================================================================
+# 2. PARTIE MATLAB (Interface MEX)
+# =============================================================================
+find_package(Matlab)
+if(Matlab_FOUND)
+    message(STATUS "MATLAB trouvé: construction de l'interface MEX imas_h5read")
+    matlab_add_mex(
+        NAME imas_h5read_mex
+        SRC  imas_h5read/imas_h5read_mex.cpp imas_h5read/imas_h5read.cpp
+        LINK_LIBRARIES al
+    )
+    set_target_properties(imas_h5read_mex PROPERTIES OUTPUT_NAME imas_h5read_mex)
+endif()
+
+# =============================================================================
+# 3. PARTIE FORTRAN (Interface native)
+# =============================================================================
+# Vérifier si Fortran est activé dans le projet principal
+get_property(languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+if("Fortran" IN_LIST languages)
+    message(STATUS "Fortran activé: construction du module imas_h5read_mod")
+
+    # Création de la bibliothèque du module Fortran
+    add_library(imas_h5read_fortran imas_h5read/imas_h5read_mod.f90)
+    target_link_libraries(imas_h5read_fortran PUBLIC al)
+    
+    # Définir où les fichiers .mod seront générés
+    set_target_properties(imas_h5read_fortran PROPERTIES 
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fortran_modules
+    )
+    target_include_directories(imas_h5read_fortran INTERFACE 
+        ${CMAKE_CURRENT_BINARY_DIR}/fortran_modules
+    )
+
+    # Optionnel: Ajouter l'exemple de test Fortran
+    add_executable(test_imas_h5read_fortran imas_h5read/test_imas_h5read_fortran.f90)
+    target_link_libraries(test_imas_h5read_fortran PRIVATE imas_h5read_fortran)
+endif()
