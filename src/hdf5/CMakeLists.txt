@@ -34,6 +34,7 @@ target_sources( al PRIVATE
     direct_access_api.cpp
     path_parser.cpp
     direct_reader.cpp
+    imas_h5read/imas_h5read.cpp
 )
 # target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_WRITER_V2 )
 target_compile_definitions( al PRIVATE -DHDF5 )
@@ -133,6 +134,7 @@ endmacro()
 al_add_hdf5_test(test_path_parser)
 # Test d'intégration et de validation de l'API
 al_add_hdf5_test(test_direct_api_validation)
+al_add_hdf5_test(test_imas_h5read)
 
 # Ajouter les outils HDF5
 add_subdirectory(tools)
