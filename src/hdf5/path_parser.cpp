@@ -14,7 +14,8 @@ const std::vector<PathSegment>& PathParser::segments() const {
 }
 
 void PathParser::parse() {
-    std::regex segment_regex("([\\w-]+)(?:\\[(.*?)\\])?");
+    // Add '&' and '@' to the list of allowed characters. 
+    std::regex segment_regex("([\\w&@-]*)(?:\\[(.*?)\\])?");
     
     // Regex pour les différentes parties de la sélection
     std::regex time_regex("time=([\\d\\.]+)?:?([\\d\\.]+)?");

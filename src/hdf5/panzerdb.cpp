@@ -105,6 +105,43 @@ PanzerDB::PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty, bool close_
 void PanzerDB::init(OpenMode mode) {
     this->mode = mode; // Ensure member mode is set
 
+    // --- DEBUT DU PATCH: AUTO-DETECTION DU GROUPE RACINE ---
+    if (mode == OpenMode::READ || mode == OpenMode::APPEND) {
+        bool is_at_root = H5Lexists(file_id, "index", H5P_DEFAULT) > 0;
+        if (!is_at_root) {
+            H5G_info_t group_info;
+            if (H5Gget_info(file_id, &group_info) >= 0) {
+                for (hsize_t i = 0; i < group_info.nlinks; ++i) {
+                    char name[256];
+                    H5Lget_name_by_idx(file_id, ".", H5_INDEX_NAME, H5_ITER_INC, i, name, sizeof(name), H5P_DEFAULT);
+
+                    // Tente d'ouvrir le lien comme un groupe, en supprimant temporairement les erreurs HDF5
+                    H5E_auto2_t old_func;
+                    void *old_client_data;
+                    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_client_data);
+                    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+                    hid_t group_id = H5Gopen2(file_id, name, H5P_DEFAULT);
+                    H5Eset_auto2(H5E_DEFAULT, old_func, old_client_data);
+
+                    if (group_id >= 0) {
+                        if (H5Lexists(group_id, "index", H5P_DEFAULT) > 0) {
+                            // On a trouvé le bon groupe !
+                            if (should_close_loc_id) {
+                                if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
+                                else H5Gclose(file_id);
+                            }
+                            file_id = group_id; // On utilise maintenant ce groupe comme racine
+                            should_close_loc_id = true; // On s'assure que ce nouveau handle sera fermé
+                            break; 
+                        }
+                        H5Gclose(group_id);
+                    }
+                }
+            }
+        }
+    }
+    // --- FIN DU PATCH ---
+
     std::string usage_hint = "time_series";  // Défaut
     if (mode == OpenMode::READ) {
         usage_hint = "interactive";  // Mode lecture privilégie accès rapide
@@ -234,7 +271,6 @@ void PanzerDB::init(OpenMode mode) {
         // NOUVEAU: Configurer le cache HDF5 pour lectures optimales
         configureReadCache();
 
-        //dumpLeavesCache();
     }
 
     H5Pclose(dapl);

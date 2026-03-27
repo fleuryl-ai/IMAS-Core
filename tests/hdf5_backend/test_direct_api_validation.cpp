@@ -30,6 +30,9 @@ void generate_test_file(const std::string& filename) {
         double time_val = static_cast<double>(t + 1);
         db.writeData("time", {}, &time_val, 1);
 
+        double a_val = 10*t;
+        db.writeDataSlices("sig_dyn", {}, &a_val, 1, "time");
+
         db.beginArray("ion", ion_size);
         for (int i = 0; i < ion_size; ++i) {
             db.setCurrentArrayIndex(i);
@@ -287,6 +290,34 @@ void validate_metadata_read() {
     std::cout << "[OK] Metadata content validated.\n";
 }
 
+void validate_dynamic_parent_read() {
+    std::cout << "\n--- Validating Read from Dynamic Parent (sig_dyn) ---\n";
+    const std::string ids_name = "test_direct_api_validation";
+    
+    // Test 1: Lecture d'un slice temporel (t=2, index temporel 2)
+    const std::string path_slice = "profiles_1d[2]/sig_dyn";
+    auto view_slice = imas::direct_access::read_tensor(ids_name, path_slice);
+    
+    assert(view_slice.type() == imas::direct_access::DataType::DOUBLE);
+    assert(view_slice.dims().size() == 1); // C'est un scalaire par slice, donc 1 valeur
+    assert(view_slice.dims()[0] == 1);
+    assert(std::abs(view_slice.as<double>()[0] - 20.0) < 1e-9);
+
+    // Test 2: Lecture de tous les temps (-1)
+    const std::string path_all = "profiles_1d/sig_dyn";
+    auto view_all = imas::direct_access::read_tensor(ids_name, path_all);
+    
+    assert(view_all.type() == imas::direct_access::DataType::DOUBLE);
+    assert(view_all.dims().size() == 1);
+    assert(view_all.dims()[0] == 5); // 5 pas de temps
+    
+    const double* data_all = view_all.as<double>();
+    for (int t = 0; t < 5; ++t) {
+        assert(std::abs(data_all[t] - (10.0 * t)) < 1e-9);
+    }
+    
+    std::cout << "[OK] Read from Dynamic Parent validated.\n";
+}
 
 int main() {
     generate_test_file("test_direct_api_validation.h5");
@@ -299,6 +330,7 @@ int main() {
     validate_int_read();
     validate_in_memory_slice();
     validate_metadata_read();
+    validate_dynamic_parent_read(); // Appel du nouveau test
 
     std::cout << "\nAll direct_api_validation tests passed!\n";
     return 0;

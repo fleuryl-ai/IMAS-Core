@@ -75,7 +75,7 @@ std::vector<double> get_time_vector(PanzerDB& db, const std::string& aos_path, s
         // Fallback if 'ids_properties/homogeneous_time' does not exist
         homogeneous_time = 1;
     }
-    db.dumpLeavesCache();
+
     if (db.is_dynamic_aos(aos_path)) {
         // Rule: For a dynamic AoS, the time of each slice is at <aos_path>/<i>/time,
         // regardless of the homogeneous_time flag.
@@ -120,6 +120,19 @@ void collect_leaf_paths_recursive(
     const auto& seg = segments[segment_idx];
     std::string new_path_base = current_path.empty() ? seg.node_name : current_path + "/" + seg.node_name;
 
+    // --- LOGIQUE DE PATCH CIBLÉE ---
+    // Cette fonction est appelée récursivement. À chaque étape, 'new_path_base' est le chemin du "parent".
+    // On vérifie s'il est un AoS dynamique.
+    bool is_parent_dyn_aos = db.is_dynamic_aos(new_path_base);
+
+    // On vérifie si son "enfant" (le segment suivant dans le chemin) est le dernier segment (c'est donc un champ).
+    bool is_child_a_field = (segment_idx + 1 == segments.size() - 1);
+
+    // La condition pour NE PAS ajouter d'indice est : si le parent est dynamique ET que l'enfant est un champ.
+    bool should_skip_indexing = (is_parent_dyn_aos && is_child_a_field);
+    
+    // --- FIN DE LA LOGIQUE DE PATCH ---
+
     if (seg.selection != SelectionType::NONE) {
         size_t start = 0;
         size_t end = 0;
@@ -136,7 +149,7 @@ void collect_leaf_paths_recursive(
             start = seg.has_start ? seg.start_index : 0;
             end = seg.has_end ? seg.end_index : aos_size;
             if (selection_dims.size() <= segment_idx) {
-                selection_dims.push_back(end - start); // Ajouter la dim qu'une seule fois
+                selection_dims.push_back(end - start);
             }
         } else if (seg.selection == SelectionType::TIME) {
             std::vector<double> time_values = get_time_vector(db, new_path_base, aos_size);
@@ -153,19 +166,31 @@ void collect_leaf_paths_recursive(
             }
         }
         
-        for (size_t i = start; i < end; ++i) {
-            std::string indexed_path = new_path_base + "/" + std::to_string(i);
-            collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
-        }
-    } else {
-        size_t aos_size = get_actual_aos_size(db, new_path_base);
-        if (aos_size > 0 && segment_idx < segments.size() - 1) {
-            if (selection_dims.size() <= segment_idx) {
-                selection_dims.push_back(aos_size); // Ajouter la dim qu'une seule fois
-            }
-            for (size_t i = 0; i < aos_size; ++i) {
+        // Appliquer la règle : si on ne doit pas indexer (cas sig_dyn), on continue sans ajouter /i.
+        if (should_skip_indexing) {
+             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
+        } else {
+             for (size_t i = start; i < end; ++i) {
                 std::string indexed_path = new_path_base + "/" + std::to_string(i);
                 collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
+            }
+        }
+
+    } else { // Pas de sélection sur ce segment
+        size_t aos_size = get_actual_aos_size(db, new_path_base);
+        if (aos_size > 0 && segment_idx < segments.size() - 1) {
+            
+            // Appliquer la règle ici aussi
+            if (should_skip_indexing) {
+                collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
+            } else {
+                if (selection_dims.size() <= segment_idx) {
+                    selection_dims.push_back(aos_size);
+                }
+                for (size_t i = 0; i < aos_size; ++i) {
+                    std::string indexed_path = new_path_base + "/" + std::to_string(i);
+                    collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, leaf_paths, selection_dims);
+                }
             }
         } else {
             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_path_base, leaf_paths, selection_dims);
@@ -336,10 +361,17 @@ TensorView read_interpolated_tensor(
     segments_sup[interp_segment_idx].interp = InterpolationMethod::NONE;
     TensorView view_sup = read_tensor_impl_core(db, segments_sup);
 
-    // 5. Effectuer l'interpolation avec les vraies valeurs de temps
+    // 5. Effectuer l'interpolation
+    // Créer des copies manuelles pour éviter le double free
+    void* data_inf_copy = malloc(view_inf.size_in_bytes());
+    if (data_inf_copy) memcpy(data_inf_copy, view_inf.data(), view_inf.size_in_bytes());
+
+    void* data_sup_copy = malloc(view_sup.size_in_bytes());
+    if (data_sup_copy) memcpy(data_sup_copy, view_sup.data(), view_sup.size_in_bytes());
+    
     std::map<std::string, void*> y_slices;
-    y_slices["slice_inf"] = view_inf.data();
-    y_slices["slice_sup"] = view_sup.data();
+    y_slices["slice_inf"] = data_inf_copy;
+    y_slices["slice_sup"] = data_sup_copy;
 
     std::map<std::string, double> slices_times;
     slices_times["slice_inf"] = time_values[slice_inf];
@@ -347,16 +379,17 @@ TensorView read_interpolated_tensor(
     
     void* interpolated_data = nullptr;
     size_t total_elements = view_inf.total_elements();
-    int data_type_code = (view_inf.type() == DataType::DOUBLE) ? DOUBLE_DATA : -1;
+    int data_type_code = (view_inf.type() == DataType::DOUBLE) ? alconst::double_data : -1;
     
     interpolator.interpolate(data_type_code, total_elements, y_slices, slices_times, interp_segment->start_time, &interpolated_data, LINEAR_INTERP);
 
-    // 6. Créer le TensorView final
-    auto final_buffer = std::shared_ptr<char[]>(reinterpret_cast<char*>(interpolated_data), [](char* p){ free(p); });
+    // 6. Créer le TensorView final avec un deleter personnalisé
+    auto final_buffer = std::shared_ptr<char[]>(reinterpret_cast<char*>(interpolated_data), [](char* p){ if(p) free(p); });
     std::vector<size_t> final_dims = view_inf.dims();
     
     return TensorView(std::move(final_buffer), final_dims, view_inf.type(), view_inf.metadata());
 }
+
 
 std::pair<std::vector<NodeInfo>, std::map<std::string, NodeType>>
 list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show_metadata) {
