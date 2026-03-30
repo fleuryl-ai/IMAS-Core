@@ -119,7 +119,8 @@ public:
     }
 
     size_t total_elements() const {
-        if (dimensions_.empty()) return 0;
+        if (!buffer_) return 0; // Empty tensor
+        if (dimensions_.empty()) return 1; // Scalar has 1 element
         size_t total = 1;
         for (size_t dim : dimensions_) total *= dim;
         return total;

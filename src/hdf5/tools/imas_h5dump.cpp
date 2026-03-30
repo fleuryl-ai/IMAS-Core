@@ -2,144 +2,243 @@
 #include <vector>
 #include <string>
 #include <iomanip>
-#include <libgen.h> // Pour dirname() et basename()
-#include <unistd.h> // Pour chdir() et getcwd()
-#include <limits.h> // Pour PATH_MAX
-#include <string.h> // Pour strdup()
+#include <map>
+#include <sstream>
+#include <complex>
+#include <numeric>
 #include "direct_access_api.h"
 
-// Helper pour l'indentation
-void print_indent(int level) {
-    for (int i = 0; i < level; ++i) std::cout << "  ";
-}
+// Déclarations
+void print_usage();
+void parse_arguments(int argc, char* argv[], std::string& filename, std::vector<std::string>& paths);
+void dump_node(const std::string& ids_name, const imas::direct_access::NodeInfo& node);
 
-// Fonction pour afficher récursivement les données numériques
 template<typename T>
-void print_data_recursive(const T* data, const std::vector<size_t>& dims, size_t dim_idx, size_t& offset, int indent_level) {
-    if (dims.empty()) { // Cas scalaire
-        std::cout << data[0];
-        return;
-    }
-    if (dim_idx >= dims.size()) return;
-
-    if (dim_idx == dims.size() - 1) {
-        // Dernière dimension: on affiche les valeurs
-        std::cout << "{ ";
-        for (size_t i = 0; i < dims[dim_idx]; ++i) {
-            std::cout << data[offset++];
-            if (i < dims[dim_idx] - 1) std::cout << ", ";
-        }
-        std::cout << " }";
-    } else {
-        // Dimensions imbriquées
-        std::cout << "{" << std::endl;
-        for (size_t i = 0; i < dims[dim_idx]; ++i) {
-            print_indent(indent_level + 1);
-            print_data_recursive(data, dims, dim_idx + 1, offset, indent_level + 1);
-            if (i < dims[dim_idx] - 1) std::cout << ",";
-            std::cout << std::endl;
-        }
-        print_indent(indent_level);
-        std::cout << "}";
-    }
-}
+void print_data(const imas::direct_access::TensorView& tensor, size_t max_elements_to_print = 20);
+void print_string_data(const imas::direct_access::TensorView& tensor, size_t max_elements_to_print = 20);
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <hdf5_file> [path_to_dump]" << std::endl;
-        return 1;
-    }
+    std::string filename;
+    std::vector<std::string> paths;
 
-    std::string full_path = argv[1];
-    std::string path_to_dump = (argc > 2) ? argv[2] : "/";
+    parse_arguments(argc, argv, filename, paths);
 
-    char original_cwd[PATH_MAX];
-    if (getcwd(original_cwd, sizeof(original_cwd)) == NULL) {
-        std::cerr << "Error: Cannot get current working directory." << std::endl;
+    if (filename.empty()) {
+        print_usage();
         return 1;
     }
 
     try {
-        char* path_copy1 = strdup(full_path.c_str());
-        char* path_copy2 = strdup(full_path.c_str());
-        char* dir = dirname(path_copy1);
-        char* base = basename(path_copy2);
-
-        if (chdir(dir) != 0) {
-            std::cerr << "Error: Cannot change directory to " << dir << std::endl;
-            free(path_copy1);
-            free(path_copy2);
-            return 1;
-        }
-
-        std::string filename_only = base;
-        free(path_copy1);
-        free(path_copy2);
+        bool recursive = paths.empty(); // List all nodes if no specific path is given
+        auto result = imas::direct_access::list_nodes(filename, recursive, false, false);
         
-        std::string ids_name = filename_only;
-        std::string extension = ".h5";
-        if (ids_name.size() > extension.size() && 
-            ids_name.substr(ids_name.size() - extension.size()) == extension) 
-        {
-            ids_name = ids_name.substr(0, ids_name.size() - extension.size());
-        }
-
-        auto result = imas::direct_access::list_nodes(ids_name, true, true, false);
-        auto nodes = result.first;
-
-        for (const auto& node_info : nodes) {
-            if (path_to_dump != "/" && node_info.path.rfind(path_to_dump, 0) != 0) {
-                continue;
-            }
-
-            if (node_info.type == imas::direct_access::NodeType::DATASET) {
-                imas::direct_access::TensorView tensor = imas::direct_access::read_tensor(ids_name, node_info.path);
-
-                std::cout << "DATASET \"" << node_info.path << "\"";
-                if (!tensor.dims().empty()) {
-                    std::cout << " {";
-                    for (size_t i = 0; i < tensor.dims().size(); ++i) {
-                        std::cout << tensor.dims()[i] << (i < tensor.dims().size() - 1 ? ", " : "");
-                    }
-                    std::cout << "}";
-                } else {
-                     std::cout << " {SCALAR}";
-                }
-                std::cout << std::endl;
-                print_indent(1);
-                std::cout << "Data: ";
-
-                if (tensor.type() == imas::direct_access::DataType::STRING || tensor.type() == imas::direct_access::DataType::LIST_OF_STRINGS) {
-                     std::cout << std::endl;
-                    if (!tensor.dims().empty() && tensor.dims().size() == 2) {
-                        const char* data_ptr = tensor.as<char>();
-                        size_t num_strings = tensor.dims()[0];
-                        size_t string_len = tensor.dims()[1];
-                        for (size_t i = 0; i < num_strings; ++i) {
-                            print_indent(2);
-                            std::cout << "(" << i << "): \"" << (data_ptr + i * string_len) << "\"" << std::endl;
-                        }
-                    }
-                } else {
-                    size_t offset = 0;
-                    if (tensor.type() == imas::direct_access::DataType::DOUBLE) {
-                        print_data_recursive(tensor.as<double>(), tensor.dims(), 0, offset, 2);
-                    } else if (tensor.type() == imas::direct_access::DataType::INT32) {
-                        print_data_recursive(tensor.as<int32_t>(), tensor.dims(), 0, offset, 2);
-                    } else {
-                        std::cout << "(unsupported type for dumping)";
-                    }
-                    std::cout << std::endl;
+        if (paths.empty()) { // Dump all nodes
+            for (const auto& node : result.first) {
+                if (node.type == imas::direct_access::NodeType::DATASET) {
+                    dump_node(filename, node);
                 }
             }
+        } else { // Dump only specified nodes
+             for (const auto& path : paths) {
+                 // Create a dummy NodeInfo to pass to dump_node
+                 imas::direct_access::NodeInfo node_to_dump;
+                 node_to_dump.path = path;
+                 node_to_dump.type = imas::direct_access::NodeType::DATASET; // Assume it's a dataset
+                 dump_node(filename, node_to_dump);
+             }
         }
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        if (chdir(original_cwd) != 0) { /* handle error */ }
         return 1;
     }
-
-    if (chdir(original_cwd) != 0) { /* handle error */ }
     return 0;
+}
+
+void parse_arguments(int argc, char* argv[], std::string& filename, std::vector<std::string>& paths) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (!arg.empty() && arg[0] != '-') {
+            if (filename.empty()) {
+                filename = arg;
+                if (filename.size() > 3 && filename.substr(filename.size() - 3) == ".h5") {
+                    filename = filename.substr(0, filename.size() - 3);
+                }
+            } else {
+                paths.push_back(arg);
+            }
+        }
+    }
+}
+
+void print_usage() {
+    std::cerr << "Usage: imas_h5dump <file> [path1] [path2] ..." << std::endl;
+    std::cerr << "  <file>: The IMAS HDF5 file (without .h5 extension)." << std::endl;
+    std::cerr << "  [path...]: Optional. Specific paths to dump. If not provided, all datasets are dumped." << std::endl;
+}
+
+void dump_node(const std::string& ids_name, const imas::direct_access::NodeInfo& node) {
+    try {
+        std::cout << "HDF5 \"" << ids_name << ".h5\" {" << std::endl;
+        std::cout << "DATASET \"" << node.path << "\" {" << std::endl;
+
+        auto tensor = imas::direct_access::read_tensor(ids_name, node.path);
+        
+        // Print shape
+        std::cout << "   DATASPACE  ";
+        if (tensor.dims().empty()) {
+            std::cout << "SCALAR" << std::endl;
+        } else {
+            std::cout << "SIMPLE { ( ";
+            for (size_t i = 0; i < tensor.dims().size(); ++i) {
+                std::cout << tensor.dims()[i] << (i < tensor.dims().size() - 1 ? ", " : " )");
+            }
+            std::cout << " }" << std::endl;
+        }
+
+        // Print data
+        std::cout << "   DATA {" << std::endl;
+        std::cout << "      ";
+        
+        switch (tensor.type()) {
+            case imas::direct_access::DataType::DOUBLE:
+                print_data<double>(tensor);
+                break;
+            case imas::direct_access::DataType::INT32:
+                print_data<int>(tensor);
+                break;
+            case imas::direct_access::DataType::COMPLEX_DOUBLE:
+                print_data<std::complex<double>>(tensor);
+                break;
+            case imas::direct_access::DataType::STRING:
+            case imas::direct_access::DataType::LIST_OF_STRINGS:
+                 print_string_data(tensor);
+                 break;
+            default:
+                std::cout << "      (Unsupported data type)" << std::endl;
+        }
+
+        std::cout << "   }" << std::endl; // End DATA
+        std::cout << "}" << std::endl;     // End DATASET
+        std::cout << "}" << std::endl;     // End FILE
+        std::cout << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "   Error processing node " << node.path << ": " << e.what() << std::endl;
+        std::cout << "}" << std::endl;
+        std::cout << "}" << std::endl;
+        std::cout << std::endl;
+    }
+}
+
+template<typename T>
+void print_data_recursive(const T* data, const std::vector<size_t>& dims, size_t dim_index, size_t& offset, std::string indent, size_t& printed_count, size_t max_count) {
+    if (printed_count >= max_count) return;
+    
+    std::cout << indent;
+    if (dim_index == dims.size() - 1) { // Innermost dimension
+        std::cout << "{ ";
+        for (size_t i = 0; i < dims[dim_index]; ++i) {
+            if (printed_count >= max_count) { std::cout << "..."; break; }
+            if constexpr (std::is_same_v<T, std::complex<double>>) {
+                std::cout << "(" << data[offset].real() << "," << data[offset].imag() << ")";
+            } else {
+                std::cout << data[offset];
+            }
+            offset++;
+            printed_count++;
+            if (i < dims[dim_index] - 1) std::cout << ", ";
+        }
+        std::cout << " }";
+    } else { // Outer dimensions
+        std::cout << "{" << std::endl;
+        for (size_t i = 0; i < dims[dim_index]; ++i) {
+            if (printed_count >= max_count) { std::cout << indent << "   ..." << std::endl; break; }
+            print_data_recursive(data, dims, dim_index + 1, offset, indent + "   ", printed_count, max_count);
+            if (i < dims[dim_index] - 1) std::cout << ",";
+            std::cout << std::endl;
+        }
+        std::cout << indent << "}";
+    }
+}
+
+template<typename T>
+void print_data(const imas::direct_access::TensorView& tensor, size_t max_elements_to_print) {
+    if (!tensor.data()) {
+        std::cout << "No data" << std::endl;
+        return;
+    }
+
+    const T* data_ptr = reinterpret_cast<const T*>(tensor.data());
+    const auto& dims = tensor.dims();
+    size_t num_elements = tensor.total_elements();
+
+    if (num_elements == 0) {
+        return; // Print nothing if no elements
+    }
+
+    if (dims.empty()) { // Scalar
+        if constexpr (std::is_same_v<T, std::complex<double>>) {
+            std::cout << "(" << data_ptr[0].real() << "," << data_ptr[0].imag() << ")";
+        } else {
+            std::cout << data_ptr[0];
+        }
+        std::cout << std::endl;
+        return;
+    }
+
+    if (dims.size() > 1) {
+        size_t offset = 0;
+        size_t printed_count = 0;
+        // The "      " is already printed by dump_node, so start with empty indent
+        print_data_recursive<T>(data_ptr, dims, 0, offset, "", printed_count, max_elements_to_print);
+        if (printed_count < num_elements) {
+            std::cout << std::endl << "      ...";
+        }
+        std::cout << std::endl;
+    } else { // 1D array
+        size_t count = std::min(num_elements, max_elements_to_print);
+        for (size_t i = 0; i < count; ++i) {
+            if constexpr (std::is_same_v<T, std::complex<double>>) {
+                std::cout << "(" << data_ptr[i].real() << "," << data_ptr[i].imag() << ")";
+            } else {
+                std::cout << data_ptr[i];
+            }
+            if (i < count - 1) std::cout << ", ";
+        }
+        if (num_elements > count) {
+            std::cout << ", ...";
+        }
+        std::cout << std::endl;
+    }
+}
+
+void print_string_data(const imas::direct_access::TensorView& tensor, size_t max_elements_to_print) {
+     if (!tensor.data()) {
+        std::cout << "No data" << std::endl;
+        return;
+    }
+
+    if (tensor.dims().size() < 2) {
+         std::cout << "(Invalid string format)" << std::endl;
+         return;
+    }
+    
+    size_t num_strings = tensor.dims()[0];
+    size_t string_len = tensor.dims()[1];
+    const char* data_ptr = reinterpret_cast<const char*>(tensor.data());
+    
+    size_t count = std::min(num_strings, max_elements_to_print);
+
+    for (size_t i = 0; i < count; ++i) {
+        std::string str(data_ptr + i * string_len, string_len);
+        // Trim trailing nulls for cleaner output
+        str.erase(str.find_last_not_of('\0') + 1);
+        std::cout << "\"" << str << "\"" << (i < count - 1 ? ", " : "");
+    }
+
+    if (num_strings > max_elements_to_print) {
+        std::cout << ", ...";
+    }
+    std::cout << std::endl;
 }

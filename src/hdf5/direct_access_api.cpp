@@ -200,28 +200,25 @@ void collect_leaf_paths_recursive(
     std::string new_real_path = current_real_path.empty() ? seg.node_name : current_real_path + "/" + seg.node_name;
 
     bool is_aos = aos_paths.count(new_schema_path) > 0;
-    bool is_dyn_aos = is_aos && aos_paths.at(new_schema_path) == NodeType::AOS_DYNAMIC;
-    
-    // --- LA REGLE D'OR CORRIGEE ---
-    bool should_add_index = false;
-    if (is_aos) {
-        if (is_dyn_aos) {
-            // C'est un AoS dynamique. On n'ajoute l'index que si le segment SUIVANT n'est PAS un champ final.
-            if (segment_idx + 1 < segments.size()) {
-                bool is_next_segment_last = (segment_idx + 1 == segments.size() - 1);
-                if (!is_next_segment_last) {
-                    should_add_index = true; // Le prochain segment est un sous-AoS, donc il faut un index
-                }
-            }
-        } else {
-            should_add_index = true; // C'est un AoS statique, on ajoute toujours l'index
-        }
+    if (!is_aos) {
+        collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
+        return;
     }
+
+    bool is_dyn_aos = (aos_paths.at(new_schema_path) == NodeType::AOS_DYNAMIC);
+
+    // Règle : l'index est passé via le paramètre `time_index` SEULEMENT si l'AoS est dynamique
+    // ET que le segment suivant est la feuille de données finale. Sinon, l'index est intégré au chemin.
+    bool pass_index_as_time_param = is_dyn_aos && (segment_idx + 1 == segments.size() - 1);
 
     size_t aos_size = aos_sizes.count(new_schema_path) ? aos_sizes.at(new_schema_path) : 0;
 
+    // Déterminer les bornes de la boucle
+    size_t start = 0, end = 0;
+    bool loop = false;
+
     if (seg.selection != SelectionType::NONE) {
-        size_t start = 0, end = 0;
+        loop = true;
         if (seg.selection == SelectionType::INDEX) {
             start = seg.index; end = start + 1;
         } else if (seg.selection == SelectionType::SLICE || seg.selection == SelectionType::ALL) {
@@ -236,39 +233,29 @@ void collect_leaf_paths_recursive(
             end = seg.has_end_time ? interpolator.getSlicesTimesIndices(seg.end_time, time_values, times_indices, CLOSEST_INTERP) + 1 : aos_size;
             if (selection_dims.size() <= segment_idx) selection_dims.push_back(end - start);
         }
+    } else if (segment_idx < segments.size() - 1) { // Pas de sélection, mais ce n'est pas la fin du chemin
+        loop = true;
+        start = 0; end = aos_size;
+        if (selection_dims.size() <= segment_idx) selection_dims.push_back(aos_size);
+    }
 
-        if (should_add_index) {
-            for (size_t i = start; i < end; ++i) {
-                std::string indexed_path = new_real_path + "/" + std::to_string(i);
-                collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
-            }
-        } else if (is_dyn_aos) {
-            if (seg.selection == SelectionType::ALL || (start == 0 && end == aos_size)) {
-                collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, -1, leaf_paths, selection_dims, aos_paths, aos_sizes);
+    if (loop) {
+        for (size_t i = start; i < end; ++i) {
+            std::string next_real_path = new_real_path;
+            int64_t next_time_index = current_time_index;
+
+            if (pass_index_as_time_param) {
+                next_time_index = i;
             } else {
-                for (size_t i = start; i < end; ++i) {
-                    collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, i, leaf_paths, selection_dims, aos_paths, aos_sizes);
-                }
+                next_real_path += "/" + std::to_string(i);
             }
-        } else {
-             collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
+            collect_leaf_paths_recursive(db, segments, segment_idx + 1, next_real_path, new_schema_path, next_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
         }
-    } else { // Pas de sélection demandée
-        if (aos_size > 0 && segment_idx < segments.size() - 1) {
-            if (should_add_index) {
-                if (selection_dims.size() <= segment_idx) selection_dims.push_back(aos_size);
-                for (size_t i = 0; i < aos_size; ++i) {
-                    std::string indexed_path = new_real_path + "/" + std::to_string(i);
-                    collect_leaf_paths_recursive(db, segments, segment_idx + 1, indexed_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
-                }
-            } else if (is_dyn_aos) {
-                collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, -1, leaf_paths, selection_dims, aos_paths, aos_sizes);
-            }
-        } else {
-            collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
-        }
+    } else { // C'est la fin du chemin, et ce n'est pas un AoS, on ne boucle pas.
+        collect_leaf_paths_recursive(db, segments, segment_idx + 1, new_real_path, new_schema_path, current_time_index, leaf_paths, selection_dims, aos_paths, aos_sizes);
     }
 }
+
 
 template <typename T>
 TensorView read_typed_tensor(
@@ -297,12 +284,8 @@ TensorView read_typed_tensor(
 
         if (status == 0 && temp_data) {
             std::vector<size_t> actual_dims = selection_dims;
-            
-            if (leaf_paths[0].second == -1 && ndim > 0 && db.is_dynamic_aos(PanzerDB::stripIndices(leaf_paths[0].first))) {
-                actual_dims.push_back(shape[ndim - 1]); // Temps au début
-                for (uint64_t d = 0; d < ndim - 1; ++d) actual_dims.push_back(shape[d]); // Reste
-            } else {
-                for (uint64_t d = 0; d < ndim; ++d) actual_dims.push_back(shape[d]);
+            for (uint64_t d = 0; d < ndim; ++d) {
+                actual_dims.push_back(shape[d]);
             }
 
             auto final_buffer = std::shared_ptr<char[]>(reinterpret_cast<char*>(temp_data), [](char* p){ if(p) free(p); });
@@ -324,11 +307,8 @@ TensorView read_typed_tensor(
         if (db.pz_readIntData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &leaf_ndim, leaf_shape, &temp) == 0) if(temp) free(temp);
     }
     
-    if (leaf_paths[0].second == -1 && leaf_ndim > 0 && db.is_dynamic_aos(PanzerDB::stripIndices(leaf_paths[0].first))) {
-        final_dims.push_back(leaf_shape[leaf_ndim - 1]);
-        for (uint64_t d = 0; d < leaf_ndim - 1; ++d) final_dims.push_back(leaf_shape[d]);
-    } else {
-        for (uint64_t d = 0; d < leaf_ndim; ++d) final_dims.push_back(leaf_shape[d]);
+    for (uint64_t d = 0; d < leaf_ndim; ++d) {
+        final_dims.push_back(leaf_shape[d]);
     }
     
     size_t total_elements = std::accumulate(final_dims.begin(), final_dims.end(), 1, std::multiplies<size_t>());
@@ -433,7 +413,7 @@ TensorView read_tensor_impl_core(PanzerDB& db, const std::vector<PathSegment>& s
     collect_leaf_paths_recursive(db, segments, 0, "", "", -1, leaf_paths, selection_dims, aos_paths, aos_sizes);
 
     if (leaf_paths.empty()) {
-        return TensorView();
+        throw std::runtime_error("Path resolution led to an empty set of leaves. Check path and indices.");
     }
 
     auto metadata = db.readMetadata(leaf_paths[0].first);
@@ -465,13 +445,34 @@ TensorView read_tensor(const std::string& ids_name, const std::string& path)
     PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
     
     std::map<std::string, size_t> aos_sizes;
+    
+    // Scan all leaves to robustly determine the true sizes of all AOS by looking at the actual paths
     for (const auto& leaf : db.getLeaves()) {
+        std::string rp = std::string(leaf.path);
+        
+        // 1. Robust parsing of actual paths to find the real max index
+        std::string current_schema;
+        std::stringstream ss(rp);
+        std::string segment;
+        while(std::getline(ss, segment, '/')) {
+            if (!segment.empty() && std::all_of(segment.begin(), segment.end(), ::isdigit)) {
+                size_t idx = std::stoull(segment);
+                aos_sizes[current_schema] = std::max(aos_sizes[current_schema], idx + 1);
+            } else {
+                current_schema += (current_schema.empty() ? "" : "/") + segment;
+            }
+        }
+        
+        // 2. Fallback: standard PanzerDB metadata (useful if a static AOS has no data but a defined shape)
         if (leaf.flags == 2 || leaf.flags == 3) {
-            std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
-            if (leaf.flags == 2 && !leaf.shape.empty()) aos_sizes[schema_path] = leaf.shape[0];
-            else if (leaf.flags == 3) {
-                auto s = db.getAOSShape(std::string(leaf.path));
-                aos_sizes[schema_path] = s.empty() ? 0 : s.front();
+            std::string schema_path = PanzerDB::stripIndices(rp);
+            if (leaf.flags == 2 && !leaf.shape.empty()) {
+                aos_sizes[schema_path] = std::max(aos_sizes[schema_path], (size_t)leaf.shape[0]);
+            } else if (leaf.flags == 3) {
+                auto s = db.getAOSShape(rp);
+                if (!s.empty()) {
+                    aos_sizes[schema_path] = std::max(aos_sizes[schema_path], (size_t)s.front());
+                }
             }
         }
     }
