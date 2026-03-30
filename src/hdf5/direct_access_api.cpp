@@ -61,11 +61,12 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
 
     std::map<std::string, NodeType> aos_paths;
     std::map<std::string, size_t> aos_sizes;
+    std::map<std::string, size_t> path_occurrence_count;
     std::map<std::string, const PanzerDB::Leaf*> schema_to_leaf_map;
 
     for (const auto& leaf : leaves) {
+        std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
         if (leaf.flags == 2 || leaf.flags == 3) {
-            std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
             aos_paths[schema_path] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
             
             if (leaf.flags == 2 && !leaf.shape.empty()) {
@@ -74,14 +75,13 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
                 auto s = db.getAOSShape(std::string(leaf.path));
                 aos_sizes[schema_path] = s.empty() ? 0 : s.front();
             }
-        }
-        
-        if ((leaf.flags & 0xF) != 0) continue; 
-        std::string schema_path = PanzerDB::stripIndices(std::string(leaf.path));
-        if (!show_metadata && schema_path.find('@') != std::string::npos) continue;
-
-        if (schema_to_leaf_map.find(schema_path) == schema_to_leaf_map.end()) {
-            schema_to_leaf_map[schema_path] = &leaf;
+        } else if ((leaf.flags & 0xF) == 0) {
+            path_occurrence_count[schema_path]++;
+            if (show_metadata || schema_path.find('@') == std::string::npos) {
+                if (schema_to_leaf_map.find(schema_path) == schema_to_leaf_map.end()) {
+                    schema_to_leaf_map[schema_path] = &leaf;
+                }
+            }
         }
     }
 
@@ -91,27 +91,65 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
         const PanzerDB::Leaf* rep_leaf = pair.second;
         
         std::vector<size_t> logical_dims;
-        bool is_in_dynamic_aos = false;
+        std::vector<size_t> static_parents;
+        bool has_dynamic_parent = false;
+        size_t static_prod = 1;
         
         std::string prefix;
         std::stringstream ss(schema_path);
         std::string segment;
         
         while(std::getline(ss, segment, '/')) {
-             if (ss.peek() == EOF && schema_path.find('/') != std::string::npos) break;
+             if (ss.peek() == EOF) break;
              prefix += (prefix.empty() ? "" : "/") + segment;
              if (aos_paths.count(prefix)) {
-                 if (aos_paths.at(prefix) == NodeType::AOS_DYNAMIC) is_in_dynamic_aos = true;
-                 if (aos_sizes.count(prefix) && aos_sizes[prefix] > 0) logical_dims.push_back(aos_sizes[prefix]);
+                 if (aos_paths.at(prefix) == NodeType::AOS_DYNAMIC) {
+                     has_dynamic_parent = true;
+                 } else if (aos_paths.at(prefix) == NodeType::AOS_STATIC) {
+                     if (aos_sizes.count(prefix) && aos_sizes[prefix] > 0) {
+                         static_parents.push_back(aos_sizes[prefix]);
+                         static_prod *= aos_sizes[prefix];
+                     }
+                 }
              }
         }
         
-        if (logical_dims.empty() && !is_in_dynamic_aos && rep_leaf->count > 1) {
-            logical_dims.push_back(rep_leaf->count);
+        size_t occurrence = path_occurrence_count[schema_path];
+        bool is_in_dynamic_aos = false;
+
+        // Determine if the signal has a time dimension
+        size_t time_dim = (static_prod > 0) ? (occurrence / static_prod) : occurrence;
+
+        if (time_dim > 1 || has_dynamic_parent) {
+            logical_dims.push_back(time_dim > 0 ? time_dim : 1);
+            is_in_dynamic_aos = true; 
         }
+
+        // Add structural dimensions from static AoS parents
+        logical_dims.insert(logical_dims.end(), static_parents.begin(), static_parents.end());
         
-        if (!rep_leaf->shape.empty() && !(rep_leaf->shape.size() == 1 && rep_leaf->shape[0] <= 1)) {
-            logical_dims.insert(logical_dims.end(), rep_leaf->shape.begin(), rep_leaf->shape.end());
+        if (!rep_leaf->shape.empty()) {
+            size_t skip = 0;
+            // Physical shape in PanzerDB for static AoS includes dimensions of static parents.
+            for (size_t sp_dim : static_parents) {
+                if (skip < rep_leaf->shape.size() && rep_leaf->shape[skip] == sp_dim) {
+                    skip++;
+                } else {
+                    break;
+                }
+            }
+            
+            if (rep_leaf->shape.size() > skip) {
+                if (!(rep_leaf->shape.size() - skip == 1 && rep_leaf->shape[skip] <= 1 && !logical_dims.empty())) {
+                    logical_dims.insert(logical_dims.end(), 
+                                        rep_leaf->shape.begin() + skip, 
+                                        rep_leaf->shape.end());
+                }
+            }
+        } else if (rep_leaf->count > 1) {
+            // For 1D signals stored via count, simply append the count.
+            // Since we properly isolated static_prod, we don't need to divide here.
+            logical_dims.push_back(rep_leaf->count);
         }
 
         result.push_back({schema_path, NodeType::DATASET, logical_dims, is_in_dynamic_aos});
