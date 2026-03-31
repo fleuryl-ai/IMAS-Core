@@ -61,9 +61,6 @@ void parse_arguments(int argc, char* argv[], std::string& filename, std::vector<
         if (!arg.empty() && arg[0] != '-') {
             if (filename.empty()) {
                 filename = arg;
-                if (filename.size() > 3 && filename.substr(filename.size() - 3) == ".h5") {
-                    filename = filename.substr(0, filename.size() - 3);
-                }
             } else {
                 paths.push_back(arg);
             }
@@ -73,13 +70,13 @@ void parse_arguments(int argc, char* argv[], std::string& filename, std::vector<
 
 void print_usage() {
     std::cerr << "Usage: imas_h5dump <file> [path1] [path2] ..." << std::endl;
-    std::cerr << "  <file>: The IMAS HDF5 file (without .h5 extension)." << std::endl;
+    std::cerr << "  <file>: The IMAS HDF5 file (with .h5 extension)." << std::endl;
     std::cerr << "  [path...]: Optional. Specific paths to dump. If not provided, all datasets are dumped." << std::endl;
 }
 
 void dump_node(const std::string& ids_name, const imas::direct_access::NodeInfo& node) {
     try {
-        std::cout << "HDF5 \"" << ids_name << ".h5\" {" << std::endl;
+        std::cout << "HDF5 \"" << ids_name << "\" {" << std::endl;
         std::cout << "DATASET \"" << node.path << "\" {" << std::endl;
 
         auto tensor = imas::direct_access::read_tensor(ids_name, node.path);

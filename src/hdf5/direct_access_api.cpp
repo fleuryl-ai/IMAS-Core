@@ -56,7 +56,7 @@ std::vector<double> get_time_vector(PanzerDB& db, const std::string& aos_path, s
 
 std::pair<std::vector<NodeInfo>, std::map<std::string, NodeType>>
 list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show_metadata) {
-    PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
+    PanzerDB db(ids_name, PanzerDB::OpenMode::READ);
     const auto& leaves = db.getLeaves();
 
     std::map<std::string, NodeType> aos_paths;
@@ -442,7 +442,7 @@ TensorView read_tensor(const std::string& ids_name, const std::string& path)
     auto list_result = list_nodes(ids_name, true, true, false);
     const auto& aos_paths = list_result.second;
     
-    PanzerDB db(ids_name + ".h5", PanzerDB::OpenMode::READ);
+    PanzerDB db(ids_name, PanzerDB::OpenMode::READ);
     
     std::map<std::string, size_t> aos_sizes;
     

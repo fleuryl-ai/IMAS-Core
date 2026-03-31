@@ -14,8 +14,8 @@ using imas::direct_access::DataType;
 using imas::direct_access::TensorView;
 
 // The filename base, .h5 will be added by the underlying API
-const std::string FILENAME_BASE = "test_imas_h5read";
-const std::string FILENAME_WITH_EXT = FILENAME_BASE + ".h5";
+const std::string FILENAME_WITHOUT_EXT = "core_profiles";
+const std::string FILENAME_WITH_EXT = FILENAME_WITHOUT_EXT + ".h5";
 
 void generate_test_file() {
     if (std::filesystem::exists(FILENAME_WITH_EXT)) {
@@ -50,7 +50,7 @@ void generate_test_file() {
 
 void test_read_scalar_int() {
     std::cout << "--- Testing ReadScalarInt..." << std::endl;
-    TensorView tv = imas_h5read::read(FILENAME_BASE, "test/scalar_int");
+    TensorView tv = imas_h5read::read(FILENAME_WITH_EXT, "core_profiles/test/scalar_int");
     assert(tv.type() == DataType::INT32);
     assert(*tv.as<int>() == 42);
     std::cout << "--- PASSED" << std::endl;
@@ -58,7 +58,7 @@ void test_read_scalar_int() {
 
 void test_read_vector_double() {
     std::cout << "--- Testing ReadVectorDouble..." << std::endl;
-    TensorView tv = imas_h5read::read(FILENAME_BASE, "test/vector_double");
+    TensorView tv = imas_h5read::read(FILENAME_WITH_EXT, "core_profiles/test/vector_double");
     // Flexible dimension check (IMAS might add a dim 1 at the start)
     const auto& d = tv.dims();
     if (d.size() == 2) assert(d[0] == 1 && d[1] == 4);
@@ -68,7 +68,7 @@ void test_read_vector_double() {
 
 void test_read_multidim_slice() {
     std::cout << "--- Testing ReadMultidimSlice..." << std::endl;
-    TensorView tv = imas_h5read::read(FILENAME_BASE, "test/array_3d", {0, 0, 0}, {2, 2, 2});
+    TensorView tv = imas_h5read::read(FILENAME_WITH_EXT, "core_profiles/test/array_3d", {0, 0, 0}, {2, 2, 2});
     const auto& d = tv.dims();
     // Allow for a leading dimension of 1 if rank > 3
     if (d.size() == 4) assert(d[0] == 1 && d[1] == 2 && d[2] == 2 && d[3] == 2);
@@ -80,7 +80,7 @@ void test_read_stride() {
     std::cout << "--- Testing ReadStride..." << std::endl;
     using imas_h5read::INF;
 
-    TensorView tv = imas_h5read::read(FILENAME_BASE, "test/array_3d", {0, 0, 0}, {INF, INF, INF}, {1, 2, 2});
+    TensorView tv = imas_h5read::read(FILENAME_WITH_EXT, "core_profiles/test/array_3d", {0, 0, 0}, {INF, INF, INF}, {1, 2, 2});
 
     const auto& d = tv.dims();
     std::cout << "  Actual dims: "; for(auto dim : d) std::cout << dim << " "; std::cout << std::endl;

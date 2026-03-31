@@ -42,9 +42,6 @@ void parse_arguments(int argc, char* argv[], std::string& filename, bool& recurs
         else if (arg == "--show-metadata") show_metadata = true;
         else if (!arg.empty() && arg[0] != '-') {
             filename = arg;
-            if (filename.size() > 3 && filename.substr(filename.size() - 3) == ".h5") {
-                filename = filename.substr(0, filename.size() - 3);
-            }
         }
     }
 }

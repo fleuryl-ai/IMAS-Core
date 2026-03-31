@@ -8,7 +8,7 @@ void test_temporal_slice_read_fails_gracefully() {
     
     try {
         imas::direct_access::TensorView view = imas::direct_access::read_tensor(
-            "test_api", "pf_active/channel[3]/time_of_flight[:]");
+            "test_api.h5", "pf_active/channel[3]/time_of_flight[:]");
         
         assert(false && "API call should have failed because test_api.h5 does not exist.");
 

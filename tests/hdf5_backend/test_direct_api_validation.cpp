@@ -72,7 +72,7 @@ void validate_index_slice_read() {
     const std::string ids_name = "test_direct_api_validation";
     const std::string path = "profiles_1d[1:3]/ion/state/z_ion";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     assert(view.dims().size() == 3);
     assert(view.dims()[0] == 2);
@@ -98,7 +98,7 @@ void validate_time_slice_read() {
     const std::string ids_name = "test_direct_api_validation";
     const std::string path = "profiles_1d[time=1.5:3.5]/ion/state/z_ion";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     assert(view.dims().size() == 3);
     assert(view.dims()[0] == 2);
@@ -124,7 +124,7 @@ void validate_time_interp_read() {
     const std::string ids_name = "test_direct_api_validation";
     const std::string path = "profiles_1d[time=2.7]/ion/state/z_ion";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     assert(view.dims().size() == 3);
     assert(view.dims()[0] == 1);
@@ -150,7 +150,7 @@ void validate_linear_interp_read() {
     // On demande le point de temps 2.5, qui est à mi-chemin entre 2.0 (index 1) et 3.0 (index 2).
     const std::string path = "profiles_1d[time=2.5,interp=linear]/ion/state/z_ion";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     // Les dimensions doivent correspondre à une seule tranche de temps interpolée
     assert(view.dims().size() == 2);
@@ -181,7 +181,7 @@ void validate_in_memory_slice() {
     const std::string ids_name = "test_direct_api_validation";
     // 1. Lire un bloc de données multidimensionnel en mémoire
     const std::string path = "profiles_1d[1:3]/ion/state/z_ion"; // Dims: {2, 3, 2}
-    auto view_orig = imas::direct_access::read_tensor(ids_name, path);
+    auto view_orig = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     // 2. Test 1: Extraire la première tranche de temps (indice 0 de la vue)
     // Cela correspond au temps d'origine t=1
@@ -228,7 +228,7 @@ void validate_list_of_strings_read() {
     const std::string ids_name = "test_direct_api_validation";
     const std::string path = "diagnostics/name";
 
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     const std::vector<std::string> expected_strings = {"bolometer", "interferometer", "thomson_scattering", "ece"};
     size_t max_len = 0;
@@ -258,7 +258,7 @@ void validate_int_read() {
     // Lire la donnée entière pour le temps t=1, ion i=0, state s=0
     const std::string path = "profiles_1d[1]/ion[0]/state[0]/a_z";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     // Vérifier le type et les dimensions
     assert(view.type() == imas::direct_access::DataType::INT32);
@@ -279,7 +279,7 @@ void validate_metadata_read() {
     // On lit n'importe quelle instance de z_ion, les métadonnées sont les mêmes pour toutes.
     const std::string path = "profiles_1d[0]/ion[0]/state[0]/z_ion";
     
-    auto view = imas::direct_access::read_tensor(ids_name, path);
+    auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
     // Récupérer et valider les métadonnées
     const auto& metadata = view.metadata();
@@ -296,7 +296,7 @@ void validate_dynamic_parent_read() {
     
     // Test 1: Lecture d'un slice temporel (t=2, index temporel 2)
     const std::string path_slice = "profiles_1d[2]/sig_dyn";
-    auto view_slice = imas::direct_access::read_tensor(ids_name, path_slice);
+    auto view_slice = imas::direct_access::read_tensor(ids_name + ".h5", path_slice);
     
     assert(view_slice.type() == imas::direct_access::DataType::DOUBLE);
     assert(view_slice.dims().size() == 1); // C'est un scalaire par slice, donc 1 valeur
@@ -305,7 +305,7 @@ void validate_dynamic_parent_read() {
 
     // Test 2: Lecture de tous les temps (-1)
     const std::string path_all = "profiles_1d/sig_dyn";
-    auto view_all = imas::direct_access::read_tensor(ids_name, path_all);
+    auto view_all = imas::direct_access::read_tensor(ids_name + ".h5", path_all);
     
     assert(view_all.type() == imas::direct_access::DataType::DOUBLE);
     assert(view_all.dims().size() == 1);

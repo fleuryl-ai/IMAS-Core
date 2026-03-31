@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <filesystem>
+#include <hdf5.h>
+
+namespace fs = std::filesystem;
 
 namespace imas_h5read {
 
@@ -36,9 +40,131 @@ static void copy_with_stride_recursive(
     }
 }
 
+// Helper structures for HDF5 external link resolution
+struct LinkSearchData {
+    std::string target_suffix;
+    std::string found_file_name;
+};
+
+static herr_t find_elink_callback(hid_t loc_id, const char* name, const H5L_info_t* linfo, void* opdata) {
+    if (linfo->type == H5L_TYPE_EXTERNAL) {
+        LinkSearchData* data = static_cast<LinkSearchData*>(opdata);
+        
+        char* buf = new char[linfo->u.val_size];
+        if (H5Lget_val(loc_id, name, buf, linfo->u.val_size, H5P_DEFAULT) >= 0) {
+            unsigned flags = 0;
+            const char* file_name = nullptr;
+            const char* obj_name = nullptr;
+            if (H5Lunpack_elink_val(buf, linfo->u.val_size, &flags, &file_name, &obj_name) >= 0) {
+                if (obj_name != nullptr) {
+                    std::string obj_str(obj_name);
+                    // Check if obj_str ends with target_suffix
+                    if (obj_str.length() >= data->target_suffix.length()) {
+                        if (obj_str.compare(obj_str.length() - data->target_suffix.length(), data->target_suffix.length(), data->target_suffix) == 0) {
+                            if (file_name != nullptr) {
+                                data->found_file_name = file_name;
+                            }
+                            delete[] buf;
+                            return 1; // Stop iteration, found it
+                        }
+                    }
+                }
+            }
+        }
+        delete[] buf;
+    }
+    return 0; // Continue iteration
+}
+
+static void parse_varname(const std::string& varname, std::string& ids_name, int& occurrence, std::string& dataset_path) {
+    size_t first_slash = varname.find('/');
+    std::string prefix;
+    if (first_slash != std::string::npos) {
+        prefix = varname.substr(0, first_slash);
+    } else {
+        prefix = varname;
+    }
+
+    size_t colon_pos = prefix.find(':');
+    if (colon_pos != std::string::npos) {
+        ids_name = prefix.substr(0, colon_pos);
+        try {
+            occurrence = std::stoi(prefix.substr(colon_pos + 1));
+        } catch (...) {
+            occurrence = 0;
+        }
+    } else {
+        ids_name = prefix;
+        occurrence = 0;
+    }
+
+    if (first_slash != std::string::npos) {
+        dataset_path = ids_name + "/" + varname.substr(first_slash + 1);
+    } else {
+        dataset_path = ids_name;
+    }
+}
+
+static void resolve_source(const std::string& source, const std::string& ids_name, int occurrence, std::string& final_h5_file) {
+    std::string path = source;
+    std::string protocol = "imas:hdf5?path=";
+    if (path.find(protocol) == 0) {
+        path = path.substr(protocol.length());
+    }
+
+    // Is it a direct .h5 file?
+    if (path.length() >= 3 && path.substr(path.length() - 3) == ".h5") {
+        if (!fs::exists(path)) {
+            throw std::runtime_error("HDF5 file does not exist: " + path);
+        }
+        final_h5_file = path;
+        return;
+    }
+
+    // Otherwise, assume it's a directory containing master.h5
+    fs::path master_path = fs::path(path) / "master.h5";
+    if (!fs::exists(master_path)) {
+        throw std::runtime_error("Source is neither a valid .h5 file nor a directory containing master.h5: " + path);
+    }
+
+    hid_t file_id = H5Fopen(master_path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file_id < 0) {
+        throw std::runtime_error("Failed to open master file: " + master_path.string());
+    }
+
+    std::string target_suffix = "//" + ids_name;
+    if (occurrence > 0) {
+        target_suffix += "_" + std::to_string(occurrence);
+    }
+
+    LinkSearchData search_data;
+    search_data.target_suffix = target_suffix;
+
+    hsize_t idx = 0;
+    // Iterate over root group links
+    herr_t status = H5Literate(file_id, H5_INDEX_NAME, H5_ITER_NATIVE, &idx, find_elink_callback, &search_data);
+
+    H5Fclose(file_id);
+
+    if (status > 0 && !search_data.found_file_name.empty()) {
+        fs::path resolved_path = fs::path(path) / search_data.found_file_name;
+        // weakly_canonical resolves ../ sequences if possible
+        final_h5_file = fs::weakly_canonical(resolved_path).string();
+    } else {
+        throw std::runtime_error("Could not find appropriate external link in master.h5 for target: " + target_suffix);
+    }
+}
+
 TensorView read(const std::string& source, const std::string& varname)
 {
-    return imas::direct_access::read_tensor(source, varname);
+    std::string ids_name, dataset_path;
+    int occurrence = 0;
+    parse_varname(varname, ids_name, occurrence, dataset_path);
+
+    std::string final_h5_file;
+    resolve_source(source, ids_name, occurrence, final_h5_file);
+
+    return imas::direct_access::read_tensor(final_h5_file, dataset_path);
 }
 
 TensorView read(const std::string& source, const std::string& varname, 
@@ -53,7 +179,15 @@ TensorView read(const std::string& source, const std::string& varname,
         }
     }
     augmented_path += "]";
-    return imas::direct_access::read_tensor(source, augmented_path);
+
+    std::string ids_name, dataset_path;
+    int occurrence = 0;
+    parse_varname(augmented_path, ids_name, occurrence, dataset_path);
+
+    std::string final_h5_file;
+    resolve_source(source, ids_name, occurrence, final_h5_file);
+
+    return imas::direct_access::read_tensor(final_h5_file, dataset_path);
 }
 
 TensorView read(const std::string& source, const std::string& varname, 
