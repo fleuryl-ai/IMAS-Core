@@ -78,12 +78,10 @@ static herr_t find_elink_callback(hid_t loc_id, const char* name, const H5L_info
 
 static void parse_varname(const std::string& varname, std::string& ids_name, int& occurrence, std::string& dataset_path) {
     size_t first_slash = varname.find('/');
-    std::string prefix;
-    if (first_slash != std::string::npos) {
-        prefix = varname.substr(0, first_slash);
-    } else {
-        prefix = varname;
-    }
+    std::string prefix = (first_slash != std::string::npos) ? varname.substr(0, first_slash) : varname;
+    
+    // Le dataset_path est ce qui suit le premier slash (peut être vide)
+    dataset_path = (first_slash != std::string::npos) ? varname.substr(first_slash + 1) : "";
 
     size_t colon_pos = prefix.find(':');
     if (colon_pos != std::string::npos) {
@@ -96,12 +94,6 @@ static void parse_varname(const std::string& varname, std::string& ids_name, int
     } else {
         ids_name = prefix;
         occurrence = 0;
-    }
-
-    if (first_slash != std::string::npos) {
-        dataset_path = ids_name + "/" + varname.substr(first_slash + 1);
-    } else {
-        dataset_path = ids_name;
     }
 }
 
