@@ -1,11 +1,12 @@
 #include "hdf5_backend.h"
-
 #include <string.h>
 #include <algorithm>
 #include "hdf5_utils.h"
 #include "hdf5_backend_factory.h"
+#include <iostream>
 
-#define IMAS_HDF5_BACKEND_VERSION "IMAS_HDF5_BACKEND_VERSION"
+#define BACKEND_DEFAULT_WRITE_VERSION "BACKEND_DEFAULT_WRITE_VERSION"
+#define BACKEND_ALLOW_AUTO_UPGRADE "BACKEND_ALLOW_AUTO_UPGRADE"
 
 
 HDF5Backend::HDF5Backend()
@@ -16,7 +17,6 @@ HDF5Backend::HDF5Backend()
 
 HDF5Backend::HDF5Backend(Backend * targetB)
 {
-
 }
 
 HDF5Backend::~HDF5Backend()
@@ -26,64 +26,139 @@ HDF5Backend::~HDF5Backend()
 const int HDF5Backend::HDF5_BACKEND_VERSION_MAJOR = 2;
 const int HDF5Backend::HDF5_BACKEND_VERSION_MINOR = 0;
 
-
 void
- HDF5Backend::createBackendComponents(std::pair<int,int>  backend_version) {
-    
+ HDF5Backend::createBackendComponents(std::pair<int,int> backend_version) {
+    //if (allowUpgrade())
+    //    backend_version = std::make_pair(2,0);
     HDF5BackendFactory backendFactory(backend_version);
     hdf5Writer = backendFactory.createWriter();
     hdf5Reader = backendFactory.createReader();
     eventsHandler = backendFactory.createEventsHandler();
 }
 
-std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx)
-{
-  std::pair<int,int> version;
-  bool masterFileAlreadyOpened = (this->file_id != -1);
-
-  if (getenv(IMAS_HDF5_BACKEND_VERSION) != NULL) {
-      std::string env_version_str(getenv(IMAS_HDF5_BACKEND_VERSION));
-      size_t dot_pos = env_version_str.find('.');
+std::pair<int, int> HDF5Backend::parseVersion(const std::string& versionStr) {
+    std::pair<int,int> version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
+    size_t dot_pos = versionStr.find('.');
       if (dot_pos != std::string::npos) {
-        int major = std::stoi(env_version_str.substr(0, dot_pos));
-        int minor = std::stoi(env_version_str.substr(dot_pos + 1));
+        int major = std::stoi(versionStr.substr(0, dot_pos));
+        int minor = std::stoi(versionStr.substr(dot_pos + 1));
         version = {major, minor};
-      } else {
-        version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
       }
-    } else {
-      version = {HDF5_BACKEND_VERSION_MAJOR, HDF5_BACKEND_VERSION_MINOR};
-    }
-  if(ctx!=NULL){ 
-    std::string backend_version_from_file = "-1";
-    try {
-     
-        files_path_strategy = HDF5Utils::MODIFIED_MDSPLUS_STRATEGY;
-      
-        //we call openPulse() which reads the backend version from the master file (no attempt for opening the master file will be performed if it is already opened) 
-        HDF5Utils::openPulse(ctx, OPEN_PULSE, backend_version_from_file, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
-      
-        }
-      catch (std::exception &e) {
-            char error_message[200];
-            sprintf(error_message, "Unable to get backend version: %s\n", e.what());
-            throw ALBackendException(error_message, LOG);
-      }
-      if (!backend_version_from_file.empty() && backend_version_from_file != "-1") {
-        version = HDF5BackendFactory::getRequiredVersion(backend_version_from_file);
-      } 
-
-      HDF5BackendFactory backendFactory(version);
-      auto hdf5Reader_version = backendFactory.createReader();
-      
-      if (!masterFileAlreadyOpened) //the master pulse file is closed only if it was already closed before to call the getVersion() method
-        hdf5Reader_version->closePulse(ctx, OPEN_PULSE, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
-    }
-  return version;
+    return version;
 }
 
+bool HDF5Backend::allowUpgrade() {
+    char* v = std::getenv(BACKEND_ALLOW_AUTO_UPGRADE);  // Autorise-t-on la transformation physique du fichier de 1.0 vers 2.0 ?
+    return v && std::string(v) == "true";
+}
+
+std::pair<int, int> HDF5Backend::getTargetVersion() {
+    char* v = std::getenv(BACKEND_DEFAULT_WRITE_VERSION);
+    return v ? parseVersion(v) : std::make_pair(2, 0);
+}
+
+std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx) {
+    // --- DEBUG: Entrée de fonction ---
+   
+    if (ctx == NULL) {
+        return getTargetVersion();
+    } 
+
+    bool masterFileAlreadyOpened = (this->file_id != -1);
+
+    std::string physical_version_from_file = "-1";
+    std::pair<int,int> physical_version = std::make_pair(-1, -1);
+
+    try {
+        
+        //std::cout << "[DEBUG] Attempting to read version from file. Master file already opened: " << (masterFileAlreadyOpened ? "YES" : "NO") << std::endl;
+
+        HDF5Utils::openPulse(ctx, OPEN_PULSE, physical_version_from_file, &this->file_id, opened_IDS_files, HDF5Utils::MODIFIED_MDSPLUS_STRATEGY, files_directory, relative_file_path, this->pulseFilePath); 
+        
+        physical_version = parseVersion(physical_version_from_file);
+        //std::cout << "[DEBUG] Physical version detected: " << physical_version.first << "." << physical_version.second << " (string: " << physical_version_from_file << ")" << std::endl;
+
+        if (!masterFileAlreadyOpened) {
+            //std::cout << "[DEBUG] Closing pulse as it was temporary for version detection." << std::endl;
+            HDF5BackendFactory backendFactory(physical_version);
+            auto hdf5Reader_version = backendFactory.createReader();
+            hdf5Reader_version->closePulse(ctx, OPEN_PULSE, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
+        } 
+    }
+    catch (std::exception &e) {
+        //std::cerr << "[ERROR] Exception during version detection: " << e.what() << std::endl;
+    }
+
+    std::pair<int, int> m_identityVersion = getTargetVersion();
+    //std::cout << "[DEBUG] Identity Version (Target): " << m_identityVersion.first << "." << m_identityVersion.second << std::endl;
+
+    // --- INSTANCIATION DU READER ---
+    if (physical_version != std::make_pair(-1, -1)) { //file exists
+        //std::cout << "[DEBUG] Instantiating Reader with Physical major version." << physical_version.first << std::endl;
+        HDF5BackendFactory backendFactory(physical_version);
+        hdf5Reader = backendFactory.createReader();
+    } 
+    else {
+        //std::cout << "[DEBUG] Instantiating Reader with major version." << physical_version.second  << std::endl;
+        HDF5BackendFactory backendFactory(getTargetVersion());
+        hdf5Reader = backendFactory.createReader();
+    } 
+
+    // --- LOGIQUE DE DÉCISION DU WRITER ---
+    std::pair<int, int> writerVersion;
+    std::pair<int, int> versionToReturn;
+
+    switch (access_mode) {
+        case alconst::open_pulse:
+        case alconst::force_open_pulse:
+            if (physical_version != getTargetVersion() && getTargetVersion() == std::make_pair(2, 0)){
+                //printf("physical_version lower than backend version\n");
+                if (allowUpgrade()){ 
+                    //printf("Allowed to upgrade\n");
+                    writerVersion = std::make_pair(2, 0);
+                    versionToReturn = getTargetVersion();
+                }
+                else{
+                    //printf("Not allowed to upgrade from physical major version %d\n", physical_version.first);
+                    throw ALBackendException("Not allowed to upgrade to 2.0 from version 1.0 (BACKEND_ALLOW_AUTO_UPGRADE is false)");
+                    //versionToReturn = physical_version; //error from LL no thrown ???
+                } 
+            } 
+            else if (physical_version  == getTargetVersion() && getTargetVersion() == std::make_pair(2, 0)){
+                //printf("physical_version same than backend version in 2.0\n");
+                writerVersion = std::make_pair(2, 0);
+                versionToReturn = getTargetVersion();
+            } 
+            else if (physical_version  == std::make_pair(1, 0) && getTargetVersion() == std::make_pair(1, 0)){
+                //printf("physical_version same than backend version in 1.0\n");
+                writerVersion = std::make_pair(1, 0);
+                versionToReturn = getTargetVersion();
+            } 
+            else if (physical_version  == std::make_pair(2, 0) && getTargetVersion() == std::make_pair(1, 0)){
+                //printf("physical_version larger than backend version in 1.0\n");
+                //writerVersion = std::make_pair(2, 0);
+                //versionToReturn = physical_version; //an error will be thrown by LL
+                throw ALBackendException("Not allowed to downgrade from version 2.0 to version 1.0.");
+            } 
+            
+        case alconst::create_pulse:
+        case alconst::force_create_pulse:
+            //printf("Returning version: %d.%d", getTargetVersion().first, getTargetVersion().second);
+            return getTargetVersion();
+            break;
+    } 
+
+    if (!masterFileAlreadyOpened){ 
+        //printf("Setting writer with version: %d.%d", writerVersion.first, writerVersion.second);
+        HDF5BackendFactory backendFactory(writerVersion);
+        hdf5Writer = backendFactory.createWriter();
+    } 
+
+    return versionToReturn;
+} 
+
 std::pair<int,int> HDF5Backend::getVersion() {
-    return getVersion(NULL);;
+    return getVersion(NULL);
 }
 
 void
@@ -100,8 +175,6 @@ void
         case OPEN_PULSE:
         case FORCE_OPEN_PULSE: 
             {
-            backend_version = getVersion(ctx);
-            backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
             int status = HDF5Utils::openPulse(ctx, mode, backend_version_str, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath); 
             if (status == -1) { //master file doesn't exist
                 backend_version = getVersion();
@@ -113,13 +186,15 @@ void
         case CREATE_PULSE:
         case FORCE_CREATE_PULSE:
             backend_version = getVersion();
+            //printf("Creating pulse file with version: %d.%d\n ", backend_version.first, backend_version.second);
+            //if (allowUpgrade())
+            //    backend_version = std::make_pair(2,0);
             backend_version_str = std::to_string(backend_version.first) + "." + std::to_string(backend_version.second);
             HDF5Utils::createPulse(ctx, mode, backend_version_str, &this->file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path, this->pulseFilePath);
             break;
         default:
             throw ALBackendException("Mode not yet supported", LOG);
     }
-    createBackendComponents(backend_version);
 }
 
 void HDF5Backend::closePulse(DataEntryContext * ctx, int mode)

@@ -194,8 +194,8 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
                                int dim, int *size, void *data) {
 
   bool is_metadata = dataset_name.find('@') != std::string::npos;
-  printf("[DEBUG write_ND_Data] Called with dataset_name='%s', timebasename='%s', datatype=%d, dim=%d, is_metadata=%s\n",
-         dataset_name.c_str(), timebasename.c_str(), datatype, dim, is_metadata ? "true" : "false");
+  //printf("[DEBUG write_ND_Data] Called with dataset_name='%s', timebasename='%s', datatype=%d, dim=%d, is_metadata=%s\n",
+  //       dataset_name.c_str(), timebasename.c_str(), datatype, dim, is_metadata ? "true" : "false");
 
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;

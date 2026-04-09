@@ -33,9 +33,13 @@ class HDF5Backend:public Backend {
     int access_mode;
     int files_path_strategy;
 
-     void createBackendComponents(std::pair<int,int> backend_version);
-     std::pair<int,int> getVersion();
-     std::string getPulseFilePath(DataEntryContext * ctx);
+    std::pair<int, int> parseVersion(const std::string& versionStr);
+    std::pair<int, int> getTargetVersion();
+    bool allowUpgrade();
+    void createBackendComponents(std::pair<int,int> backend_version);
+    std::pair<int,int> getVersion();
+     
+    std::string getPulseFilePath(DataEntryContext * ctx);
 
     void beginWriteArraystructAction(ArraystructContext * ctx, int *size);
     void beginReadArraystructAction(ArraystructContext * ctx, int *size);

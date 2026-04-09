@@ -20,6 +20,7 @@ HDF5EventsHandler::beginAction(OperationContext * ctx, hid_t file_id, std::unord
 	hid_t loc_id = -1;
 	strategy_set = false;
 	if (ctx->getAccessmode() == WRITE_OP && ctx->getRangemode() == GLOBAL_OP) {
+		//printf("HDF5EventsHandler::calling create_IDS_group\n" );
 		writer.create_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path, access_mode, &loc_id);
 		writer.setWriteStrategy(ctx, GLOBAL_OP, loc_id);
 		strategy_set = true;
