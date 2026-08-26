@@ -266,7 +266,7 @@ qu'à t=0.6 (présente). Ajouts :
 ### 6.2 Résultats finaux
 
 - **ctest complet : 60/60 pass** (57 originaux + 3 nouveaux), sur **3 runs
-  consécutifs** ;
+  consécutifs** *(avant la prise en charge de `homogeneous_time=1`, voir § 7)* ;
 - les 4 anciens failants (`test_profiles_1d_dynamic_signal_1d`,
   `test_profiles_1d_dynamic_0d_append`, `test_time_slice_nested_x_point`,
   `test_profiles_1d_dynamic_append_slice`) et les 4 segfaults
@@ -287,7 +287,134 @@ qu'à t=0.6 (présente). Ajouts :
 
 ---
 
-## 7. Points restants / hors périmètre
+## 7. Prise en charge des gaps pour `homogeneous_time = 1`
+
+### 7.1 Constats (diagnostic confirmé par tests)
+
+Les tests § 5.2-5.4 utilisent tous `homogeneous_time = 0` avec un **AoS
+dynamique** + timebase imbriquée. Le cas homogène (`homogeneous_time = 1`,
+signaux **standalone** à la racine ou dans des AoS statiques, timebase racine
+`time`) **n'était pas couvert** et les tests confirment le non-support :
+
+| Symptôme | Observations mesurées |
+|---|---|
+| Lecture par slice | `closest sigA@0.2 → 103` (espéré 101), `closest sigB@0.1 → 202` (espéré 200) : **la slice manquante est absorbée** (timeline compressée), jamais résolue |
+| Lecture timerange (signal racine) | En plus de la compression, `sigA[4] →` valeur « garbage » (lecture au-delà de la dernière feuille) |
+| Écriture chunkée (bulk) | inchangée (les bulk writes alignaient chaque signal sur son propre compteur, cas inhomogène et homogène) |
+
+**Cause racine d'écriture** — `PanzerDB::writeDataSlicesImpl`, CASE 2
+(« standalone dynamic data », panzerdb.cpp:1865) :
+
+```cpp
+base_time = aos_time_counters[full_path];        // compteur PROPRE du signal
+```
+
+Le signal alignait sa N-ème écriture sur la N-ème position **du signal**
+indépendamment de la timebase. Une session écrivant `time` + `sigC` mais pas
+`sigA` → le compteur `sigA` restait à sa valeur précédente → la session
+suivante d'écriture de `sigA` atterrissait sur `time_index` = compteur+1
+(comprimé), pas sur la position réelle dans la timebase. Le lecteur
+(§ 4, `nearestAvailableSliceIndex`) était **parfait** — il n'avait juste
+rien à résoudre car le trou n'existait pas (compression).
+
+**Cause racine de lecture timerange** —
+`TimeRangeReadStrategy::read_ND_Data` (timerange_read_strategy.cpp:195) :
+la branche `dynamic_index == -1` (signaux standalone) lit la concaténation
+entière (`read_dataset_globally`) puis découpe par **offset d'éléments** —
+indépendant des `time_index`. Avec un trou → valeurs faussées + lecture
+hors-borne au-delà de la dernière feuille.
+
+**Cause latente (cache)** — `PanzerDB::beginArray(name, timebase)`
+(dynamique) n'invalidait pas `dynamic_aos_path_valid`, alors que le
+beginArray statique le fait (panzerdb.cpp:1263). Séquence « écriture
+racine puis AoS dynamique » pouvait laisser un cache vide qui
+« routait » les écritures dans l'AoS dynamique au CASE 2 (compteur
+propre) au lieu du CASE 1 (itération de l'AoS), masqué tant que le
+compteur propre coïncidait.
+
+### 7.2 Patches (trois modifications)
+
+1. **Écriture — ancrage sur timebase dans CASE 2**
+   (`PanzerDB::writeDataSlicesImpl` numeric + `writeDataSlices` strings) :
+   au lieu de `base_time = compteur_propre[full_path]`, ancrer sur le
+   **compteur de la timebase** (si `timebase` non vide et présent dans
+   `aos_time_counters`) :
+
+   ```cpp
+   base_time = aos_time_counters[time_key];
+   if (!timebase.empty() && aos_time_counters.count(timebase)) {
+       uint64_t time_next = aos_time_counters[timebase];
+       if (time_next >= n_slices)
+           base_time = std::max(base_time, time_next - n_slices);
+   }
+   ```
+
+   `max()` préserve les écritures chunkées (bulk writes multi-slices) :
+   le compteur propre reste la borne inférieure.
+
+2. **Écriture — invalidation du cache AoS dynamique**
+   (`PanzerDB::beginArray(name, timebase)`) : ajout de
+   `invalidateDynamicAOSCache();` après `beginArray(level)`, conformément
+   à l'overload statique.
+
+3. **Lecture timerange — lecture par slice**
+   (`TimeRangeReadStrategy::read_ND_Data`, branche `dynamic_index == -1`) :
+   nouveau chemin pour `double` / `int` / `complex` qui lit chaque
+   slice demandée via `PanzerDB::readInterpolatedData(...)` (déjà gap-aware
+   par `nearestAvailableSliceIndex`), puis assemble le buffer AL
+   conventionnel (spatial dims + time dim en dernier, `size[last] = n_slices`).
+   Le chemin `read_dataset_globally` est conservé pour les strings et pour
+   les signaux avec `dynamic_index != -1`.
+
+### 7.3 Tests (2 nouveaux)
+
+- `tests/hdf5_backend/test_gap_homog_slice_read.cpp` — écriture homogène
+  (5 APPEND, 1 point de timebase `time` par session), `sigA=100+i`
+  (trou i=2), `sigB=200+i` (trous i=1,3), `sigC=300+i` (pler). Lecture
+  `slice_op` closest / previous / linear : valeurs exactes au trou
+  (`closest sigA@0.2 → 101`, `linear sigA@0.2 → 102 = (101+103)/2`,
+  `linear sigB@0.1 → 201`, `linear sigB@0.3 → 203`). Signal non écrit →
+  non disponible.
+- `tests/hdf5_backend/test_gap_homog_timerange_read.cpp` — mêmes fixtures.
+  Lecture `timerange_op [0.0, 0.4]` (pas de resampling) :
+  - closest `sigA` → `[100, 101, 101, 103, 104]` (trou @ idx2 résolvé
+    vers la dernière disponible ≤ t) ;
+  - linear  `sigA` → `[100, 101, 102, 103, 104]` (interpolation entre
+    slices existantes uniquement) ;
+  - closest `sigC` → `[300, 301, 302, 303, 304]` ;
+  - signal non écrit → non disponible.
+
+### 7.4 Validation finale
+
+- **ctest complet : 62/62 pass** sur **3 runs consécutifs**
+  (57 originaux + 3 gaps inhomogènes + 2 gaps homogènes) ;
+- 8 régressions intermédiaires détectées (4 tests « append slice » +
+  4 segfaults « timerange nested dynamic aos » + `profiles_1d_dynamic`
+  + `direct_api_validation`). Cause : les 3 patches ci-dessus s'appliquent
+  indifféremment aux cas homogènes et inhomogènes — le patch de write
+  CASE 2 (item 7.2.1) a régressé des signaux « in AOS dynamique » par
+  effet de cascade (le compteur timebase racine, déjà avancé par
+  l'écriture en bulk des 10 slices, poussait `base_time` au-delà de la
+  position réelle). L'invalidation de cache (item 7.2.2) + la garde
+  `max(signal_compteur)` suffisent à restaurer le comportement attendu.
+- Aucune ligne de debug résiduelle (`grep DBG-CASE2 panzerdb.cpp` vide),
+  build propre `make -j8`, aucun changement d'API publique.
+
+### 7.5 Tableau avant / après (fixture `test_gap_homog_slice_read` : `sigA=100+i`, trou t=0.2)
+
+| Demande | Avant (bug) | Après |
+|---|---|---|
+| `closest sigA@0.2` (trou) | 103 (compression) | **101** |
+| `closest sigB@0.1` (trou) | 202 | **200** |
+| `linear  sigA@0.2` (trou) | 103 | **102** |
+| `linear  sigB@0.1` (trou) | 202 | **201** |
+| `timerange [0, 0.4] closest sigA` | `[100, 103, 104, …, garbage]` | **`[100, 101, 101, 103, 104]`** |
+| `timerange [0, 0.4] linear  sigA` | `[100, 103, 104, 0, …]` | **`[100, 101, 102, 103, 104]`** |
+| Signal jamais écrit | indét. | « non disponible » |
+
+---
+
+## 8. Points restants / hors périmètre
 
 - **Lignes « empty »** : le format PanzerDB prévoit une ligne `flags=1`
   dans `/index` pour marquer une slice vide (panzerdb.cpp `endArray` :
@@ -304,17 +431,21 @@ qu'à t=0.6 (présente). Ajouts :
 
 ---
 
-## 8. Diff résumé
+## 9. Diff résumé
 
 ```text
- src/hdf5/CMakeLists.txt                                 |   3 +  (3 al_add_hdf5_test)
- src/hdf5/panzerdb.cpp                                   | 233 +++++++++----- (fonction neuve + réécriture)
- src/hdf5/panzerdb.h                                     |  42 +++  (déclaration)
- tests/hdf5_backend/test_dynamic_aos_gap.cpp             | 123 ++++++ (renfort)
- tests/hdf5_backend/test_gap_closest_prev_read.cpp       | 142 +++++  (nouveau)
- tests/hdf5_backend/test_gap_linear_read.cpp             | 122 +++++  (nouveau)
- tests/hdf5_backend/test_gap_timerange_read.cpp          | 119 +++++  (nouveau)
- docs/PLANS_correction_lecture_gaps.md                   | (plan de référence)
+  src/hdf5/CMakeLists.txt                                 |   5 +  (3 + 2 al_add_hdf5_test)
+  src/hdf5/panzerdb.cpp                                   | 270 ++++++++++------ (fonction neuve + patch homog_time)
+  src/hdf5/panzerdb.h                                     |  42 +++  (déclaration)
+  src/hdf5/timerange_read_strategy.cpp                    |  89 +++++  (par slice)
+  tests/hdf5_backend/test_dynamic_aos_gap.cpp             | 123 ++++++ (renfort)
+  tests/hdf5_backend/test_gap_closest_prev_read.cpp       | 142 +++++  (nouveau)
+  tests/hdf5_backend/test_gap_linear_read.cpp             | 122 +++++  (nouveau)
+  tests/hdf5_backend/test_gap_timerange_read.cpp          | 119 +++++  (nouveau)
+  tests/hdf5_backend/test_gap_homog_slice_read.cpp        | 158 +++++++ (nouveau, homog_time=1)
+  tests/hdf5_backend/test_gap_homog_timerange_read.cpp    | 135 ++++++ (nouveau, homog_time=1)
+  docs/PLANS_correction_lecture_gaps.md                   | (plan de référence inhomogène)
+  docs/PLANS_gap_homog_timebase.md                        | (plan de référence homogène)
 ```
 
-**Total** : ≈ +590 / −90 lignes (hors plan pré-existant).
+**Total** : ≈ +660 / −95 lignes (hors plans pré-existants).

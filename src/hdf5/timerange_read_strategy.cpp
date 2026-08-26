@@ -192,6 +192,94 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
         
         
+        if (dynamic_index == -1 &&
+            (*datatype == alconst::double_data ||
+             *datatype == alconst::integer_data ||
+             *datatype == alconst::complex_data))
+        {
+            // FIX (gaps, homogeneous_time=1): a standalone dynamic signal is read
+            // slice by slice instead of as one concatenated buffer. The previous
+            // approach sliced the global buffer by element offset, so a missing
+            // slice (gap) both shifted the later values AND allowed reads past the
+            // end (garbage). readInterpolatedData resolves every requested time to
+            // the nearest available slice (closest / previous / linear).
+            //
+            // Strings keep the legacy path below (out of scope for this fix).
+            std::string full_path = buildFullPath(ctx, dataset_name);
+            const char* cpath = full_path.c_str();
+            int interp_mode = opctx->time_range.interpolation_method;
+
+            // Requested time list:
+            //  - explicit resample grid (dtime.size() > 1)
+            //  - step resampling (dtime.size() == 1) : tmin, tmin+dt, ... <= tmax
+            //  - no resampling : original grid points within [tmin, tmax]
+            std::vector<double> requested_times;
+            const auto& dtime = opctx->time_range.dtime;
+            if (dtime.size() > 1) {
+                requested_times = dtime;
+            } else if (dtime.size() == 1 && dtime[0] > 0.0) {
+                for (double ti = opctx->time_range.tmin; ti <= tmax + 1e-12; ti += dtime[0])
+                    requested_times.push_back(ti);
+            } else {
+                if (time_min_index == -1 || time_max_index == -1) return 0;
+                for (int idx = time_min_index; idx <= time_max_index; ++idx)
+                    requested_times.push_back(time_basis_vector[idx]);
+            }
+            if (requested_times.empty()) return 0;
+
+            // Probe one slice to learn the per-slice shape/dim.
+            uint64_t probe_ndim = 0;
+            uint64_t probe_shape[6] = {0};
+            void* probe_buf = nullptr;
+            int probe_status = panzer_db_ptr->readInterpolatedData(
+                cpath, requested_times[0], time_basis_vector,
+                interp_mode, *datatype, &probe_ndim, probe_shape, &probe_buf, true);
+            if (probe_status != 0 || probe_buf == nullptr) {
+                if (probe_buf) free(probe_buf);
+                return 0;
+            }
+            size_t per_slice_count = 1;
+            for (size_t d = 0; d < probe_ndim; ++d) per_slice_count *= (size_t)probe_shape[d];
+            free(probe_buf);
+
+            size_t elem_bytes = 0;
+            if (*datatype == alconst::double_data)      elem_bytes = sizeof(double);
+            else if (*datatype == alconst::integer_data) elem_bytes = sizeof(int);
+            else if (*datatype == alconst::complex_data) elem_bytes = sizeof(std::complex<double>);
+            if (elem_bytes == 0) return 0;
+
+            size_t nb = requested_times.size();
+            void* out_buf = malloc(nb * per_slice_count * elem_bytes);
+            if (!out_buf) return 0;
+            char* out_ptr = (char*)out_buf;
+
+            // Fill the output buffer: one resolved slice per requested time.
+            for (size_t k = 0; k < nb; ++k) {
+                uint64_t ndim_k = 0;
+                uint64_t shape_k[6] = {0};
+                void* slice_buf = nullptr;
+                int st = panzer_db_ptr->readInterpolatedData(
+                    cpath, requested_times[k], time_basis_vector,
+                    interp_mode, *datatype, &ndim_k, shape_k, &slice_buf, true);
+                if (st != 0 || slice_buf == nullptr) {
+                    if (slice_buf) free(slice_buf);
+                    free(out_buf);
+                    return 0;
+                }
+                memcpy(out_ptr + k * per_slice_count * elem_bytes,
+                       slice_buf, per_slice_count * elem_bytes);
+                free(slice_buf);
+            }
+
+            // AL convention: spatial dims first, then the time dim appended at the
+            // end with the number of slices.
+            *data = out_buf;
+            *dim = (int)probe_ndim + 1;
+            for (size_t d = 0; d < probe_ndim; ++d) size[d] = (int)probe_shape[d];
+            size[probe_ndim] = (int)nb;
+            return 1;
+        }
+
         if (dynamic_index == -1) {
             // No dynamic index found: we read the whole dataset (global behavior)
             // then we slice/resample according to the time range

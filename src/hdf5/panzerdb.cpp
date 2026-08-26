@@ -1300,6 +1300,12 @@ void PanzerDB::beginArray(const std::string& name, const std::string& timebase) 
     }
     
     beginArray(level);
+    // Cache invalidation: the dynamic-AoS set can change (e.g. opening a dynamic
+    // AoS after a root time write). The static-path beginArray already does this;
+    // the dynamic path must as well, otherwise a stale cache (empty dyn path from
+    // an earlier root write) poisons every subsequent in-AoS signal write and
+    // misroutes it to CASE 2. Mirrors the static-path beginArray (line ~1263).
+    invalidateDynamicAOSCache();
 }
 
 void PanzerDB::beginArray(ArrayLevel& level) {
@@ -1873,6 +1879,20 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
         }
         
         base_time = aos_time_counters[time_key];
+
+        // FIX (gaps, homogeneous_time=1): for a standalone dynamic signal on the
+        // master timebase, anchor the slice number to the timebase's written
+        // position (like CASE 1 does with the dynamic AoS timebase). Without this,
+        // skipping the signal for a time step would compress the signal's timeline
+        // (its next write landing on the next slice) instead of leaving a resolvable
+        // gap aligned to the master timebase. max() preserves chunked writes.
+        // Guarded by timebase so it never fires for the timebase write itself.
+        if (!timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+            uint64_t time_next = aos_time_counters[timebase];
+            if (time_next >= n_slices) {
+                base_time = std::max(base_time, time_next - n_slices);
+            }
+        }
     }
 
     // --- Common writing ---
@@ -1989,10 +2009,20 @@ void PanzerDB::writeDataSlices(const std::string& name,
             aos_time_counters[time_key] = 0;
         }
         base_time = aos_time_counters[time_key];
+
+        // FIX (gaps, homogeneous_time=1): same timebase anchoring as the numeric
+        // writeDataSlicesImpl CASE 2, so a skipped string slice leaves a
+        // resolvable gap aligned to the master timebase instead of compressing.
+        if (!timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+            uint64_t time_next = aos_time_counters[timebase];
+            if (time_next >= n_slices) {
+                base_time = std::max(base_time, time_next - n_slices);
+            }
+        }
     }
 
     uint64_t start_offset = disk_size_str + data_buffer_str.size();
-    
+
     // ✅ DIFFERENCE: count_per_slice for strings
     size_t count_per_slice = base_shape.empty() ? 1 : base_shape[0];
 
