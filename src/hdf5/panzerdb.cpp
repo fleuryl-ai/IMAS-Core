@@ -2352,6 +2352,102 @@ bool PanzerDB::isTimeInLeaf(const Leaf& leaf, int64_t time_index) const {
             static_cast<uint64_t>(time_index) < (leaf.time_index + n_steps));
 }
 
+int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
+                                             int64_t prefer_direction,
+                                             const std::vector<double>& time_basis,
+                                             double requested_time) const {
+    std::string target_path(full_path);
+
+    // The dynamic AoS prefix of the target (if any), mirroring the path
+    // resolution strategies of the pz_read*Data_by_index family:
+    //   direct path, generic path (index dropped), substituted path
+    //   (index replaced by the requested one).
+    std::string dynamic_aos;
+    std::string remainder_suffix; // e.g. "/ion/0/signal_1d" (leading '/')
+    for (const auto& aos_path : cached_dynamic_aos_roots) {
+        if (target_path.size() > aos_path.size() &&
+            target_path[aos_path.size()] == '/' &&
+            target_path.compare(0, aos_path.size(), aos_path) == 0) {
+            dynamic_aos = aos_path;
+            const std::string::size_type dyn_len = dynamic_aos.size();
+            // remainder = target_path[dyn_len+1 .. end]  (skips trailing '/')
+            const std::string::size_type rem_start = dyn_len + 1;
+            std::string remainder = (rem_start < target_path.size())
+                                            ? target_path.substr(rem_start)
+                                            : std::string();
+            std::string::size_type first_slash = remainder.find('/');
+            if (first_slash != std::string::npos) {
+                remainder_suffix = remainder.substr(first_slash);
+            }
+            break;
+        }
+    }
+
+    auto path_covers = [&](const std::string& path, int64_t idx) -> bool {
+        auto it = leaf_lookup.find(path);
+        if (it == leaf_lookup.end()) return false;
+        for (size_t lidx : it->second) {
+            if (isTimeInLeaf(getLeaves()[lidx], idx)) return true;
+        }
+        return false;
+    };
+
+    auto available = [&](int64_t idx) -> bool {
+        if (path_covers(target_path, idx)) return true;
+        if (dynamic_aos.empty()) return false;
+        if (path_covers(dynamic_aos + remainder_suffix, idx)) return true; // generic
+        std::string substituted;
+        substituted.reserve(dynamic_aos.size() + remainder_suffix.size() + 12);
+        substituted.append(dynamic_aos);
+        substituted.push_back('/');
+        substituted.append(std::to_string(idx));
+        substituted.append(remainder_suffix);
+        return path_covers(substituted, idx);
+    };
+
+    long long nb = static_cast<long long>(time_basis.size());
+    int64_t lo = 0;
+    int64_t hi = (nb > 0) ? nb - 1 : 0;
+
+    if (available(requested_idx)) return requested_idx;
+
+    // Highest available index <= requested (linear search, few slices expected)
+    int64_t highest_below = -1;
+    for (int64_t i = requested_idx; i >= lo; --i) {
+        if (available(i)) { highest_below = i; break; }
+    }
+    // Lowest available index >= requested
+    int64_t lowest_above = -1;
+    if (requested_idx <= hi) {
+        for (int64_t i = requested_idx; i <= hi; ++i) {
+            if (available(i)) { lowest_above = i; break; }
+        }
+    }
+
+    if (prefer_direction < 0) {
+        return highest_below != -1 ? highest_below : lowest_above;
+    }
+    if (prefer_direction > 0) {
+        return lowest_above != -1 ? lowest_above : highest_below;
+    }
+
+    // Nearest in time; ties resolved to the smaller index
+    auto distance = [&](int64_t idx) -> double {
+        if (requested_time >= 0 && idx >= 0 && idx < static_cast<int64_t>(time_basis.size())) {
+            return std::abs(time_basis[idx] - requested_time);
+        }
+        return std::abs(static_cast<double>(idx - requested_idx));
+    };
+
+    if (highest_below == -1) return lowest_above;
+    if (lowest_above == -1) return highest_below;
+    double d_below = distance(highest_below);
+    double d_above = distance(lowest_above);
+    if (d_below < d_above) return highest_below;
+    if (d_above < d_below) return lowest_above;
+    return highest_below; // tie -> smaller index
+}
+
 int PanzerDB::pz_readData_by_index(
                          const char* full_data_path,
                          int64_t time_index,
@@ -3095,109 +3191,77 @@ int PanzerDB::readInterpolatedData(
 
     //printf("--> Time basis size: %zu\n", time_basis.size());
     int slice_index = data_interpolation_component.getSlicesTimesIndices(time, time_basis, times_indices, interp_mode);
+    int request_sup = times_indices[SLICE_SUP];
 
-    auto read_slice_with_fallback = [&](int64_t idx, void** out_ptr) -> int {
-        //printf("    [read_slice_with_fallback] Trying to read index: %lld\n", (long long)idx);
-        
-        int res = -1;
+    // Resolve the requested time indices to available slices.
+    // A "gap" (missing slice for this signal) is resolved to the closest
+    // available slice:
+    //   - closest / undefined : nearest available slice in time (ties -> lower index)
+    //   - previous            : last available <= t (else first available >= t)
+    //   - linear              : last available <= t (inf) and first available
+    //                           >= t (sup), interpolation factor computed with
+    //                           the actual times of those slices.
+    // A signal with no data at all -> -1 (data not available).
+    // Closest (and undefined) ask for the nearest slice in time; previous and
+    // linear ask for "last available <= t" on the inf side.
+    const bool want_nearest = (interp_mode != PREVIOUS_INTERP && interp_mode != LINEAR_INTERP);
+    const int64_t inf_direction = want_nearest ? 0 : -1;
+    int64_t inf_i = nearestAvailableSliceIndex(full_data_path, slice_index, inf_direction, time_basis, time);
+    if (inf_i == -1) return -1;
+
+    int64_t sup_i = inf_i;
+    if (interp_mode == LINEAR_INTERP && request_sup != slice_index) {
+        sup_i = nearestAvailableSliceIndex(full_data_path, request_sup, +1, time_basis, time);
+        if (sup_i == -1) sup_i = inf_i;
+        if (sup_i < inf_i) {
+            std::swap(inf_i, sup_i);
+        }
+    }
+
+    auto read_slice_at = [this, full_data_path, datatype, ndim_out, shape_out](int64_t idx, void** out_ptr) -> int {
+        *out_ptr = nullptr;
         if (datatype == alconst::char_data) {
-             res = pz_readStringData_by_index(full_data_path, idx, ndim_out, shape_out, (char**)out_ptr);
+            return pz_readStringData_by_index(full_data_path, idx, ndim_out, shape_out, (char**)out_ptr);
         } else if (datatype == alconst::complex_data) {
-             res = pz_readComplexData_by_index(full_data_path, idx, ndim_out, shape_out, (std::complex<double>**)out_ptr);
+            return pz_readComplexData_by_index(full_data_path, idx, ndim_out, shape_out, (std::complex<double>**)out_ptr);
         } else {
-             res = pz_readData_by_index(full_data_path, idx, ndim_out, shape_out, (double**)out_ptr);
+            return pz_readData_by_index(full_data_path, idx, ndim_out, shape_out, (double**)out_ptr);
         }
-        
-        //printf("    [read_slice_with_fallback] Result: %d\n", res);
-
-        if (res != 0 && datatype != alconst::char_data && datatype != alconst::complex_data) {
-            //printf("    [read_slice_with_fallback] Trying fallback to time_index=0\n");
-            
-            void* fallback_ptr = nullptr;
-            int res_fallback = pz_readData_by_index(full_data_path, 0, ndim_out, shape_out, (double**)&fallback_ptr);
-            
-            if (res_fallback == 0 && fallback_ptr != nullptr) {
-                if (*ndim_out == 0 || !expect_time_dim) {
-                    size_t element_size = sizeof(double);
-                    if (datatype == (int)DataType::INT32) element_size = sizeof(int);
-                    else if (datatype == (int)DataType::COMPLEX128) element_size = sizeof(std::complex<double>);
-                    
-                    size_t total_elements = 1;
-                    for(size_t i=0; i<*ndim_out; ++i) total_elements *= shape_out[i];
-
-                    *out_ptr = malloc(total_elements * element_size);
-                    memcpy(*out_ptr, fallback_ptr, total_elements * element_size);
-                    free(fallback_ptr);
-                    return 0;
-                }
-
-                size_t num_slices = shape_out[*ndim_out - 1];
-                if (idx >= 0 && (size_t)idx < num_slices) {
-                    size_t total_elements = 1;
-                    for(size_t i=0; i<*ndim_out; ++i) total_elements *= shape_out[i];
-                    
-                    size_t element_size = sizeof(double); 
-                    if (datatype == (int)DataType::INT32) element_size = sizeof(int);
-
-                    size_t single_slice_elements = total_elements / num_slices;
-                    
-                    *out_ptr = malloc(single_slice_elements * element_size);
-                    memcpy(*out_ptr, (double*)fallback_ptr + (idx * single_slice_elements), 
-                           single_slice_elements * element_size);
-                    
-                    free(fallback_ptr);
-                    *ndim_out -= 1;
-                    return 0;
-                }
-                free(fallback_ptr);
-            }
-        }
-        return res;
     };
 
     void* data_inf = nullptr;
-    int res_inf = read_slice_with_fallback(slice_index, &data_inf);
-    
-    if (res_inf != 0) {
-        //printf("[PanzerDB::readInterpolatedData] EXIT with error\n");
+    if (read_slice_at(inf_i, &data_inf) != 0) {
         return -1;
     }
 
-    // Interpolation if necessary
-    if (times_indices["slice_inf"] != times_indices["slice_sup"]) {
-        void* data_sup = nullptr;
-        int res_sup = read_slice_with_fallback(times_indices["slice_sup"], &data_sup);
-
-        if (res_sup != 0) {
-            if (data_inf) free(data_inf);
-            return -1;
-        }
-
-        std::map<std::string, double> slices_times;
-        slices_times["slice_inf"] = time_basis[times_indices["slice_inf"]];
-        slices_times["slice_sup"] = time_basis[times_indices["slice_sup"]];
-        
-        std::map<std::string, void*> y_slices;
-        y_slices["slice_inf"] = data_inf;
-        y_slices["slice_sup"] = data_sup;
-        
-        size_t shape_prod = 1;
-        for (size_t i = 0; i < *ndim_out; ++i) shape_prod *= shape_out[i];
-        
-        data_interpolation_component.interpolate(datatype, shape_prod, y_slices, slices_times, time, data_out, interp_mode);
-
-        if (data_inf && *data_out != data_inf) free(data_inf);
-        if (data_sup && *data_out != data_sup) free(data_sup);
-
-        return 0;
-    }
-
-    if (data_inf != nullptr) {
+    if (sup_i == inf_i || interp_mode != LINEAR_INTERP) {
         *data_out = data_inf;
         return 0;
     }
 
-    return -1;
+    void* data_sup = nullptr;
+    if (read_slice_at(sup_i, &data_sup) != 0) {
+        free(data_inf);
+        return -1;
+    }
+
+    std::map<std::string, double> slices_times;
+    slices_times[SLICE_INF] = time_basis[inf_i];
+    slices_times[SLICE_SUP] = time_basis[sup_i];
+
+    std::map<std::string, void*> y_slices;
+    y_slices[SLICE_INF] = data_inf;
+    y_slices[SLICE_SUP] = data_sup;
+
+    size_t shape_prod = 1;
+    for (size_t i = 0; i < *ndim_out; ++i) shape_prod *= shape_out[i];
+
+    data_interpolation_component.interpolate(datatype, shape_prod, y_slices, slices_times, time, data_out, interp_mode);
+
+    if (data_inf && *data_out != data_inf) free(data_inf);
+    if (data_sup && *data_out != data_sup) free(data_sup);
+
+    return 0;
 }
 
 std::string PanzerDB::getDynamicAOSPath() const {

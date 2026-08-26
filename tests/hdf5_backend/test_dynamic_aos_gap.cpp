@@ -171,15 +171,134 @@ int main() {
                 backend.endAction(&opCtx);
             }
 
-            // 2. Linear Interp
+            // 2. Linear Interp valeur présente (aucune interp)
             {
                 std::cout << "Checking Linear Interp at t=" << t_req << "...\n";
                 int interpmode = alconst::linear_interp;
                 OperationContext opCtx(&dataEntryCtx, "test_ids", READ_OP, alconst::slice_op, t_req, interpmode);
                 backend.beginAction(&opCtx);
-                // ... (Code similaire pour Linear, voir fichier complet)
+
+                int size_A = 0;
+                ArraystructContext ctxA(&opCtx, "A", "");
+                backend.beginArraystructAction(&ctxA, &size_A);
+
+                int size_B = 0;
+                ArraystructContext ctxB(&ctxA, "B", "time");
+                backend.beginArraystructAction(&ctxB, &size_B);
+
+                void* data_ptr = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                backend.readData(&ctxB, "sig2", "time", &data_ptr, &datatype, &dim, size);
+                double val2 = *(double*)data_ptr;
+                free(data_ptr);
+
+                std::cout << "  sig2 (linear): " << val2 << " (Expected 206.0)\n";
+                assert(std::abs(val2 - 206.0) < 1e-9);
+
+                backend.endAction(&ctxB);
+                backend.endAction(&ctxA);
                 backend.endAction(&opCtx);
             }
+
+            // 3. Lecture au TROU (t=0.5) : sig2 n'a pas de valeur à 0.5.
+            //    Avant la correction, le fallback renvoyait la slice 0 (200).
+            double t_gap = 0.5;
+
+            // 3a. Closest -> ex-aequo (0.4 et 0.6) -> index inférieur -> 204
+            {
+                std::cout << "Checking Closest at GAP t=" << t_gap << "...\n";
+                int interpmode = alconst::closest_interp;
+                OperationContext opCtx(&dataEntryCtx, "test_ids", READ_OP, alconst::slice_op, t_gap, interpmode);
+                backend.beginAction(&opCtx);
+
+                int size_A = 0;
+                ArraystructContext ctxA(&opCtx, "A", "");
+                backend.beginArraystructAction(&ctxA, &size_A);
+
+                int size_B = 0;
+                ArraystructContext ctxB(&ctxA, "B", "time");
+                backend.beginArraystructAction(&ctxB, &size_B);
+
+                void* data_ptr = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                backend.readData(&ctxB, "sig2", "time", &data_ptr, &datatype, &dim, size);
+                double val2 = *(double*)data_ptr;
+                free(data_ptr);
+
+                std::cout << "  sig2 (closest gap): " << val2 << " (Expected 204.0)\n";
+                assert(std::abs(val2 - 204.0) < 1e-9);
+
+                backend.endAction(&ctxB);
+                backend.endAction(&ctxA);
+                backend.endAction(&opCtx);
+            }
+
+            // 3b. Previous -> dernière prénente <= 0.5 = 0.4 -> 204
+            {
+                std::cout << "Checking Previous at GAP t=" << t_gap << "...\n";
+                int interpmode = alconst::previous_interp;
+                OperationContext opCtx(&dataEntryCtx, "test_ids", READ_OP, alconst::slice_op, t_gap, interpmode);
+                backend.beginAction(&opCtx);
+
+                int size_A = 0;
+                ArraystructContext ctxA(&opCtx, "A", "");
+                backend.beginArraystructAction(&ctxA, &size_A);
+
+                int size_B = 0;
+                ArraystructContext ctxB(&ctxA, "B", "time");
+                backend.beginArraystructAction(&ctxB, &size_B);
+
+                void* data_ptr = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                backend.readData(&ctxB, "sig2", "time", &data_ptr, &datatype, &dim, size);
+                double val2 = *(double*)data_ptr;
+                free(data_ptr);
+
+                std::cout << "  sig2 (previous gap): " << val2 << " (Expected 204.0)\n";
+                assert(std::abs(val2 - 204.0) < 1e-9);
+
+                backend.endAction(&ctxB);
+                backend.endAction(&ctxA);
+                backend.endAction(&opCtx);
+            }
+
+            // 3c. Linear -> entre 0.4 (204) et 0.6 (206), fact. 0.5 -> 205
+            {
+                std::cout << "Checking Linear at GAP t=" << t_gap << "...\n";
+                int interpmode = alconst::linear_interp;
+                OperationContext opCtx(&dataEntryCtx, "test_ids", READ_OP, alconst::slice_op, t_gap, interpmode);
+                backend.beginAction(&opCtx);
+
+                int size_A = 0;
+                ArraystructContext ctxA(&opCtx, "A", "");
+                backend.beginArraystructAction(&ctxA, &size_A);
+
+                int size_B = 0;
+                ArraystructContext ctxB(&ctxA, "B", "time");
+                backend.beginArraystructAction(&ctxB, &size_B);
+
+                void* data_ptr = nullptr;
+                int datatype = alconst::double_data;
+                int dim = 0;
+                int size[H5S_MAX_RANK];
+                backend.readData(&ctxB, "sig2", "time", &data_ptr, &datatype, &dim, size);
+                double val2 = *(double*)data_ptr;
+                free(data_ptr);
+
+                std::cout << "  sig2 (linear gap): " << val2 << " (Expected 205.0)\n";
+                assert(std::abs(val2 - 205.0) < 1e-9);
+
+                backend.endAction(&ctxB);
+                backend.endAction(&ctxA);
+                backend.endAction(&opCtx);
+            }
+
             backend.closePulse(&dataEntryCtx, OPEN_PULSE);
         }
         std::cout << GREEN << "[OK] Validation completed.\n" << RESET;

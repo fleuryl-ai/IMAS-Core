@@ -654,15 +654,39 @@ public:
      * @return 0 on success, -1 on failure.
      */
     int readInterpolatedData(
-                         const char* full_data_path, 
-                         double time,
-                         const std::vector<double>& time_basis,
-                         int interp_mode,
-                         int datatype,
-                         uint64_t* ndim_out,
-                         uint64_t shape_out[6],
-                         void** data_out,
-                         bool expect_time_dim = true);
+                          const char* full_data_path, 
+                          double time,
+                          const std::vector<double>& time_basis,
+                          int interp_mode,
+                          int datatype,
+                          uint64_t* ndim_out,
+                          uint64_t shape_out[6],
+                          void** data_out,
+                          bool expect_time_dim = true);
+
+    /**
+     * @brief Finds the time index of the nearest available slice for a data path.
+     *
+     * Resolves missing slices ("gaps"): if the requested index has no data,
+     * returns the closest available one according to `prefer_direction`:
+     * - -1: prefer the largest index <= requested (fall back to the smallest
+     *      index >= requested if none below exists)
+     * - +1: prefer the smallest index >= requested (fall back to the largest
+     *      index <= requested if none above exists)
+     * -  0: nearest in time (ties resolved to the smaller index)
+     *
+     * @param full_data_path Full path of the data node.
+     * @param requested_idx The requested time index.
+     * @param prefer_direction -1, +1 or 0 (see above).
+     * @param time_basis Time basis of the dynamic structure.
+     * @param requested_time The actual requested time (used for distance
+     *        computation when prefer_direction == 0).
+     * @return The available time index, or -1 if no data exists for the path.
+     */
+    int64_t nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
+                                       int64_t prefer_direction,
+                                       const std::vector<double>& time_basis,
+                                       double requested_time = -1.0) const;
 
     /**
      * @brief C-style API to read double-precision data by path and time index.
