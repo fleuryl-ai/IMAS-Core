@@ -142,7 +142,6 @@ public:
      */
     std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
     std::vector<double> time_values;
-    //std::cout << "[DEBUG getTimeValues] homogeneous_time=" << homogeneous_time << " timebasename='" << timebasename << "'" << std::endl;
 
     std::string timebasename_copy = timebasename;
     if (!timebasename_copy.empty() && timebasename_copy[0] == '/') {
@@ -156,23 +155,18 @@ public:
             return time_values_cache["HOMOGENEOUS_TIME"];
         }
         time_values = panzer_db_ptr->getWholeDynamicSignal("time");
-        //std::cout << "[DEBUG getTimeValues] getWholeDynamicSignal('time') returned size: " << time_values.size() << std::endl;
         time_values_cache["HOMOGENEOUS_TIME"] = time_values;
         return time_values;
     }
 
     // --- Logic for homogeneous_time == 0 ---
-    //std::cout << "[DEBUG getTimeValues] Searching for time values in dynamic AoS context." << std::endl;
     if (ctx == nullptr) {
-        //std::cout << "[DEBUG getTimeValues] ctx is nullptr" << std::endl;
         return time_values; // Return empty vector
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
     if (!arrCtx) { // Case where context is OperationContext
-        //std::cout << "[DEBUG getTimeValues] ctx is not ArraystructContext, trying fallback to root time" << std::endl;
         time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback for root time
-        //printf("[DEBUG getTimeValues] Fallback getWholeDynamicSignal('time') returned size: %zu\n", time_values.size());
         return time_values;
     }
 
@@ -185,7 +179,6 @@ public:
     // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
     // In this case, the time vector is also static relative to the current context.
     if (!timed_ctx) {
-        //std::cout << "[DEBUG getTimeValues] No timed parent context found." << std::endl;
         if (!timebasename_copy.empty()) {
             // For homogeneous_time=0, the timebase can be relative to the static AoS element,
             // or fall back to a common timebase at the root of the IDS.
@@ -203,7 +196,6 @@ public:
             }
             return time_values;
         }
-        //printf("[DEBUG getTimeValues] No timed parent context and no static timebase found. Returning empty time vector.\n");
         return {}; // No timebase found
     }
 
@@ -225,7 +217,6 @@ public:
     if (time_values_cache.count(cache_key)) {
         return time_values_cache[cache_key];
     }
-    //std::cout << "[DEBUG getTimeValues] Searching for timebase leaves with AoS path '" << timed_aos_path << "' and timebase basename '" << timebase_basename << "'" << std::endl;
 
     auto leaves = panzer_db_ptr->getLeaves();
 
@@ -284,10 +275,8 @@ public:
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
             time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
-            //std::cout << "[DEBUG getTimeValues] Read " << temp_data.size() << " time values from leaf with time_index=" << time_idx << ". Total time values: " << time_values.size() << std::endl;
         }
     }
-    //printf("[DEBUG getTimeValues] Final time values size: %zu\n", time_values.size());
     time_values_cache[cache_key] = time_values;
     return time_values;
 }

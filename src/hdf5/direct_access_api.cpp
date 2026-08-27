@@ -20,7 +20,7 @@
 namespace imas {
 namespace direct_access {
 
-// Déclarations anticipées
+// Forward declarations
 void collect_leaf_paths_recursive(PanzerDB& db, const std::vector<PathSegment>& segments, size_t segment_idx, std::string current_real_path, std::string current_schema_path, int64_t current_time_index, std::vector<std::pair<std::string, int64_t>>& leaf_paths, std::vector<size_t>& selection_dims, const std::map<std::string, NodeType>& aos_paths, const std::map<std::string, size_t>& aos_sizes);
 TensorView read_tensor_impl_core(PanzerDB& db, const std::vector<PathSegment>& segments, const std::map<std::string, NodeType>& aos_paths, const std::map<std::string, size_t>& aos_sizes);
 
@@ -207,13 +207,13 @@ void collect_leaf_paths_recursive(
 
     bool is_dyn_aos = (aos_paths.at(new_schema_path) == NodeType::AOS_DYNAMIC);
 
-    // Règle : l'index est passé via le paramètre `time_index` SEULEMENT si l'AoS est dynamique
-    // ET que le segment suivant est la feuille de données finale. Sinon, l'index est intégré au chemin.
+    // Rule: the index is passed via the `time_index` parameter ONLY if the AoS is dynamic
+    // AND the next segment is the final data node. Otherwise, the index is part of the path.
     bool pass_index_as_time_param = is_dyn_aos && (segment_idx + 1 == segments.size() - 1);
 
     size_t aos_size = aos_sizes.count(new_schema_path) ? aos_sizes.at(new_schema_path) : 0;
 
-    // Déterminer les bornes de la boucle
+    // Determine the loop bounds
     size_t start = 0, end = 0;
     bool loop = false;
 
@@ -233,7 +233,7 @@ void collect_leaf_paths_recursive(
             end = seg.has_end_time ? interpolator.getSlicesTimesIndices(seg.end_time, time_values, times_indices, CLOSEST_INTERP) + 1 : aos_size;
             if (selection_dims.size() <= segment_idx) selection_dims.push_back(end - start);
         }
-    } else if (segment_idx < segments.size() - 1) { // Pas de sélection, mais ce n'est pas la fin du chemin
+    } else if (segment_idx < segments.size() - 1) { // no selection, but not the end of the path
         loop = true;
         start = 0; end = aos_size;
         if (selection_dims.size() <= segment_idx) selection_dims.push_back(aos_size);

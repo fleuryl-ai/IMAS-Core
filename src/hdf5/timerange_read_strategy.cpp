@@ -11,7 +11,6 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
 
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
       ArraystructContext* arrctx = static_cast<ArraystructContext*>(ctx);
-      //printf("Synchronizing PanzerDB index for AoS path: %s, to index: %d\n", arrctx->getPath().c_str(), arrctx->getIndex());
       if (panzer_db_ptr) panzer_db_ptr->setCurrentArrayIndex(arrctx->getIndex());
     }
 
@@ -59,8 +58,6 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
         std::string aos_path_token = getPath(ctx, false);
         auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);
         *size = shapes.empty() ? 0 : shapes[0]; 
-        //printf("-->Preparing AOS: %s\n", aos_path_token.c_str());
-        //printf("size = %d\n", *size);
     }
     
 }
@@ -69,8 +66,6 @@ void TimeRangeReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump leaf cache for debugging
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
     }
   else{

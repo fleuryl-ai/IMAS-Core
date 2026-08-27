@@ -118,8 +118,7 @@ int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::st
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
   std::replace(dataset_name_copy.begin(), dataset_name_copy.end(), '/', '&');
-  //printf("--> HDF5Reader_v2::read_ND_Data called for dataset: %s\n", dataset_name_copy.c_str());
-  
+
   int status = read_strategy->read_ND_Data(ctx, dataset_name_copy, timebasename_copy, datatype, data, dim, size);
 
   return status;

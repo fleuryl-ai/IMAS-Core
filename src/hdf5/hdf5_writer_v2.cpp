@@ -10,10 +10,6 @@
 
 #include "hdf5_utils.h"
 
-/* ----------------------------------------------------------------------
- *  Debug macro  define DEBUG_HDF5_WRITER in the build system to enable
- *  the trace.  When undefined the macro expands to a no-op (zero cost).
- * ---------------------------------------------------------------------- */
 
 #ifdef DEBUG_HDF5_WRITER_V2
 #define DEBUG_PRINT(msg)                                                       \
@@ -31,8 +27,6 @@ using namespace boost::filesystem;
 HDF5Writer_v2::HDF5Writer_v2(std::pair<int,int> backend_version_)
     : HDF5Writer(backend_version_)
        {
-  // H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-
 }
 
 HDF5Writer_v2::~HDF5Writer_v2() {}
@@ -87,8 +81,6 @@ void HDF5Writer_v2::beginWriteArraystructAction(ArraystructContext *ctx,
   }
 
   if (*size == 0 ) {
-      //printf("[DEBUG beginArray] No data for array of structure '%s', skipping beginArray()\n", 
-      //       ctx->getPath().c_str());
       return;
   }
 
@@ -138,8 +130,6 @@ void HDF5Writer_v2::beginWriteArraystructAction(ArraystructContext *ctx,
       
       // Synchronize PanzerDB with the parent's state
       if (!aos_names.empty()) {
-          //printf("[DEBUG beginArray] Synchronizing parent hierarchy before creating '%s'\n", 
-          //       ctx->getPath().c_str());
           panzer_db_ptr->synchronizeArrayStack(aos_names, indices);
       }
   }
@@ -165,12 +155,8 @@ void HDF5Writer_v2::beginWriteArraystructAction(ArraystructContext *ctx,
   
   // Use the correct overload depending on the AOS type
   if (ctx->getTimed() && !ctx->getTimebasePath().empty()) {
-      //printf("[DEBUG beginArray] Creating DYNAMIC AoS: '%s' with timebase '%s'\n",
-      //       aos_name.c_str(), ctx->getTimebasePath().c_str());
       panzer_db_ptr->beginArray(aos_name, ctx->getTimebasePath());
   } else {
-      //printf("[DEBUG beginArray] Creating STATIC AoS: '%s' with size %d\n",
-      //       aos_name.c_str(), *size);
         panzer_db_ptr->beginArray(aos_name, static_cast<size_t>(*size));
   }
 
@@ -194,8 +180,6 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
                                int dim, int *size, void *data) {
 
   bool is_metadata = dataset_name.find('@') != std::string::npos;
-  //printf("[DEBUG write_ND_Data] Called with dataset_name='%s', timebasename='%s', datatype=%d, dim=%d, is_metadata=%s\n",
-  //       dataset_name.c_str(), timebasename.c_str(), datatype, dim, is_metadata ? "true" : "false");
 
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
@@ -584,29 +568,17 @@ void HDF5Writer_v2::endAction(Context *ctx) {
     // For empty AOS, we rely on the fact that:
     // 1. beginArray() has already created the meta-node with the correct size
     // 2. Empty indices do not need entries in the index
-    //printf("HDF5Writer_v2::endAction called for ArraystructContext, calling endArray()\n");
-    //if (panzer_db_ptr) {
-        //panzer_db_ptr->endArray();
-    //}
 
     ArraystructContext* arrCtx = static_cast<ArraystructContext*>(ctx);
-    
-    // Only close if we opened it
+
+    // Only close an AoS we actually opened (tracked in initialized_aos).
     if (initialized_aos.count(arrCtx) > 0) {
-        //printf("[DEBUG endAction] Closing AoS '%s'\n", arrCtx->getPath().c_str());
         if (panzer_db_ptr) panzer_db_ptr->endArray();
         initialized_aos.erase(arrCtx);
-    } else {
-        //printf("[DEBUG endAction] Skipping endArray() for AoS '%s' (was not initialized)\n", 
-        //       arrCtx->getPath().c_str());
     }
-    
-    
   } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-    //printf("HDF5Writer_v2::endAction called for OperationContext, calling flush()\n");
 
     if (panzer_db_ptr) panzer_db_ptr->flush();
-    //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache();
     if (panzer_db_ptr) panzer_db_ptr->close();
   }
 }

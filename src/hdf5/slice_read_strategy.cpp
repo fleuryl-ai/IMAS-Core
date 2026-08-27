@@ -34,7 +34,6 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
             timebase_path += "time";
         }
         slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
-        //printf("SliceReadStrategy::beginReadArraystructAction: slice_idx=%lld for timebase_path='%s' and requested_time=%f\n", slice_idx, timebase_path.c_str(), opCtx->getTime());
     }
 
     std::string path_container = getPath(ctx, false, slice_idx);
@@ -72,8 +71,6 @@ void SliceReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump du cache de feuilles pour le debug
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
     }
   else{
@@ -91,18 +88,14 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         return status;  
      }                                  
 
-    //printf("SliceReadStrategy::read_ND_Data called for dataset '%s' with timebasename='%s' and homogeneous_time=%d\n", 
-    //       dataset_name.c_str(), timebasename.c_str(), homogeneous_time);
     std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
 
     double time;
     int interp;
-    std::string aos_path = "";
 
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE){
         time  = dynamic_cast<ArraystructContext*>(ctx)->getOperationContext()->getTime();
         interp = dynamic_cast<ArraystructContext*>(ctx)->getOperationContext()->getInterpmode();
-        aos_path = getPath(dynamic_cast<ArraystructContext*>(ctx));
     } 
     else if (ctx->getType() == CTX_OPERATION_TYPE){
         time  = dynamic_cast<OperationContext*>(ctx)->getTime();
@@ -115,27 +108,15 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
 
     std::vector<uint64_t> indices(ctx_indices.begin(), ctx_indices.end());
 
-    // Extracting the root name (e.g., "A" from "A/0/B")
-    std::string root_name = aos_path;
-    size_t pos = aos_path.find('/');
-    if (pos != std::string::npos) {
-        root_name = aos_path.substr(0, pos);
-    }
-
     uint64_t ndim_out = 0;
     uint64_t shape_out[6] = {0};
     void* data_out = nullptr;
 
-    //const char* full_path = "A/0/B/0/C/0/D/0/tensor";
     std::string full_path = buildFullPath(ctx, dataset_name);
     const char* c_full_path = full_path.c_str();
 
-    // --- METADATA HANDLING ---
-    // Try to read metadata for this path
-    std::map<std::string, std::string> meta = panzer_db_ptr->readMetadata(full_path);
-    if (!meta.empty()) {
-        // printf("[SliceReadStrategy] Loaded %zu metadata entries for %s\n", meta.size(), c_full_path);
-    }
+    // Read the node's metadata (also marks it processed to avoid re-reading it later).
+    panzer_db_ptr->readMetadata(full_path);
 
     int res = panzer_db_ptr->readInterpolatedData(
         c_full_path,
@@ -149,8 +130,6 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         !isTimedContext(ctx) // expect_time_dim
     );
 
-    //printf("ndim_out = %llu\n", ndim_out);
-
     if (res == 0) {
         *data = data_out;
         *dim = ndim_out;
@@ -160,23 +139,16 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
 
         // AL Convention: For a time-dependent N-D array (N>0), a slice should be returned as an (N+1)-D array
         // with the last dimension of size 1. For a time-dependent scalar (N=0), the behavior is ambiguous.
-        // Heuristic: A scalar signal defined at the root or in a static AoS gets its dimension promoted when sliced,
-        // but a scalar signal defined inside a dynamic AoS remains a scalar when sliced.
+        // Heuristic: a scalar signal defined at the root or in a static AoS gets its dimension promoted when
+        // sliced, but a scalar signal defined inside a dynamic AoS remains a scalar when sliced.
         bool is_dynamic = !timebasename.empty() || isTimedContext(ctx);
-        //printf("[SliceReadStrategy] read_ND_Data: is_dynamic=%d, dataset='%s', timebasename='%s', root_name='%s', expected_time_dim=%d\n", 
-        //       is_dynamic, dataset_name.c_str(), timebasename.c_str(), root_name.c_str(), !isTimedContext(ctx));
         if (is_dynamic && *datatype != alconst::char_data) {
             if (!isTimedContext(ctx)) {
                  size[*dim] = 1;
                  (*dim)++;
             }
         }
-        //printf("[SliceReadStrategy] read_ND_Data succeeded for dataset '%s' with time interpolation at t=%f\n", 
-        //       dataset_name.c_str(), time);
-        //printf(dim != nullptr ? "dim = %d\n" : "dim is nullptr\n", *dim);
         return 1;
     }
-    //printf("[SliceReadStrategy] read_ND_Data failed for dataset '%s' with time interpolation at t=%f\n", 
-    //       dataset_name.c_str(), time);
     return 0;
 }

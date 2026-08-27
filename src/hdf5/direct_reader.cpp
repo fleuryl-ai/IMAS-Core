@@ -44,7 +44,7 @@ TensorView DirectReader::read(const std::vector<PathSegment>& segments) {
     if (!time_slice_segment) throw std::runtime_error("Only time-sliced reads are supported for this implementation.");
     if (!static_aos_segment) throw std::runtime_error("Reading a full static AoS is required for this implementation.");
 
-    // 2. Déterminer les dimensions
+    // 2. Determine the dimensions
     size_t time_aos_size = panzer_db.getDynamicAOSSize("profiles_1d");
     int64_t start_idx = time_slice_segment->has_start ? time_slice_segment->start_index : 0;
     int64_t end_idx = time_slice_segment->has_end ? time_slice_segment->end_index : time_aos_size;

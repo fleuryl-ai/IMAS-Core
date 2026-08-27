@@ -124,13 +124,13 @@ void PanzerDB::init(OpenMode mode) {
 
                     if (group_id >= 0) {
                         if (H5Lexists(group_id, "index", H5P_DEFAULT) > 0) {
-                            // On a trouvé le bon groupe !
+                            // Found the right group (the one holding the index).
                             if (should_close_loc_id) {
                                 if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
                                 else H5Gclose(file_id);
                             }
-                            file_id = group_id; // On utilise maintenant ce groupe comme racine
-                            should_close_loc_id = true; // On s'assure que ce nouveau handle sera fermé
+                            file_id = group_id; // Use this group as the new root
+                            should_close_loc_id = true; // Ensure this new handle will be closed
                             break; 
                         }
                         H5Gclose(group_id);
@@ -141,9 +141,9 @@ void PanzerDB::init(OpenMode mode) {
     }
     // --- FIN DU PATCH ---
 
-    std::string usage_hint = "time_series";  // Défaut
+    std::string usage_hint = "time_series";  // default
     if (mode == OpenMode::READ) {
-        usage_hint = "interactive";  // Mode lecture privilégie accès rapide
+        usage_hint = "interactive";  // read mode favors fast access
     }
 
     configureChunking(usage_hint);
@@ -219,7 +219,7 @@ void PanzerDB::init(OpenMode mode) {
                                                    chunk_config.path_chunk_entries, true, dapl);
         H5Tclose(str_type);
         
-        // Buffers optimisés
+        // Optimized buffers
         index_buffer.reserve(chunk_config.index_chunk_rows * 14);
         data_buffer_f64.reserve(chunk_config.data_chunk_f64);
         data_buffer_i32.reserve(chunk_config.data_chunk_i32);
@@ -246,7 +246,7 @@ void PanzerDB::init(OpenMode mode) {
         readChunkingConfig();
         updateDiskSizes();
         
-        // Buffers optimisés
+        // Optimized buffers
         index_buffer.reserve(chunk_config.index_chunk_rows * 14);
         data_buffer_f64.reserve(chunk_config.data_chunk_f64);
         data_buffer_i32.reserve(chunk_config.data_chunk_i32);
@@ -300,7 +300,7 @@ void PanzerDB::updateDiskSizes() {
 }
 
 // ============================================================================
-// 5. LECTURE DE LA CONFIGURATION DE CHUNKING
+// READING THE PERSISTED CHUNKING CONFIGURATION
 // ============================================================================
 
 void PanzerDB::readChunkingConfig() {
@@ -318,7 +318,7 @@ void PanzerDB::readChunkingConfig() {
         H5Pget_chunk(dcpl, 1, chunk_dims);
         chunk_config.data_chunk_f64 = chunk_dims[0];
         
-        // Vérifier si compression est active
+        // Check whether compression is active
         if (H5Pget_nfilters(dcpl) > 0) {
             chunk_config.enable_compression = true;
         }
@@ -332,12 +332,12 @@ void PanzerDB::readChunkingConfig() {
 }
 
 // ============================================================================
-// 6. CONFIGURATION DU CACHE DE LECTURE
+// CONFIGURING THE READ (CHUNK) CACHE
 // ============================================================================
 
 void PanzerDB::configureReadCache() {
     // Configurer le cache HDF5 pour optimiser les lectures via DAPL (Dataset Access Property List)
-    // Cela permet d'appliquer le cache sur les datasets déjà ouverts ou à ouvrir.
+    // This applies the cache to datasets already open or about to be opened.
 
     hid_t dapl = H5Pcreate(H5P_DATASET_ACCESS);
     if (dapl < 0) {
@@ -355,7 +355,7 @@ void PanzerDB::configureReadCache() {
         return;
     }
     
-    // Fonction helper pour réouvrir un dataset avec le nouveau DAPL
+    // Helper to reopen a dataset with the new DAPL
     auto reopen_dataset = [&](hid_t& dset_id, const char* name) {
         if (dset_id >= 0) {
             H5Dclose(dset_id);
@@ -383,29 +383,29 @@ void PanzerDB::configureReadCache() {
 }
 
 // ============================================================================
-// 2. DÉTECTION AUTOMATIQUE DU PATTERN D'USAGE
+// AUTOMATIC USAGE-PATTERN DETECTION
 // ============================================================================
 
 void PanzerDB::configureChunking(const std::string& usage_hint) {
     // Patterns d'usage typiques:
-    // - "time_series": Beaucoup d'écritures séquentielles, lectures par slice temporel
-    // - "array_of_structures": Beaucoup d'AoS imbriqués, accès par structure
-    // - "bulk_write": Écriture massive unique, lecture rare
-    // - "interactive": Lectures/écritures fréquentes et petites
+    // - "time_series": many sequential writes, time-slice reads
+    // - "array_of_structures": many nested AoS, structure-based access
+    // - "bulk_write": single massive write, rare reads
+    // - "interactive": frequent, small reads/writes
     
     if (usage_hint == "time_series") {
-        // Optimisé pour écriture séquentielle et lecture par slice temporel
-        chunk_config.index_chunk_rows = 4096;      // Plus petit pour meilleur accès
+        // Optimized for sequential writes and time-slice reads
+        chunk_config.index_chunk_rows = 4096;      // smaller chunks for better access
         chunk_config.data_chunk_f64 = 65536;       // 512 KB par chunk
         chunk_config.data_chunk_i32 = 131072;      // 512 KB par chunk
         chunk_config.data_chunk_c128 = 32768;      // 512 KB par chunk (16 bytes/elem)
         chunk_config.data_chunk_str = 8192;        // ~64-128 KB (pointeurs)
         chunk_config.path_chunk_entries = 4096;    // ~1 MB (256 bytes/entry)
         chunk_config.enable_compression = true;
-        chunk_config.compression_level = 1;        // Compression légère
+        chunk_config.compression_level = 1;        // light compression
         
     } else if (usage_hint == "array_of_structures") {
-        // Optimisé pour AoS avec beaucoup de petites structures
+        // Optimized for AoS with many small structures
         chunk_config.index_chunk_rows = 16384;     // Plus gros index chunks
         chunk_config.data_chunk_f64 = 32768;       // Plus petits data chunks
         chunk_config.data_chunk_i32 = 65536;
@@ -416,18 +416,18 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.compression_level = 1;
         
     } else if (usage_hint == "bulk_write") {
-        // Optimisé pour écriture massive
-        chunk_config.index_chunk_rows = 32768;     // Très gros chunks
+        // Optimized for massive single writes
+        chunk_config.index_chunk_rows = 32768;     // very large chunks
         chunk_config.data_chunk_f64 = 524288;      // 4 MB par chunk
         chunk_config.data_chunk_i32 = 1048576;     // 4 MB par chunk
         chunk_config.data_chunk_c128 = 262144;     // 4 MB par chunk
         chunk_config.data_chunk_str = 65536;
         chunk_config.path_chunk_entries = 16384;   // ~4 MB
         chunk_config.enable_compression = true;
-        chunk_config.compression_level = 1;        // Compression légère (vitesse)
+        chunk_config.compression_level = 1;        // light compression (speed)
         
     } else if (usage_hint == "interactive") {
-        // Optimisé pour accès fréquents et petits
+        // Optimized for frequent, small accesses
         chunk_config.index_chunk_rows = 1024;      // Petits chunks
         chunk_config.data_chunk_f64 = 8192;        // 64 KB par chunk
         chunk_config.data_chunk_i32 = 16384;       // 64 KB par chunk
@@ -437,7 +437,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.enable_compression = false;   // Pas de compression
         
     } else {
-        // Configuration par défaut (équilibrée)
+        // Default configuration (balanced)
         chunk_config.index_chunk_rows = 8192;
         chunk_config.data_chunk_f64 = 131072;
         chunk_config.data_chunk_i32 = 262144;
@@ -457,7 +457,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
 }
 
 // ============================================================================
-// 3. CRÉATION OPTIMISÉE DES DATASETS
+// OPTIMIZED DATASET CREATION
 // ============================================================================
 
 hid_t PanzerDB::createOptimizedDataset(const std::string& name,
@@ -465,12 +465,12 @@ hid_t PanzerDB::createOptimizedDataset(const std::string& name,
                                         size_t chunk_size,
                                         bool enable_compression,
                                         hid_t dapl) {
-    // Créer le dataspace (1D, extensible)
+    // Create the dataspace (1-D, extensible)
     hsize_t dims[1] = {0};
     hsize_t maxdims[1] = {H5S_UNLIMITED};
     hid_t space = H5Screate_simple(1, dims, maxdims);
     
-    // Créer et configurer le property list
+    // Create and configure the property list
     hid_t plist = H5Pcreate(H5P_DATASET_CREATE);
     
     // OPTIMISATION 1: Chunking
@@ -481,14 +481,14 @@ hid_t PanzerDB::createOptimizedDataset(const std::string& name,
     if (enable_compression && chunk_config.enable_compression) {
         H5Pset_deflate(plist, chunk_config.compression_level);
         
-        // Shuffle filter (améliore compression pour données numériques)
+        // Shuffle filter (improves compression of numeric data)
         H5T_class_t type_class = H5Tget_class(type);
         if (type_class == H5T_INTEGER || type_class == H5T_FLOAT || type_class == H5T_ARRAY) {
             H5Pset_shuffle(plist);
         }
     }
     
-    // OPTIMISATION 3: Fillvalue (évite initialisation coûteuse)
+    // OPTIMIZATION 3: fill value (avoids costly initialization)
     if (H5Tget_class(type) == H5T_STRING && H5Tis_variable_str(type) > 0) {
         // For variable-length strings, it's mandatory to set a fill value.
         // Setting it to NULL is the standard way to indicate no fill.
@@ -498,10 +498,10 @@ hid_t PanzerDB::createOptimizedDataset(const std::string& name,
         H5Pset_fill_time(plist, H5D_FILL_TIME_NEVER);
     }
     // OPTIMISATION 4: Allocation strategy
-    // Allouer l'espace progressivement plutôt que tout d'un coup
+    // Allocate space progressively rather than all at once
     H5Pset_alloc_time(plist, H5D_ALLOC_TIME_INCR);
     
-    // Créer le dataset
+    // Create the dataset
     hid_t dset = H5Dcreate2(file_id, name.c_str(), type, space, 
                             H5P_DEFAULT, plist, dapl);
     
@@ -513,7 +513,7 @@ hid_t PanzerDB::createOptimizedDataset(const std::string& name,
 }
 
 // ============================================================================
-// 7. API PUBLIQUE POUR CONFIGURATION
+// PUBLIC CONFIGURATION API
 // ============================================================================
 
 void PanzerDB::setChunkingHint(const std::string& hint) {
@@ -538,7 +538,7 @@ void PanzerDB::disableCompression() {
 
 
 // ============================================================================
-// 8. STATISTIQUES DE CHUNKING
+// CHUNKING STATISTICS
 // ============================================================================
 
 ChunkingStats PanzerDB::getChunkingStats() const {
@@ -561,9 +561,9 @@ ChunkingStats PanzerDB::getChunkingStats() const {
         stats.total_chunks_written = (dims[0] + chunk_dims[0] - 1) / chunk_dims[0];
         stats.total_bytes_written = dims[0] * sizeof(double);
         
-        // Taille compressée (approximation)
+        // Compressed size (approximation)
         if (chunk_config.enable_compression) {
-            // Ratio typique pour données numériques avec gzip
+            // Typical ratio for numeric data with gzip
             stats.compression_ratio = 40;  // 40% de la taille originale
         }
     }
@@ -589,16 +589,16 @@ void PanzerDB::printChunkingStats() const {
     std::cout << "====================================\n" << std::endl;
 }
 
-// Construction optimisée du path_prefix depuis le stack
+// Optimized construction of path_prefix from the stack
 std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_vector) const {
     if (stack_vector.empty()) return "";
     
-    // OPTIMISATION 1: Pré-calculer la taille totale pour une seule allocation
+    // OPTIMIZATION 1: precompute the total size for a single allocation
     size_t total_size = 0;
     for (size_t i = 0; i < stack_vector.size(); ++i) {
         total_size += stack_vector[i].name.length();
         if (i > 0) {
-            // Longueur max d'un uint64_t en décimal = 20 caractères
+            // max length of a uint64_t in decimal = 20 characters
             total_size += 20;  // Pour l'index (ex: "/12345")
         }
         total_size += 1;  // Pour le '/'
@@ -608,12 +608,12 @@ std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_ve
     std::string result;
     result.reserve(total_size + 10); // +10 de marge
     
-    // OPTIMISATION 3: Construction sans réallocation
+    // OPTIMIZATION 3: build without reallocation
     for (size_t i = 0; i < stack_vector.size(); ++i) {
         if (i > 0) {
-            // Ajouter l'index du niveau précédent
+            // Append the previous level's index
             result += '/';
-            // Utiliser to_string qui est optimisé
+            // use to_string, which is optimized
             result += std::to_string(stack_vector[i-1].current_index);
         }
         if (!result.empty()) {
@@ -847,9 +847,8 @@ void PanzerDB::flush() {
         H5Sclose(filespace);
     }
 
-    // OPTIMISATION: Ne pas forcer le flush disque à chaque appel.
-    // Cela permet à l'OS et à HDF5 d'optimiser les écritures en cache.
-    // H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+    // OPTIMIZATION: do not force a disk flush on every call.
+    // Let the OS and HDF5 coalesce writes in their caches.
     
     index_buffer.clear();
     data_buffer_f64.clear();
@@ -883,7 +882,7 @@ void PanzerDB::close() {
 }
 
 
-// 2. LECTURE DIRECTE VIA HYPERSLAB (sans buffer intermédiaire)
+// DIRECT HYPERSLAB READ (no intermediate buffer)
 // ============================================================================
 
 template<typename T>
@@ -891,7 +890,7 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
                                int64_t time_index,
                                T* out_buffer) const {
     
-    // Volume d'une slice temporelle (re-calculé depuis leaf.shape : déjà en mémoire)
+    // Volume of one time slice (recomputed from leaf.shape: already in memory)
     uint64_t slice_volume = 1;
     for (size_t s : leaf.shape) {
         if (s > 0) slice_volume *= s;
@@ -900,7 +899,7 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
 
     uint64_t local_step = time_index - leaf.time_index;
     
-    // Déterminer le dataset et type appropriés
+    // Determine the appropriate raw dataset and HDF5 type
     hid_t dset_id = -1;
     hid_t mem_type = -1;
     
@@ -919,18 +918,18 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
         return -1;
     }
     
-    // OPTIMISATION CLÉE: Lecture directe du slice via hyperslab
+    // KEY OPTIMIZATION: read the slice directly via a hyperslab
     // Au lieu de lire tout le chunk puis copier
     
     hid_t file_space = H5Dget_space(dset_id);
     
-    // Sélectionner exactement le slice voulu
+    // Select exactly the desired slice
     hsize_t offset[1] = {leaf.offset + local_step * slice_volume};
     hsize_t count[1] = {slice_volume};
     
     H5Sselect_hyperslab(file_space, H5S_SELECT_SET, offset, NULL, count, NULL);
     
-    // Créer memspace pour la sortie
+    // Create the output memory space
     hid_t mem_space = H5Screate_simple(1, count, NULL);
     
     // Lecture DIRECTE dans le buffer de sortie (pas de copie!)
@@ -1065,9 +1064,7 @@ void PanzerDB::beginArray(const std::string& name, size_t size) {
     level.saved_path_prefix = path_prefix;
     level.declared_size = size;
     
-    //printf("[DEBUG beginArray BEFORE] array_stack.size() = %zu\n", array_stack.size());
     beginArray(level);
-    //printf("[DEBUG beginArray AFTER] array_stack.size() = %zu\n", array_stack.size());
 
     invalidateDynamicAOSCache();
 }
@@ -1236,7 +1233,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     for (uint64_t i = 0; i < read_count; ++i) {
         const uint64_t* row = &idx[i * 14];
 
-        // OPTIMISATION: Construction en place pour éviter la copie de 'leaf' et de son vecteur 'shape'
+        // OPTIMIZATION: build in place to avoid copying 'leaf' and its 'shape' vector
         cached_leaves.emplace_back();
         Leaf& leaf = cached_leaves.back();
 
@@ -1348,18 +1345,7 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
     // Check validity and attempt recovery if needed
     H5I_type_t id_type = H5Iget_type(data_dset_str);
     if (id_type != H5I_DATASET) {
-        /*std::cerr << "[PanzerDB] WARNING: data_dset_str (" << data_dset_str << ") is invalid (Type: " << id_type << "). Attempting to reopen..." << std::endl;
-        
-        if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) {
-            data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
-            if (data_dset_str < 0) {
-                 throw std::runtime_error("Failed to recover data_dset_str");
-            }
-            std::cerr << "[PanzerDB] Successfully reopened data_dset_str: " << data_dset_str << std::endl;
-        } else {
-            throw std::runtime_error("Dataset for string type is not open and does not exist in file");
-        }*/
-         throw ALBackendException("Dataset for string type is not open", LOG);
+        throw ALBackendException("Dataset for string type is not open", LOG);
     }
     
     hid_t dset_id = data_dset_str;
@@ -1382,13 +1368,8 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
 
     herr_t status = H5Dread(dset_id, str_type_vl, memspace, space, H5P_DEFAULT, rdata);
     if (status < 0) {
-        //std::cerr << "[PanzerDB] Error: H5Dread failed for string tensor at offset " << leaf.offset << " count " << leaf.count << std::endl;
-        //H5Eprint2(H5E_DEFAULT, stderr);
         throw ALBackendException("H5Dread failed for string tensor", LOG);
     }
-    /*else{
-        printf("[PanzerDB] Successfully read string tensor: offset = %llu, count = %llu\n", leaf.offset, leaf.count);
-    } */ 
 
     for (size_t i = 0; i < hcount; ++i) {
         if (rdata[i] != nullptr) {
@@ -1429,10 +1410,10 @@ void PanzerDB::writeDataImpl(const std::string& name,
         array_stack.back().actual_count++;
     }
 
-    // OPTIMISATION 1: Construire parent_path de manière optimisée
+    // OPTIMIZATION 1: build parent_path efficiently
     std::string parent_path;
     if (!array_stack.empty()) {
-        // Pré-calculer taille nécessaire
+        // precompute the required size
         size_t estimated_size = path_prefix.length() + 25; // +25 pour "/12345"
         parent_path.reserve(estimated_size);
         
@@ -1443,7 +1424,7 @@ void PanzerDB::writeDataImpl(const std::string& name,
         parent_path = path_prefix;
     }
 
-    // OPTIMISATION 2: Construire full_path avec réservation
+    // OPTIMIZATION 2: build full_path with reserved capacity
     std::string full_path;
     full_path.reserve(parent_path.length() + name.length() + 1);
     
@@ -1475,7 +1456,7 @@ void PanzerDB::writeDataImpl(const std::string& name,
     append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags);
 }
 
-// 6. PATH PARSING OPTIMISÉ (pour substitution dans pz_readData_by_index)
+// OPTIMIZED PATH PARSING (for substitution in pz_readData_by_index)
 // ============================================================================
 
 
@@ -1488,7 +1469,7 @@ PathComponents PanzerDB::parsePath(const std::string& path,
         return result;
     }
     
-    // Vérifier que path commence par aos_path + "/"
+    // check that path starts with aos_path + '/'
     std::string expected_prefix = aos_path + "/";
     if (path.rfind(expected_prefix, 0) != 0) {
         return result;
@@ -1550,7 +1531,7 @@ template<>
 void PanzerDB::writeData<char>(const std::string& name,
                          const std::vector<size_t>& shape,
                          const char* data,  // ✅ Simple pointer to buffer
-                         size_t count,      // count devrait être == shape[0]
+                         size_t count,      // count should be == shape[0]
                          const std::string& timebase) {
     if (!timebase.empty()) {
         throw std::runtime_error("writeData with timebase not allowed, use writeDataSlices");
@@ -1605,8 +1586,6 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
                                     DataType dtype,
                                     hid_t dataset_id,
                                     std::vector<T>& buffer) {
-    //if (timebase.empty()) throw std::runtime_error("timebase required");
-
     std::string dynamic_aos_path = getDynamicAOSPath();
 
     // ✅ Construct data path to serve as time key
@@ -1748,8 +1727,6 @@ void PanzerDB::writeDataSlices(const std::string& name,
                                const std::vector<size_t>& base_shape,
                                const char* const* data, size_t n_slices,
                                const std::string& timebase) {
-    //if (timebase.empty()) throw std::runtime_error("timebase required");
-                                
     std::string dynamic_aos_path = getDynamicAOSPath();
 
     // Auto-sync (same code as others)
@@ -1850,7 +1827,7 @@ void PanzerDB::setCurrentArrayIndex(size_t new_index) {
     }
 }
 
-// 3. APPEND_INDEX_ROW: ÉVITER COPIES DE STRINGS
+// APPEND_INDEX_ROW: AVOID STRING COPIES
 // ============================================================================
 
 void PanzerDB::append_index_row(const std::string& full_path, 
@@ -1862,7 +1839,7 @@ void PanzerDB::append_index_row(const std::string& full_path,
                                 uint64_t count, 
                                 uint64_t flags) {
     
-    // OPTIMISATION 1: Pré-allouer exactement ce qu'il faut
+    // OPTIMIZATION 1: preallocate exactly what is needed
     size_t required_paths = paths_buffer.size() + PATH_MAX_LEN;
     if (paths_buffer.capacity() < required_paths) {
         size_t new_cap = std::max(required_paths, paths_buffer.capacity() * BUFFER_GROWTH_FACTOR);
@@ -1879,7 +1856,7 @@ void PanzerDB::append_index_row(const std::string& full_path,
     size_t current_path_size = paths_buffer.size();
     paths_buffer.resize(current_path_size + PATH_MAX_LEN, 0);
     
-    // Copie optimisée (strncpy est rapide pour buffers fixes)
+    // optimized copy (strncpy is fast for fixed-size buffers)
     strncpy(paths_buffer.data() + current_path_size, 
             full_path.c_str(), 
             PATH_MAX_LEN - 1);
@@ -1891,7 +1868,7 @@ void PanzerDB::append_index_row(const std::string& full_path,
             parent_path.c_str(), 
             PATH_MAX_LEN - 1);
     
-    // Construction de la row (inchangé)
+    // build the row (unchanged layout)
     uint64_t row[14] = {0};
     row[0] = type;
     row[1] = shape.size();
@@ -1950,7 +1927,6 @@ void PanzerDB::dumpLeavesCache() const {
 
 void PanzerDB::endArray() {
    if (current_path.empty() || array_stack.empty()) {
-        //printf("[WARN endArray] Stack is empty, ignoring endArray() call\n");
         return;
     }
 
@@ -1983,7 +1959,6 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
   // 1. Find root AoS meta-node
   const Leaf *aos_root_leaf = nullptr;
 
-  //printf("level_name: '%s'\n", level_name.c_str());
 
   
   // OPTIMISATION: Utiliser leaf_lookup
@@ -1991,7 +1966,7 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
   if (it_root != leaf_lookup.end() && !it_root->second.empty()) {
       aos_root_leaf = &leaves[it_root->second[0]];
   }
-  // Pas de fallback linéaire nécessaire si l'index est cohérent
+  // No linear fallback is needed if the index is consistent
 
   if (!aos_root_leaf) {
     return shapes; // Return empty vector if AoS not found
@@ -2010,7 +1985,6 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       // No data leaves found under this dynamic AoS. Size is 0.
       shapes.push_back(0);
     }
-    //printf("Dynamic AoS detected. inferred size: %zu\n", shapes[0]);
 
     return shapes;
   }
@@ -2055,7 +2029,6 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
       shapes.push_back(0); // Case where even meta-node has no shape (should not happen for an AoS)
     }
   }
-  //printf("Static AoS detected. max_index: %lld, inferred size: %zu\n", max_index, shapes[0]);
   return shapes;
 }
 
@@ -2238,8 +2211,6 @@ int PanzerDB::pz_readData_by_index(
                          uint64_t shape_out[6],
                          double** data_out) {
 
-    //printf("    [pz_readData_by_index] ENTER for full_data_path: %s, time_index: %lld\n", 
-    //       full_data_path, (long long)time_index);
 
     const auto& leaves = getLeaves();
     if (leaves.empty()) return -1;
@@ -2315,8 +2286,6 @@ int PanzerDB::pz_readData_by_index(
         for(auto s : first.shape) if(s > 0) slice_vol *= s;
         shape_out[*ndim_out - 1] = total_count / slice_vol;
 
-        //printf("    [pz_readData_by_index] Aggregated %zu matches, ndim_out=%llu\n", 
-        //       matches.size(), *ndim_out);
 
         return 0;
     } else {
@@ -2387,8 +2356,6 @@ int PanzerDB::pz_readData_by_index(
                 generic_path.append(aos_view);
                 generic_path.append(suffix);
 
-                //printf("    [pz_readData_by_index] Trying generic path: '%s' with time_index: %lld\n", 
-                //       generic_path.c_str(), (long long)time_index);
 
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
@@ -2447,7 +2414,6 @@ int PanzerDB::pz_readData_by_index(
         }
     }
 
-    //printf("    [pz_readData_by_index] Data not found\n");
     return -1;
 }
 
@@ -2458,8 +2424,6 @@ int PanzerDB::pz_readStringData_by_index(
                           uint64_t shape_out[6],
                           char** data_out) {
 
-    //printf("    [pz_readStringData_by_index] ENTER for full_data_path: %s, time_index: %lld\n", 
-    //       full_data_path, (long long)time_index);
 
     const auto& leaves = getLeaves();
     if (leaves.empty()) return -1;
@@ -2562,7 +2526,6 @@ int PanzerDB::pz_readStringData_by_index(
                 } else {
                     generic_path.append("/").append(suffix);
                 }
-                //printf("    [pz_readStringData_by_index] Trying generic path: '%s' with time_index: %lld\n", generic_path.c_str(), (long long)time_index);
 
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
@@ -2580,7 +2543,6 @@ int PanzerDB::pz_readStringData_by_index(
                     if (first_slash != std::string::npos) {
                         substituted_path.append(suffix.substr(first_slash));
                     }
-                    //printf("    [pz_readStringData_by_index] Trying substituted path: '%s' with time_index: %lld\n", substituted_path.c_str(), (long long)time_index);
                     auto it_sub = leaf_lookup.find(substituted_path);
                     if (it_sub != leaf_lookup.end()) {
                         for (size_t idx : it_sub->second) {
@@ -2669,8 +2631,6 @@ int PanzerDB::pz_readComplexData_by_index(
                           uint64_t shape_out[6],
                           std::complex<double>** data_out) {
 
-    //printf("    [pz_readComplexData_by_index] ENTER for full_data_path: %s, time_index: %lld\n", 
-    //       full_data_path, (long long)time_index);
 
     const auto& leaves = getLeaves();
     if (leaves.empty()) return -1;
@@ -2785,7 +2745,6 @@ int PanzerDB::pz_readComplexData_by_index(
                 } else {
                     generic_path.append("/").append(suffix);
                 }
-                //printf("    [pz_readComplexData_by_index] Trying generic path: '%s' with time_index: %lld\n", generic_path.c_str(), (long long)time_index);
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
                     for (size_t idx : it_gen->second) {
@@ -2802,7 +2761,6 @@ int PanzerDB::pz_readComplexData_by_index(
                     if (first_slash != std::string::npos) {
                         substituted_path.append(suffix.substr(first_slash));
                     }
-                    //printf("    [pz_readComplexData_by_index] Trying substituted path: '%s' with time_index: %lld\n", substituted_path.c_str(), (long long)time_index);
                     auto it_sub = leaf_lookup.find(substituted_path);
                     if (it_sub != leaf_lookup.end()) {
                         for (size_t idx : it_sub->second) {
@@ -2966,13 +2924,10 @@ int PanzerDB::readInterpolatedData(
                          void** data_out,
                          bool expect_time_dim) {
 
-    //printf("[PanzerDB::readInterpolatedData] ENTER for path: %s, time: %f\n", 
-    //       full_data_path, time);
 
     DataInterpolation data_interpolation_component;
     std::map<std::string, int> times_indices;
 
-    //printf("--> Time basis size: %zu\n", time_basis.size());
     int slice_index = data_interpolation_component.getSlicesTimesIndices(time, time_basis, times_indices, interp_mode);
     int request_sup = times_indices[SLICE_SUP];
 
@@ -3093,16 +3048,16 @@ void PanzerDB::advanceTimeForAOS(const std::string& aos_path, uint64_t delta) {
 void PanzerDB::advanceTimebase(const std::string& timebase_name, uint64_t n_steps) {
     std::string dynamic_aos_path = getDynamicAOSPath();
     if (dynamic_aos_path.empty()) {
-        throw std::runtime_error("advanceTimebase appelé hors d'un AOS dynamique");
+        throw std::runtime_error("advanceTimebase called outside a dynamic AoS");
     }
     advanceTimeForAOS(dynamic_aos_path, n_steps);
 }
 
 
-// Fonction pour récupérer l'intégralité d'un signal dynamique hors-AOS
+// Retrieve a whole dynamic signal that is not inside an AoS
 std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) {
     
-    // 1. Accéder à l'index en mémoire
+    // 1. Access the in-memory index
     const auto& leaves = getLeaves();
     
     // 2. Filtrer les feuilles correspondant au dataset
@@ -3113,14 +3068,13 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
     if (it != leaf_lookup.end()) {
         for (size_t idx : it->second) {
             // Comparaison stricte car le dataset n'est pas dans un AOS
-            // (déjà garanti par le lookup)
+            // (already guaranteed by the lookup)
             target_leaves.push_back(&leaves[idx]);
             total_elements += leaves[idx].count;
         }
     }
 
     if (target_leaves.empty()) {
-        //std::cerr << "[WARN] Dynamic dataset not found: " << dataset_name << std::endl;
         return {};
     }
 
@@ -3217,7 +3171,6 @@ std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& ins
             std::string value;
             readTensor<std::string>(leaf, &value);
             metadata[key] = value;
-            // std::cout << "[PanzerDB] Read metadata for " << schema_path << ": " << key << " = " << value << std::endl;
         }
     }
 
@@ -3237,11 +3190,10 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
     size_t sync_depth = std::min(array_stack.size(), aos_names.size());
     
     if (sync_depth == 0) {
-        //printf("[DEBUG sync]   Stack is empty, nothing to synchronize\n");
         return;
     }
     
-   // OPTIMISATION 2: Modification in-place avec détection de changement
+   // OPTIMIZATION 2: in-place modification with change detection
     bool modified = false;
     for (size_t level = 0; level < sync_depth; ++level) {
         const std::string& target_name = aos_names[level];
@@ -3249,7 +3201,7 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
         
         ArrayLevel& current_level = array_stack[level];
         
-        // Vérification nom
+        // name check
         if (current_level.name != target_name) {
             continue;
         }
@@ -3259,42 +3211,42 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
             continue;
         }
 
-        // Mise à jour si nécessaire
+        // update if necessary
         if (current_level.current_index != static_cast<size_t>(target_index)) {
             current_level.current_index = target_index;
             modified = true;
         }
     }
     
-    // OPTIMISATION 3: Reconstruction seulement si modifié
+    // OPTIMIZATION 3: rebuild only if modified
     if (modified) {
         // Reconstruire le stack
         
-        // Reconstruction optimisée du path_prefix (une seule allocation)
+        // optimized rebuild of path_prefix (single allocation)
         path_prefix = buildPathFromStack(array_stack);
     }
 }
 
 /**
- * @brief Détermine le type de donnée d'une feuille à partir de son chemin en utilisant
- * l'index en mémoire de PanzerDB. C'est la méthode correcte et performante.
- * @param path Le chemin logique complet vers le nœud de données.
- * @return Le type de la donnée sous forme d'enum DataType.
+ * @brief Determines the data type of a leaf from its path using the
+ * in-memory PanzerDB index. This is the correct and performant way.
+ * @param path Full logical path to the data node.
+ * @return The data type as a DataType enum value.
  */
  imas::direct_access::DataType PanzerDB::get_leaf_type(const std::string& path)
  {
-     // 1. Récupère l'index en mémoire (très rapide, utilise un cache).
+     // 1. Fetch the in-memory index (fast, uses the cache).
      const auto& leaves = getLeaves();
  
-     // 2. Recherche la feuille en utilisant la table de lookup optimisée de PanzerDB.
+     // 2. Look up the leaf using PanzerDB's optimized lookup table.
      auto it = leaf_lookup.find(std::string_view(path));
      if (it != leaf_lookup.end() && !it->second.empty()) {
-         // Un chemin peut avoir plusieurs entrées (ex: séries temporelles).
-         // Le type est le même pour toutes, donc on prend la première.
+         // A path may have several entries (e.g. time series).
+         // The type is identical for all of them, so take the first one.
          const Leaf& leaf = leaves[it->second[0]];
  
-         // 3. Décode le type de données depuis le membre 'flags'.
-         // Le type est encodé dans les bits de poids fort.
+         // 3. Decode the data type from the 'flags' member.
+         // The type is encoded in the most significant bits.
          uint64_t type_bits = (leaf.flags >> 4);
          PanzerDB::DataType pz_type = static_cast<PanzerDB::DataType>(type_bits);
  
@@ -3311,33 +3263,32 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
              case PanzerDB::DataType::LIST_OF_STRINGS:
                  return imas::direct_access::DataType::LIST_OF_STRINGS;
              default:
-                 throw std::runtime_error("Type de donnée inconnu dans les flags de la feuille pour le chemin : " + path);
+                 throw std::runtime_error("Unknown data type in leaf flags for path: " + path);
          }
      }
  
-     // Si la feuille n'est pas trouvée dans l'index, c'est une erreur.
-     throw std::runtime_error("Chemin non trouvé dans l'index de PanzerDB : " + path);
+     // If the leaf is not found in the index, this is an error.
+     throw std::runtime_error("Path not found in the PanzerDB index: " + path);
  }
 
  bool PanzerDB::is_dynamic_aos(const std::string& aos_path) const
 {
-    // S'assure que l'index est chargé en mémoire.
+    // Ensure the index is loaded in memory.
     const auto& leaves = getLeaves();
 
-    // Utilise la table de lookup optimisée pour trouver la feuille correspondant au chemin.
+    // Use the optimized lookup table to find the leaf matching the path.
     auto it = leaf_lookup.find(std::string_view(aos_path));
     if (it != leaf_lookup.end() && !it->second.empty()) {
-        // Un chemin doit identifier de manière unique un méta-nœud d'AoS,
-        // donc nous prenons la première correspondance.
+        // A path should uniquely identify an AoS meta-node,
+        // so take the first match.
         const Leaf& leaf = leaves[it->second[0]];
 
-        // Le flag '3' est utilisé dans l'index de PanzerDB pour marquer
-        // un méta-nœud d'AoS dynamique.
+        // Flag '3' marks a dynamic AoS meta-node in the PanzerDB index.
         if (leaf.flags == 3) {
             return true;
         }
     }
 
-    // Si le chemin n'est pas trouvé ou si ce n'est pas un AoS dynamique.
+    // If the path is not found or is not a dynamic AoS.
     return false;
 }

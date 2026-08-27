@@ -80,7 +80,7 @@ static void parse_varname(const std::string& varname, std::string& ids_name, int
     size_t first_slash = varname.find('/');
     std::string prefix = (first_slash != std::string::npos) ? varname.substr(0, first_slash) : varname;
     
-    // Le dataset_path est ce qui suit le premier slash (peut être vide)
+    // dataset_path is everything after the first slash (may be empty)
     dataset_path = (first_slash != std::string::npos) ? varname.substr(first_slash + 1) : "";
 
     size_t colon_pos = prefix.find(':');

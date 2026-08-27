@@ -23,7 +23,6 @@ GlobalReadStrategy::GlobalReadStrategy(hid_t loc_id)
     : IReadStrategy(loc_id) {}
 
 
-
 void GlobalReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
 
     std::string aos_path_token = getPath(ctx, false);
@@ -40,8 +39,6 @@ void GlobalReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        //printf("GlobalReadStrategy::endAction called for OperationContext\n");
-        //if (panzer_db_ptr) panzer_db_ptr->dumpLeavesCache(); // Dump leaf cache for debugging
         if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
     }
   else{

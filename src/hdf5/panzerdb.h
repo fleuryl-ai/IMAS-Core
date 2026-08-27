@@ -1,4 +1,14 @@
-// panzerdb.h ULTIMATE LIGHTWEIGHT VERSION (without index_names)
+/**
+ * @file panzerdb.h
+ * @brief PanzerDB: a high-performance, columnar, index-table-based HDF5 storage engine
+ *        used by the IMAS-core HDF5 backend (v2) for reading and writing time-dependent
+ *        scientific data in a flat, append-friendly layout.
+ *
+ * This header declares the PanzerDB class (the storage engine itself) and the small
+ * helper types it exposes (Leaf, ChunkingConfig, ArrayLevel, PathComponents,
+ * ChunkingStats). All read and write operations go through the single central
+ * "/index" table; see the PanzerDB class documentation for the design rationale.
+ */
 #pragma once
 #include <hdf5.h>
 #include <string>
@@ -15,8 +25,7 @@
 #include <map>
 #include "metadata/metadata_extractor.h"
 
-// Ajout pour la nouvelle méthode get_leaf_type
-#include "direct_access_api.h"
+#include "direct_access_api.h" // for imas::direct_access::DataType (return type of get_leaf_type)
 
 /**
  * @class PanzerDB
@@ -96,36 +105,51 @@ struct ChunkingConfig {
     size_t chunk_cache_nslots = 10007;               // Prime number for hash
 };
 
+/**
+ * @struct ArrayLevel
+ * @brief Descriptor of one level (element) on the AoS iteration stack.
+ *
+ * An ArrayLevel represents one AoS in the hierarchy of beginArray()/endArray()
+ * calls currently open. It is both the record kept on `array_stack` and the
+ * argument of the "manual" beginArray(ArrayLevel&) overload.
+ */
 struct ArrayLevel {
-    std::string name;
-    std::string saved_path_prefix;
-    std::string timebase;
-    bool is_dynamic = false;
-    size_t declared_size = 0;
-    size_t current_index = 0;
-    size_t actual_count = 0;
-    bool had_write = false;
-    
-    // Full path of the AoS (for lookup in aos_time_counters)
+    std::string name;              // Name of this AoS (e.g. "ion").
+    std::string saved_path_prefix; // Path prefix before entering this level (restored by endArray()).
+    std::string timebase;          // Time base (non-empty only for dynamic AoS).
+    bool is_dynamic = false;       // True if this AoS is time-evolving.
+    size_t declared_size = 0;      // Fixed size of a static AoS (0 for dynamic).
+    size_t current_index = 0;      // Index of the element currently being processed.
+    size_t actual_count = 0;       // Number of elements actually written so far.
+    bool had_write = false;        // True if at least one data node was written at this level.
+
+    // Full path of the AoS (for lookup in aos_time_counters).
     std::string aos_full_path;
 };
 
 /**
  * @struct PathComponents
- * @brief Helper struct to hold the parsed components of a data path within a dynamic AoS.
+ * @brief Parsed components of an instance path inside a (possibly dynamic) AoS.
+ *
+ * Splits e.g. "profiles_2d/3/ion/1/state/2/z_min" into
+ * prefix="profiles_2d", index_str="3", suffix="/ion/1/state/2/z_min",
+ * so that the AoS index can be substituted when resolving dynamic nodes.
  */
+
 struct PathComponents {
     std::string prefix;      // "profiles_2d"
-    std::string index_str;   // "0"
-    std::string suffix;      // "/ion/0/state/0/z_min"
+    std::string index_str;   // "3"
+    std::string suffix;      // "/ion/1/state/2/z_min"
     bool has_index;
-    
+
     PathComponents() : has_index(false) {}
 };
 
 /**
  * @struct ChunkingStats
- * @brief Holds statistics about HDF5 chunking performance.
+ * @brief Aggregate I/O counters exposed for diagnostics (getChunkingStats()).
+ *
+ * All counters are cumulative for the life of the PanzerDB instance.
  */
 struct ChunkingStats {
     size_t total_chunks_written = 0;
@@ -139,20 +163,33 @@ class PanzerDB {
 public:
     /**
      * @struct Leaf
-     * @brief Represents a terminal node (a data entry) in the PanzerDB index.
+     * @brief One entry of the PanzerDB index table: a fully self-describing data node.
      *
-     * Each leaf corresponds to one row in the main index table and holds all
-     * metadata required to locate and interpret a piece of data.
+     * Each leaf corresponds to one row of the central "/index" dataset and holds every
+     * piece of metadata needed to locate, interpret and read one logical node
+     * (a static tensor, one chunk of a time signal, or an Array-of-Structures meta-node).
+     *
+     * Notes:
+     * - `path` / `parent_path` are zero-copy views into the internal path storage
+     *   (the cached_paths_blocks). They are valid only while the leaf cache lives;
+     *   copy them out if you need to keep them longer.
+     * - The low 4 bits of `flags` encode the node role, the upper bits encode the
+     *   stored data type (see DataType). Typical values in production:
+     *   flags = 0        : normal data node (double)
+     *   flags = 4        : data node of type (4>>4)=INT32, etc.
+     *   flags = 2        : static AoS meta-node (no raw data, size in `shape[0]`)
+     *   flags = 3        : dynamic AoS meta-node (time-evolving; see aos_time_counters)
+     *   flags = 1        : explicitly preserved empty node.
      */
     struct Leaf {
-        std::vector<size_t> shape;
-        uint64_t time_index = 0;
-        std::string_view path; // OPTIMIZATION: Zero-copy view into cached_paths_blob
-        std::string_view parent_path;
-        uint64_t offset = 0;
-        uint64_t count = 0;
-        uint64_t flags = 0;  // 0=normal, 1=empty, 2=static AoS meta-node, 3=dynamic AoS meta-node
-        bool is_empty = false; // Helper for compatibility
+        std::vector<size_t> shape;      // Dimensions of a single time slice (empty for scalars/meta-nodes).
+        uint64_t time_index = 0;        // First time step stored in this leaf (0 for static data).
+        std::string_view path;          // Full instance path, e.g. "profiles_1d/0/ion/0/density".
+        std::string_view parent_path;   // Path of the immediate parent node.
+        uint64_t offset = 0;            // Element offset of this leaf inside its raw data dataset.
+        uint64_t count = 0;             // Number of stored elements (slice_volume * n_time_steps).
+        uint64_t flags = 0;             // low 4 bits: node kind; upper bits: DataType. See struct doc.
+        bool is_empty = false;          // Convenience flag mirroring (flags & 0xF) == 1.
     };
 
 private:
@@ -173,7 +210,12 @@ private:
     hsize_t disk_size_i32 = 0;
     hsize_t disk_size_c128 = 0;
     hsize_t disk_size_str = 0;
-    
+
+    /**
+     * @brief (Re)loads the on-disk size of every raw data dataset into disk_size_*.
+     * @note Called once after opening (WRITE or APPEND) and after each flush(), so
+     *       that append offsets (disk_size_* + in-memory buffer size) stay correct.
+     */
     void updateDiskSizes();
 
     std::unordered_map<std::string, uint64_t> aos_time_counters;
@@ -203,19 +245,54 @@ private:
     static constexpr size_t BUFFER_GROWTH_FACTOR = 2;              
     
     // Cache to avoid reconstructions
+    /**
+     * @brief Joins the given AoS stack levels into a single fully-qualified path.
+     *        Root-to-leaf order is preserved.
+     * @param stack_vector The AoS levels, from root to the current level.
+     * @return The joined path string (e.g. "profiles_1d/3/ion").
+     */
     std::string buildPathFromStack(const std::vector<ArrayLevel>& stack_vector) const;
 
     mutable std::string cached_dynamic_aos_path;
     mutable bool dynamic_aos_path_valid = false;
-    
+
+    /**
+     * @brief Invalidates the cached dynamic-AoS path so it is recomputed on next use.
+     * @note Called by every beginArray()/endArray() variant because the active
+     *       dynamic AoS can change whenever the stack changes.
+     */
     void invalidateDynamicAOSCache();
     
+    /**
+     * @brief Grows an in-memory write buffer to hold at least `required_space` elements.
+     * @param required_space Minimum number of elements the buffer must be able to hold.
+     */
     void growBufferIfNeeded(size_t required_space);
+
+    /**
+     * @brief Appends the buffered complex values into the complex raw dataset via the writer.
+     */
     void flushComplexBuffer();
+
+    /**
+     * @brief Appends the buffered string values into the string raw dataset via the writer.
+     */
     void flushStringBuffer() ;
 
+    /**
+     * @brief Appends a chunk of plain-text path entries into the given path dataset.
+     * @param dataset_id Target path dataset (paths_dset or parent_paths_dset).
+     * @param buffer The path characters to append (PATH_MAX_LEN per entry).
+     */
     void flushPathBuffer(hid_t dataset_id, std::vector<char>& buffer);
 
+    /**
+     * @brief Appends a chunk of numeric values into a given raw data dataset.
+     * @tparam T Value type (double, int32_t, std::complex<double>).
+     * @param dataset_id Target raw data dataset.
+     * @param buffer The values to append.
+     * @param h5_type The matching native HDF5 type id.
+     */
     template<typename T>
     void flushDataBuffer(hid_t dataset_id, std::vector<T>& buffer, hid_t h5_type);
    
@@ -242,24 +319,55 @@ private:
 
     std::unordered_set<std::string> written_metadata_schema_paths;
 
-    // Rebuilds max_time_at_dynamic_root from the currently cached leaves:
-    // for every dynamic AoS root, the max time_index of ALL descendant
-    // data leaves (any depth). Called once per cache (re)build.
+    /**
+     * @brief Rebuilds max_time_at_dynamic_root from the currently cached leaves:
+     *        for every dynamic AoS root, the max time_index of ALL descendant
+     *        data leaves (any depth).
+     * @note Called once per cache (re)build, by getLeaves().
+     */
     void rebuildDynamicRootTimeIndex() const;
 
-    PathComponents parsePath(const std::string& path, 
-                                   const std::string& aos_path) const;
+    /**
+     * @brief Splits `path` relative to the `aos_path` root (dynamic AoS path substitution).
+     * @param path     The full instance path to parse.
+     * @param aos_path The AoS root it belongs to.
+     * @return The parsed prefix / index / suffix components.
+     */
+    PathComponents parsePath(const std::string& path,
+                                    const std::string& aos_path) const;
 
     ChunkingConfig chunk_config;
-    
-    void configureChunking(const std::string& usage_hint);
-    hid_t createOptimizedDataset(const std::string& name,
-                                  hid_t type,
-                                  size_t chunk_size,
-                                  bool enable_compression,
-                                  hid_t dapl = H5P_DEFAULT);
 
+    /**
+     * @brief Applies a chunking/compression configuration preset selected by a usage hint.
+     * @param usage_hint One of "time_series", "array_of_structures", "bulk_write",
+     *                   "interactive", or an empty string for the default preset.
+     */
+    void configureChunking(const std::string& usage_hint);
+
+    /**
+     * @brief Creates a chunked (and optionally deflated) HDF5 dataset with the given layout.
+     * @param name             Name of the dataset under the PanzerDB root location.
+     * @param type             HDF5 native type id.
+     * @param chunk_size       Number of elements per chunk (1-D layout).
+     * @param enable_compression If true, applies GZIP at chunk_config.compression_level.
+     * @param dapl             Data access property list (chunk cache), or H5P_DEFAULT.
+     * @return The new dataset id (>=0), or a negative id on failure.
+     */
+    hid_t createOptimizedDataset(const std::string& name,
+                                   hid_t type,
+                                   size_t chunk_size,
+                                   bool enable_compression,
+                                   hid_t dapl = H5P_DEFAULT);
+
+    /**
+     * @brief Restores chunking/compression settings persisted in an existing file (APPEND).
+     */
     void readChunkingConfig();
+
+    /**
+     * @brief Installs the HDF5 raw-data (chunk) cache on the datasets for read optimization.
+     */
     void configureReadCache();
 
     //==========================================================================
@@ -366,17 +474,26 @@ public:
      */
     void beginArray(const std::string& name, const std::string& timebase);
 
-     /**
-     * @brief Manually increments the index of the current AoS level.
+    /**
+     * @brief Enters a caller-constructed AoS level (full control over the ArrayLevel fields).
+     * @param level The level descriptor to push (name, size, dynamic flag, time base, index).
+     * @note Registers a meta-node in the index table unless it already exists (APPEND/READ),
+     *       updates path_prefix and pushes the level on the AoS stack.
      */
-    void beginArray(ArrayLevel& level);
+     void beginArray(ArrayLevel& level);
 
     /**
-     * @brief Manually sets the index of the current AoS level.
-     * @param new_index The new index to set.
+     * @brief Moves to the next element of the current AoS level.
+     * @note Advances current_index of the stack top by one; a no-op when no AoS is open.
      */
-    void incrementArrayIndex();
-    void setCurrentArrayIndex(size_t new_index);
+     void incrementArrayIndex();
+
+    /**
+     * @brief Jumps to a specific element of the current AoS level.
+     * @param new_index The element index to set on the stack top.
+     * @note No-op when no AoS is open.
+     */
+     void setCurrentArrayIndex(size_t new_index);
 
     /**
      * @brief Checks if the current write position is inside a dynamic AoS.
@@ -390,13 +507,14 @@ public:
     //==========================================================================
 
     /**
-     * @brief Writes a static (non-time-dependent) data tensor.
-     * @tparam T The data type (e.g., double, int32_t, std::complex<double>).
-     * @param name The name of the data node.
-     * @param shape The dimensions of the tensor.
-     * @param data A pointer to the data buffer.
-     * @param count The total number of elements in the buffer.
-     * @param timebase (Unsupported for this function, must be empty).
+     * @brief Writes a static (non-time-dependent) data tensor of any supported type.
+     * @tparam T The element type (double, int32_t, std::complex<double>, char, const char*).
+     * @param name     Name of the data node under the current path.
+     * @param shape    Dimensions of the tensor (empty for a scalar).
+     * @param data     Pointer to the element buffer.
+     * @param count    Total number of elements.
+     * @param timebase Must be empty for static data.
+     * @note Appends to the in-memory buffers; physically stored on flush() or destruction.
      */
     template<typename T>
     void writeData(const std::string& name,
@@ -404,15 +522,20 @@ public:
                    const T* data, size_t count,
                    const std::string& timebase = "");
 
+    /*
+     * (private) Shared implementation of writeData<T>.
+     * Resolves the target raw dataset and its buffer from dtype, grows the buffer,
+     * appends `count` elements, appends the 14-column index row, and bumps aos_time_counters.
+     */
     template<typename T>
     void writeDataImpl(const std::string& name,
-                              const std::vector<size_t>& shape,
-                              const T* data,
-                              size_t count,
-                              const std::string& timebase,
-                              DataType dtype,
-                              hid_t dataset_id,
-                              std::vector<T>& buffer);
+                               const std::vector<size_t>& shape,
+                               const T* data,
+                               size_t count,
+                               const std::string& timebase,
+                               DataType dtype,
+                               hid_t dataset_id,
+                               std::vector<T>& buffer);
 
     /**
      * @brief Writes one or more time slices of a dynamic double-precision floating point signal.
@@ -427,46 +550,74 @@ public:
                                const double* data, size_t n_slices,
                                const std::string& timebase);
 
-     /**
+    /**
      * @brief Writes one or more time slices of a dynamic 32-bit integer signal.
+     * @param name       Name of the signal under the current path.
+     * @param base_shape Shape of a single time slice.
+     * @param data       Pointer to the contiguous buffer holding all slices.
+     * @param n_slices   Number of time slices to append.
+     * @param timebase   Name of the associated time base (may be empty).
+     * @note Time steps are numbered using aos_time_counters, preserving gaps and
+     *       aligning with the enclosing dynamic AoS.
      */
-    void writeDataSlices(const std::string& name,
-                               const std::vector<size_t>& base_shape,
-                               const int32_t* data, size_t n_slices,
-                               const std::string& timebase);
+     void writeDataSlices(const std::string& name,
+                                const std::vector<size_t>& base_shape,
+                                const int32_t* data, size_t n_slices,
+                                const std::string& timebase);
 
-     /**
+    /**
      * @brief Writes one or more time slices of a dynamic complex signal.
+     * @param name       Name of the signal under the current path.
+     * @param base_shape Shape of a single time slice.
+     * @param data       Pointer to the contiguous buffer holding all slices.
+     * @param n_slices   Number of time slices to append.
+     * @param timebase   Name of the associated time base (may be empty).
      */
-    void writeDataSlices(const std::string& name,
-                               const std::vector<size_t>& base_shape,
-                               const std::complex<double>* data, size_t n_slices,
-                               const std::string& timebase);
+     void writeDataSlices(const std::string& name,
+                                const std::vector<size_t>& base_shape,
+                                const std::complex<double>* data, size_t n_slices,
+                                const std::string& timebase);
 
     /**
      * @brief Writes one or more time slices of a dynamic string signal.
-     */                           
-    void writeDataSlices(const std::string& name,
-                               const std::vector<size_t>& base_shape,
-                               const char* const* data, size_t n_slices,
-                               const std::string& timebase);
-                              
+     * @param name       Name of the signal under the current path.
+     * @param base_shape Shape of a single time slice.
+     * @param data       Array of null-terminated string pointers (one per slice element).
+     * @param n_slices   Number of time slices to append.
+     * @param timebase   Name of the associated time base (may be empty).
+     */
+     void writeDataSlices(const std::string& name,
+                                const std::vector<size_t>& base_shape,
+                                const char* const* data, size_t n_slices,
+                                const std::string& timebase);
+
+    /*
+     * (private) Shared implementation of writeDataSlices<T>: computes the base time from
+     * aos_time_counters, appends the slices to the raw dataset buffer and one index row,
+     * then advances the counters.
+     */
     template<typename T>
     void writeDataSlicesImpl(const std::string& name,
-                                    const std::vector<size_t>& base_shape,
-                                    const T* data,
-                                    size_t n_slices,
-                                    const std::string& timebase,
-                                    DataType dtype,
-                                    hid_t dataset_id,
-                                    std::vector<T>& buffer);
- 
-    
-     /**
-     * @brief Prints the content of the cached index table (leaves) to standard output for debugging.
+                                     const std::vector<size_t>& base_shape,
+                                     const T* data,
+                                     size_t n_slices,
+                                     const std::string& timebase,
+                                     DataType dtype,
+                                     hid_t dataset_id,
+                                     std::vector<T>& buffer);
+
+    /**
+     * @brief Dumps the cached index table (leaves) to standard output, for debugging.
      */
-    void dumpLeavesCache() const;
-    void endArray();
+     void dumpLeavesCache() const;
+
+    /**
+     * @brief Exits the current AoS level, restoring the path prefix and counts.
+     * @note Symmetric to beginArray(). When leaving a dynamic AoS, the corresponding
+     *       dynamic-level state is cleared and caches that depend on the stack are
+     *       invalidated.
+     */
+     void endArray();
 
      /**
      * @brief Flushes all in-memory write buffers to the HDF5 file.
@@ -485,30 +636,41 @@ public:
 
     /**
      * @brief Retrieves the entire database index as a vector of Leaf objects.
-     * The result is cached for subsequent calls. This is the primary entry point for read operations.
-     * @return A constant reference to the cached vector of leaves.
-     */
+    * The result is cached for subsequent calls. This is the primary entry point for read operations.
+    * @return A constant reference to the cached vector of leaves.
+    */
     const std::vector<Leaf>& getLeaves() const;
-    //const std::vector<std::string>& getDynamicAOSRoots() const { return cached_dynamic_aos_roots; }
 
      /**
-     * @brief Gets the effective size of an Array of Structures.
-     * For static AoS, it returns the declared size. For dynamic AoS, it returns the number of time steps written.
-     * @param level_name The full path to the AoS meta-node (e.g., "profiles_1d" or "profiles_1d/0/ion").
-     * @return A vector containing the size of the AoS.
-     */
-    std::vector<size_t> getAOSShape(const std::string& level_name) const;
-    size_t getDynamicAOSSize(const std::string& aos_path) const;
+      * @brief Gets the effective size of an Array of Structures.
+      * For static AoS, it returns the declared size. For dynamic AoS, it returns the number of time steps written.
+      * @param level_name The full path to the AoS meta-node (e.g., "profiles_1d" or "profiles_1d/0/ion").
+      * @return A vector containing the size of the AoS.
+      */
+     std::vector<size_t> getAOSShape(const std::string& level_name) const;
 
     /**
-     * @brief Finds the index in a time base vector that is closest to a requested time.
-     * @param timebase_path The full path to the 1D dataset representing the time base.
-     * @param requested_time The time value to search for.
-     * @return The index of the element in the time base closest to the requested time.
+     * @brief Gets the next free time index of a dynamic AoS (number of slices written so far).
+     * @param aos_path The full path of the dynamic AoS meta-node.
+     * @return The slice counter, or 0 if the AoS is unknown.
      */
-    int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
+    size_t getDynamicAOSSize(const std::string& aos_path) const;
 
+     /**
+      * @brief Finds the index in a time base vector that is closest to a requested time.
+      * @param timebase_path The full path to the 1D dataset representing the time base.
+      * @param requested_time The time value to search for.
+      * @param interp_mode The interpolation mode hint (see DataInterpolation).
+      * @return The index of the element in the time base closest to the requested time.
+      */
+     int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
 
+    /**
+     * @brief Checks whether a time index falls within the time steps stored in a leaf.
+     * @param leaf       The index leaf under test (must be a data leaf).
+     * @param time_index The time index to test.
+     * @return True if the leaf holds the requested time step.
+     */
     bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
 
     /**
@@ -518,9 +680,10 @@ public:
     OpenMode getOpenMode() const { return mode; }
 
     /**
-     * @brief Détermine le type de donnée d'une feuille (dataset) à partir de son chemin.
-     * @param path Le chemin complet vers le dataset dans le fichier HDF5.
-     * @return Le type de la donnée sous forme d'enum DataType.
+     * @brief Determines the stored data type of a node from its full path.
+     * @param path The full instance path to the data node.
+     * @return The matching imas::direct_access::DataType.
+     * @throws ALBackendException if the path is not found in the index.
      */
     imas::direct_access::DataType get_leaf_type(const std::string& path);
 
@@ -656,10 +819,16 @@ public:
         uint64_t shape_out[6],
         double** data_out);
 
-     /**
+    /**
      * @brief C-style API to read string data by path and time index.
+     * @param full_data_path Full path to the string signal (e.g. "profiles_2d/1/label").
+     * @param time_index     Time index to read, or -1 for static / all-slices aggregation.
+     * @param ndim_out       [out] Number of output dimensions.
+     * @param shape_out      [out] Output shape (up to 6 dimensions).
+     * @param data_out       [out] Newly allocated buffer of null-terminated strings (caller frees).
+     * @return 0 on success, -1 on failure.
      */
-    int pz_readStringData_by_index(
+     int pz_readStringData_by_index(
         const char* full_data_path,
         int64_t time_index,
         uint64_t* ndim_out,
@@ -668,6 +837,12 @@ public:
     
     /**
      * @brief C-style API to read complex data by path and time index.
+     * @param full_data_path Full path to the complex signal.
+     * @param time_index     Time index to read, or -1 for static / all-slices aggregation.
+     * @param ndim_out       [out] Number of output dimensions.
+     * @param shape_out      [out] Output shape (up to 6 dimensions).
+     * @param data_out       [out] Newly allocated buffer of std::complex<double> (caller frees).
+     * @return 0 on success, -1 on failure.
      */
     int pz_readComplexData_by_index(
         const char* full_data_path,
@@ -678,15 +853,34 @@ public:
 
     /**
      * @brief C-style API to read 32-bit integer data by path and time index.
+     * @param full_data_path Full path to the int32 signal.
+     * @param time_index     Time index to read, or -1 for static / all-slices aggregation.
+     * @param ndim_out       [out] Number of output dimensions.
+     * @param shape_out      [out] Output shape (up to 6 dimensions).
+     * @param data_out       [out] Newly allocated buffer of int32_t (caller frees).
+     * @return 0 on success, -1 on failure.
      */
-     int pz_readIntData_by_index(
+      int pz_readIntData_by_index(
         const char* full_data_path,
         int64_t time_index,
         uint64_t* ndim_out,
         uint64_t shape_out[6],
         int32_t** data_out);
 
+    /**
+     * @brief Advances the time counter of the enclosing dynamic AoS by n_steps.
+     * @param timebase_name Name of the time base (used for diagnostics).
+     * @param n_steps Number of time steps to skip.
+     * @pre Must be called while inside a dynamic AoS.
+     * @throws std::runtime_error if not inside a dynamic AoS.
+     */
     void advanceTimebase(const std::string& timebase_name, uint64_t n_steps = 1);
+
+    /**
+     * @brief Reads a whole dynamic (time-evolving) double signal into memory.
+     * @param dataset_name The full path of the signal (outside an AoS instance).
+     * @return The concatenated time series, or an empty vector if not found.
+     */
     std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
 
      /**
@@ -736,16 +930,54 @@ public:
     std::map<std::string, std::string> readMetadata(const std::string& instance_path);
 
 private:
+    /**
+     * @brief Re-establishes the write-time context (aos_time_counters) from the
+     *        on-disk leaves after opening an existing file (APPEND/READ).
+     * @note Ensures that appending continues where the previous session stopped,
+     *        including gap alignment on the enclosing time base.
+     */
     void restoreTimeContext();
+
+    /**
+     * @brief Common initialization path shared by both constructors.
+     * @param mode The open mode being set up (WRITE / READ / APPEND).
+     */
     void init(OpenMode mode);
+
+    /**
+     * @brief Appends one 14-column row to the index buffer (no HDF5 I/O).
+     * @param full_path    Full instance path of the node.
+     * @param parent_path  Path of the parent node.
+     * @param shape        Node shape (up to 6 dimensions).
+     * @param type         Data type (DataType value, stored in the type column).
+     * @param time_idx     First time step of the row (0 for static data).
+     * @param offset       Element offset inside the raw data dataset.
+     * @param count        Number of stored elements.
+     * @param flags        Node kind (low 4 bits) or metadata marker.
+     */
     void append_index_row(const std::string& full_path, const std::string& parent_path,
-                                const std::vector<size_t>& shape, uint64_t type,
-                                uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags);
-    // Helper to get the path of the dynamic parent AOS
+                                 const std::vector<size_t>& shape, uint64_t type,
+                                 uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags);
+
+    /**
+     * @brief Returns the path of the enclosing dynamic AoS, or an empty string.
+     */
     std::string getDynamicAOSPath() const;
+
+    /**
+     * @brief Gets the current next slice index of a dynamic AoS (aos_time_counters).
+     * @param aos_path Full path of the dynamic AoS.
+     * @return The counter value.
+     */
     uint64_t getCurrentTimeForAOS(const std::string& aos_path);
+
+    /**
+     * @brief Advances the aos_time_counters entry of a dynamic AoS by delta.
+     * @param aos_path Full path of the dynamic AoS.
+     * @param delta    Number of time steps to add.
+     */
     void advanceTimeForAOS(const std::string& aos_path, uint64_t delta);
-    
+
 };
 
 // Declarations of explicit specializations OUTSIDE the class
