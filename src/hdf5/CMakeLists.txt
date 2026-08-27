@@ -74,73 +74,110 @@ macro(al_add_hdf5_test test_name)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
 
-    #al_add_hdf5_test(test_panzer)
-    al_add_hdf5_test(test_panzer_read_by_index)
-    al_add_hdf5_test(test_panzer_read_by_index_deep)
-    al_add_hdf5_test(test_panzer_read_by_index_deep_2_signals)
-    al_add_hdf5_test(test_panzer_read_by_index_complex_aos)
-    al_add_hdf5_test(test_panzer_read_by_index_very_deep)
-    al_add_hdf5_test(test_panzer_read_by_index_ultra_deep)
-    al_add_hdf5_test(test_panzer_empty_aos)
-    al_add_hdf5_test(test_panzer_dynamic_aos)
-    al_add_hdf5_test(test_panzer_nested_dynamic_aos)
-    al_add_hdf5_test(test_panzer_read_2d_signal)
-    al_add_hdf5_test(test_panzer_root_scalar)
-    al_add_hdf5_test(test_magnetics_flux_loop)
-    al_add_hdf5_test(test_magnetics_repro)
-    al_add_hdf5_test(test_panzer_group_constructor)
-    al_add_hdf5_test(test_panzer_dynamic_data_put_and_slice)
-    al_add_hdf5_test(test_panzer_complex_append)
-    al_add_hdf5_test(test_panzer_char_data)
-    al_add_hdf5_test(test_panzer_string_complex)
-    al_add_hdf5_test(test_panzer_list_of_strings)
-    al_add_hdf5_test(test_nested_dynamic_timebase)
-    al_add_hdf5_test(test_inhom_timebase)
-    al_add_hdf5_test(test_homog_2d)
-    al_add_hdf5_test(test_dynamic_aos_string)
-    al_add_hdf5_test(test_dynamic_aos_string_inhom)
-    al_add_hdf5_test(test_dynamic_aos_gap)
-    al_add_hdf5_test(test_gap_closest_prev_read)
-    al_add_hdf5_test(test_gap_linear_read)
-    al_add_hdf5_test(test_gap_timerange_read)
-    al_add_hdf5_test(test_gap_homog_slice_read)
-    al_add_hdf5_test(test_gap_homog_timerange_read)
-    al_add_hdf5_test(test_timerange_simple)
-    al_add_hdf5_test(test_timerange_aos)
-    al_add_hdf5_test(test_timerange_nested_dynamic_aos)
-    al_add_hdf5_test(test_timerange_nested_dynamic_aos_resampling)
-    al_add_hdf5_test(test_timerange_nested_dynamic_aos_resampling_vector)
-    al_add_hdf5_test(test_magnetics_resampling_vector)
-    al_add_hdf5_test(test_profiles_1d_dynamic)
-    al_add_hdf5_test(test_dynamic_aos_nested_only)
-    al_add_hdf5_test(test_profiles_1d_dynamic_signal_1d)
-    al_add_hdf5_test(test_profiles_1d_dynamic_signal_2d)
-    al_add_hdf5_test(test_nested_static_aos)
-    al_add_hdf5_test(test_profiles_1d_dynamic_0d_append)
-    al_add_hdf5_test(test_time_slice_nested_x_point)
-    al_add_hdf5_test(test_profiles_1d_dynamic_append_slice)
-    al_add_hdf5_test(test_profiles_1d_dynamic_append_slice_large)
-    al_add_hdf5_test(test_core_profiles_put_get_slice)
-    al_add_hdf5_test(test_timerange_aos_string_list)
-    al_add_hdf5_test(test_timerange_root_string)
-    al_add_hdf5_test(test_root_1d_dynamic_append)
-    al_add_hdf5_test(test_magnetics_repro_slice)
-    al_add_hdf5_test(test_nested_aos_char_data)
-    al_add_hdf5_test(test_bug_string_list_1d)
-    al_add_hdf5_test(test_bug_static_aos_slice)
-    al_add_hdf5_test(test_bug_dynamic_aos_nested_static)
-    al_add_hdf5_test(test_bug_cic_string_slice)
-    al_add_hdf5_test(test_bug_b_field_na_slice)
-    al_add_hdf5_test(test_static_aos_dynamic_signal_slice)
-    al_add_hdf5_test(test_timerange)
-    al_add_hdf5_test(test_slice_op2)
-    al_add_hdf5_test(test_metadata_strategies)
+# --------------------------------------------------------------------------
+# Engine tests (PanzerDB API directly)
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_engine_readdata_by_index)
+al_add_hdf5_test(test_engine_readdata_by_index_deep)
+al_add_hdf5_test(test_engine_readdata_by_index_2signals)
+al_add_hdf5_test(test_engine_readdata_by_index_complex_aos)
+al_add_hdf5_test(test_engine_readdata_by_index_verydeep)
+al_add_hdf5_test(test_engine_readdata_by_index_ultradeep)
+al_add_hdf5_test(test_engine_readdata_by_index_2d)
+al_add_hdf5_test(test_engine_write_read_char)
+al_add_hdf5_test(test_engine_write_read_string_complex)
+al_add_hdf5_test(test_engine_write_read_listofstrings)
+al_add_hdf5_test(test_engine_write_read_root_scalar)
+al_add_hdf5_test(test_engine_empty_aos_getshape)
+al_add_hdf5_test(test_engine_group_constructor)
+al_add_hdf5_test(test_engine_write_read_dynamic_aos)
+al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
+al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
+al_add_hdf5_test(test_engine_append_complex)
 
-# Test pour le Path Parser
-al_add_hdf5_test(test_path_parser)
-# Test d'intégration et de validation de l'API
+# --------------------------------------------------------------------------
+# AL-level tests (via HDF5Backend / ALContext, dispatching to v2)
+# --------------------------------------------------------------------------
+# regression reproductions
+al_add_hdf5_test(test_al_bfield_na_slice)
+al_add_hdf5_test(test_al_cic_string_slice)
+al_add_hdf5_test(test_al_dynamic_aos_nested_static_slice)
+al_add_hdf5_test(test_al_static_aos_signal_slice)
+al_add_hdf5_test(test_al_string_list_1d_slice)
+
+# core IDS structures
+al_add_hdf5_test(test_al_core_profiles_put_get_slice)
+al_add_hdf5_test(test_al_core_sources_put_slice)
+
+# magnetics flux_loop
+al_add_hdf5_test(test_al_flux_loop_aos)
+al_add_hdf5_test(test_al_flux_loop_deep_data_slice)
+al_add_hdf5_test(test_al_flux_loop_deep_data_getslice)
+
+# dynamic-AoS behaviour
+al_add_hdf5_test(test_al_dynamic_aos_gap)
+al_add_hdf5_test(test_al_dynamic_aos_nested_only_getshape)
+al_add_hdf5_test(test_al_dynamic_aos_string_slice)
+al_add_hdf5_test(test_al_dynamic_aos_string_inhom_slice)
+al_add_hdf5_test(test_al_nested_dynamic_timebase)
+al_add_hdf5_test(test_al_nested_static_aos)
+al_add_hdf5_test(test_al_nested_aos_listofstrings)
+al_add_hdf5_test(test_al_static_aos_dynamic_signal_slice)
+al_add_hdf5_test(test_al_timeslice_nested_x_point)
+
+# homogeneous / inhomogeneous timebases
+al_add_hdf5_test(test_al_homog_timebase_2d_signal)
+al_add_hdf5_test(test_al_inhom_timebase)
+
+# gap handling
+al_add_hdf5_test(test_al_gap_closest_prev)
+al_add_hdf5_test(test_al_gap_homog_slice)
+al_add_hdf5_test(test_al_gap_homog_timerange)
+al_add_hdf5_test(test_al_gap_linear)
+al_add_hdf5_test(test_al_gap_timerange)
+
+# profiles_1d / root 1D signals
+al_add_hdf5_test(test_al_profiles_1d_dynamic)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_0d_append)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_append_slice)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_append_slice_large)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_signal_1d)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_signal_2d)
+al_add_hdf5_test(test_al_root_1d_dynamic_append)
+
+# slice operators
+al_add_hdf5_test(test_al_slice_op_code_output)
+
+# time-range operator
+al_add_hdf5_test(test_al_timerange_basic)
+al_add_hdf5_test(test_al_timerange_aos)
+al_add_hdf5_test(test_al_timerange_aos_string_list)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling_vector)
+al_add_hdf5_test(test_al_timerange_root_string)
+al_add_hdf5_test(test_al_timerange_simple)
+
+# resampling
+al_add_hdf5_test(test_al_resampling_user_vector)
+
+# metadata
+al_add_hdf5_test(test_al_metadata_strategies)
+
+# --------------------------------------------------------------------------
+# Direct-access API
+# --------------------------------------------------------------------------
 al_add_hdf5_test(test_direct_api_validation)
-al_add_hdf5_test(test_imas_h5read)
+
+# --------------------------------------------------------------------------
+# h5read (imas_h5read library)
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_h5read_overloads)
+
+# --------------------------------------------------------------------------
+# Path parser
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_path_parser_syntax)
 
 # Ajouter les outils HDF5
 add_subdirectory(tools)

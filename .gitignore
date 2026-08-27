@@ -44,3 +44,10 @@ python/lib/
 /.venv/
 /vcpkg/
 /UDA-*/
+
+# test artifacts
+/test_db_*/
+
+# local session helpers
+/.cptr/
+/start.sh
