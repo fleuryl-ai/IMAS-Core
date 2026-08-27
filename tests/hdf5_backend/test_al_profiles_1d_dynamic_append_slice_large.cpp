@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic_append_slice.cpp
+// @file  test_al_profiles_1d_dynamic_append_slice_large.cpp
+// @brief Profiling test for profiles_1d dynamic AoS with large data: initial global
+//        write of signals, strings and nested ion/element AoS, then slice appends.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -154,7 +156,7 @@ int main() {
                 // profiles_1d
                 int p_size = 1;
                 ArraystructContext profilesCtx(&opCtx, "profiles_1d", "time");
-                // Note: Pas besoin de setIndex(t_idx) ici, PanzerDB gère l'index d'ajout en mode APPEND
+                // Note: No need to call setIndex(t_idx) here; PanzerDB manages the append index in APPEND mode
                 backend.beginArraystructAction(&profilesCtx, &p_size);
 
                 // ion

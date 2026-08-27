@@ -1,4 +1,6 @@
-// test_dynamic_aos_string.cpp
+// @file  test_al_dynamic_aos_string_slice.cpp
+// @brief Dynamic AoS with string and complex signals under homogeneous time:
+//        global write, then closest-interpolation slice reads.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

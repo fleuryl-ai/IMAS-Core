@@ -1,9 +1,9 @@
-// tests/hdf5_backend/test_gap_closest_prev_read.cpp
-//
-// Vérifie la lecture closest / previous d'un signal dynamique présentant des
-// "trous" (certaines slices absentes). Quand la slice demandée est absente, la
-// valeur retournée doit être celle d'une slice EXISTANTE (la plus proche / la
-// dernière <= t), jamais d'une autre (cf. le bug du fallback sur slice 0).
+// @file  test_al_gap_closest_prev.cpp
+// @brief Verifies closest / previous reads of a dynamic signal with gaps
+//        (some slices missing). When the requested slice is absent, the value
+//        returned must come from an EXISTING slice (the closest one / the last
+//        one <= t), never from another one (cf. the bug of the fallback to
+//        slice 0).
 #include "al_context.h"
 #include "al_defs.h"
 #include "al_const.h"
@@ -34,9 +34,9 @@ static void write_fixture() {
     for (int i = 0; i < 5; ++i) {
         double t = 0.1 * i;
         backend.writeData(&ctxB, "time", "", &t, alconst::double_data, 0, nullptr);
-        if (i != 2)              // sigA: trou à la slice 2
+        if (i != 2)              // sigA: gap at slice 2
             { double v = 100.0 + i; backend.writeData(&ctxB, "sigA", "time", &v, alconst::double_data, 0, nullptr); }
-        if (i != 1 && i != 3)    // sigB: trous aux slices 1 et 3
+        if (i != 1 && i != 3)    // sigB: gaps at slices 1 and 3
             { double v = 200.0 + i; backend.writeData(&ctxB, "sigB", "time", &v, alconst::double_data, 0, nullptr); }
         { double v = 300.0 + i; backend.writeData(&ctxB, "sigC", "time", &v, alconst::double_data, 0, nullptr); }
         if (i < 4) ctxB.nextIndex(1);
@@ -83,7 +83,7 @@ static double read_scalar(int interp, double req_time,
 }
 
 static int nfail = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; nfail++; } } while(0)
+#include "fixtures/check.h"
 
 int main() {
     try {
@@ -93,26 +93,26 @@ int main() {
         };
 
         // ---- CLOSEST ----
-        // sigA trou à idx2 (t=0.2) : valeur la plus proche existante = slice 1 (101)
+        // sigA gap at idx2 (t=0.2): closest existing value = slice 1 (101)
         check(read_scalar(alconst::closest_interp, 0.2, "sigA", nullptr), 101.0, "closest sigA@0.2");
-        // sigC présent partout
+        // sigC present everywhere
         check(read_scalar(alconst::closest_interp, 0.2, "sigC", nullptr), 302.0, "closest sigC@0.2");
-        // sigB trous à idx1 et idx3
+        // sigB gaps at idx1 and idx3
         check(read_scalar(alconst::closest_interp, 0.1, "sigB", nullptr), 200.0, "closest sigB@0.1");
         check(read_scalar(alconst::closest_interp, 0.3, "sigB", nullptr), 202.0, "closest sigB@0.3");
 
-        // ---- PREVIOUS (la dernière disponible <= t) ----
+        // ---- PREVIOUS (the last available value <= t) ----
         check(read_scalar(alconst::previous_interp, 0.2, "sigA", nullptr), 101.0, "prev sigA@0.2");
         check(read_scalar(alconst::previous_interp, 0.3, "sigB", nullptr), 202.0, "prev sigB@0.3");
         check(read_scalar(alconst::previous_interp, 0.4, "sigB", nullptr), 204.0, "prev sigB@0.4 (present)");
         check(read_scalar(alconst::previous_interp, 0.1, "sigA", nullptr), 101.0, "prev sigA@0.1 (present)");
 
-        // NOTE : `alconst::undefined_interp` (valeur 0) n'est pas autorisé en
-        // slice_op par al_context.cpp ("Missing interpmode") : on ne le teste
-        // donc pas ici. closest/previous suffisent à couvrir le cas "slice
-        // absente -> valeur d'une slice existante la plus proche".
+        // NOTE: `alconst::undefined_interp` (value 0) is not allowed with
+        // slice_op by al_context.cpp ("Missing interpmode"), so it is not
+        // tested here. closest/previous are sufficient to cover the case
+        // "absent slice -> value of the closest existing slice".
 
-        // ---- Signal jamais écrit -> non disponible ----
+        // ---- Signal never written -> unavailable ----
         bool avail = false;
         read_scalar(alconst::closest_interp, 0.2, "sig_never", &avail);
         CHECK(!avail, "closest sig_never should be unavailable");

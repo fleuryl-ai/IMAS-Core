@@ -1,3 +1,6 @@
+// @file  test_al_dynamic_aos_gap.cpp
+// @brief Gap handling in a dynamic AoS: appending slices where some signals
+//        are missing, then reading across the gap with all interpolations.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -171,7 +174,7 @@ int main() {
                 backend.endAction(&opCtx);
             }
 
-            // 2. Linear Interp valeur présente (aucune interp)
+            // 2. Linear Interp, value present (no interpolation needed)
             {
                 std::cout << "Checking Linear Interp at t=" << t_req << "...\n";
                 int interpmode = alconst::linear_interp;
@@ -202,11 +205,11 @@ int main() {
                 backend.endAction(&opCtx);
             }
 
-            // 3. Lecture au TROU (t=0.5) : sig2 n'a pas de valeur à 0.5.
-            //    Avant la correction, le fallback renvoyait la slice 0 (200).
+            // 3. Read at the gap (t=0.5): sig2 has no value at 0.5.
+            //    Before the fix, the fallback returned slice 0 (200).
             double t_gap = 0.5;
 
-            // 3a. Closest -> ex-aequo (0.4 et 0.6) -> index inférieur -> 204
+            // 3a. Closest -> tie (0.4 and 0.6) -> lower index -> 204
             {
                 std::cout << "Checking Closest at GAP t=" << t_gap << "...\n";
                 int interpmode = alconst::closest_interp;
@@ -237,7 +240,7 @@ int main() {
                 backend.endAction(&opCtx);
             }
 
-            // 3b. Previous -> dernière prénente <= 0.5 = 0.4 -> 204
+            // 3b. Previous -> last present value <= 0.5 is 0.4 -> 204
             {
                 std::cout << "Checking Previous at GAP t=" << t_gap << "...\n";
                 int interpmode = alconst::previous_interp;
@@ -268,7 +271,7 @@ int main() {
                 backend.endAction(&opCtx);
             }
 
-            // 3c. Linear -> entre 0.4 (204) et 0.6 (206), fact. 0.5 -> 205
+            // 3c. Linear -> between 0.4 (204) and 0.6 (206), factor 0.5 -> 205
             {
                 std::cout << "Checking Linear at GAP t=" << t_gap << "...\n";
                 int interpmode = alconst::linear_interp;

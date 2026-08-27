@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_slice_op2.cpp
+// @file  test_al_slice_op_code_output.cpp
+// @brief Tests slice reads of code/output_flag, pressure and test/code_flag
+//        signals (dynamic 1D, spatial 0D) at fixed time points.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

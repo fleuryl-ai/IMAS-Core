@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_metadata_strategies.cpp
+// @file  test_al_metadata_strategies.cpp
+// @brief Tests metadata write/read across all access strategies (global,
+//        slice, timerange), including static AoS with per-signal metadata.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

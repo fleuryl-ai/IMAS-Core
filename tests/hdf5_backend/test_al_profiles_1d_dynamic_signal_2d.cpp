@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic_signal_2d.cpp
+// @file  test_al_profiles_1d_dynamic_signal_2d.cpp
+// @brief Tests profiles_1d dynamic AoS with a 2D signal and a 1D nested signal:
+//        global write and iterative read validation (legacy backend aware).
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -71,7 +73,7 @@ int main() {
 
                 backend.writeData(&profilesCtx, "signal_2d", "", val_2d.data(), alconst::double_data, sig_dim, sig_size);
                 
-                // AoS statique 'ion'
+                // Static AoS 'ion'
                 int ion_size = 3;
                 ArraystructContext ionCtx(&profilesCtx, "ion", "");
                 backend.beginArraystructAction(&ionCtx, &ion_size);
@@ -80,7 +82,7 @@ int main() {
                     double z_ion_val = 1.0 + t + i;
                     backend.writeData(&ionCtx, "z_ion", "", &z_ion_val, alconst::double_data, 0, nullptr);
 
-                    // AoS statique 'element' dans 'ion'
+                    // Static AoS 'element' inside 'ion'
                     int element_size = 2;
                     ArraystructContext elementCtx(&ionCtx, "element", "");
                     backend.beginArraystructAction(&elementCtx, &element_size);
@@ -162,8 +164,8 @@ int main() {
                 }
                 free(data);*/
 
-                // 1. Déterminer si on est sur le vieux backend (via la version ou la forme des dataspace)
-                bool is_legacy = version == std::make_pair(1,0); // Supposons que la version 1.0 est le vieux backend
+                // 1. Determine whether the legacy backend is in use (via the version or the dataspace shape)
+                bool is_legacy = version == std::make_pair(1,0); // Assume version 1.0 is the legacy backend
 
                 for(int x=0; x<dim1; ++x) {
                     for(int y=0; y<dim2; ++y) {
@@ -177,7 +179,7 @@ int main() {
                     }
                 }
 
-                // Validation AOS statique 'ion'
+                // Validation of static AoS 'ion'
                 ArraystructContext ionCtx(&profilesCtx, "ion", "");
                 int ion_size = 0;
                 backend.beginArraystructAction(&ionCtx, &ion_size);
@@ -194,7 +196,7 @@ int main() {
                     }
                     free(data);
 
-                    // Validation AOS statique 'element'
+                    // Validation of static AoS 'element'
                     ArraystructContext elementCtx(&ionCtx, "element", "");
                     int element_size = 0;
                     backend.beginArraystructAction(&elementCtx, &element_size);
@@ -241,13 +243,13 @@ int main() {
 
 double get_expected_value(int t, int x, int y, int d1, int d2, bool legacy_mode) {
     if (!legacy_mode) {
-        // Logique normale (Nouveau Backend)
+        // Normal logic (new backend)
         return 1000.0 + t * 100.0 + x * 10.0 + y;
     } else {
-        /* Logique du vieux backend : il ne saute que 'dim2' au lieu de 'dim1*dim2'
-           On simule le décalage observé : t=1 commence à l'index x=1 du bloc t=0
+        /* Legacy backend logic: it only skips 'dim2' instead of 'dim1*dim2'
+           Simulates the observed offset: t=1 starts at index x=1 of the t=0 block
         */
-        int actual_x = x + t; // Le décalage que vous avez observé (1010.0 à t=1,x=0)
+        int actual_x = x + t; // The observed offset (1010.0 at t=1,x=0)
         int actual_t = actual_x / d1;
         actual_x = actual_x % d1;
         

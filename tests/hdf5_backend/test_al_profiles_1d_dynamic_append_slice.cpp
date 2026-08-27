@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic_append_slice.cpp
+// @file  test_al_profiles_1d_dynamic_append_slice.cpp
+// @brief Tests appending slices to a profiles_1d dynamic AoS (nested
+//        ion > element) and validating the appended values by slice read.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -144,7 +146,7 @@ int main() {
                 // profiles_1d
                 int p_size = 1;
                 ArraystructContext profilesCtx(&opCtx, "profiles_1d", "time");
-                // Note: Pas besoin de setIndex(t_idx) ici, PanzerDB gère l'index d'ajout en mode APPEND
+                // Note: no need for setIndex(t_idx) here, PanzerDB handles the append index in APPEND mode
                 backend.beginArraystructAction(&profilesCtx, &p_size);
 
                 // ion

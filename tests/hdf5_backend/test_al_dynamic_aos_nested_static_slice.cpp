@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_bug_dynamic_aos_nested_static.cpp
+// @file  test_al_dynamic_aos_nested_static_slice.cpp
+// @brief Bug reproduction test: reading a slice of a dynamic AoS that contains
+//        a nested static AoS with a varying size per slice.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -33,7 +35,7 @@ int main() {
         const int BUG_TRIGGER_SIZE = 2;    // Size at t=0 to trigger the bug
 
         // ===================================================================
-        // 1. Écriture (simule ids_put of b_field_non_axisymmetric)
+        // 1. Writing (simulates ids_put of b_field_non_axisymmetric)
         // ===================================================================
         {
             std::cout << "\n--- Phase 1: Writing Data (Global Write) ---\n";
@@ -120,7 +122,7 @@ int main() {
         }
 
         // ===================================================================
-        // 2. Lecture (simule ids_get_slice) et Vérification
+        // 2. Reading (simulates ids_get_slice) and Verification
         // ===================================================================
         {
             std::cout << "\n--- Phase 2: Reading Slice and checking for bug ---\n";

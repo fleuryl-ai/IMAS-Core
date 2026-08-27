@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_nested_static_aos.cpp
+// @file  test_al_nested_static_aos.cpp
+// @brief Tests a deeply nested static AoS (source > ion/neutral > element)
+//        with 0D signals, written and read back.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

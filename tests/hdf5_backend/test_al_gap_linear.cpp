@@ -1,9 +1,8 @@
-// tests/hdf5_backend/test_gap_linear_read.cpp
-//
-// Vérifie la lecture linear d'un signal dynamique présentant des "trous".
-// Quand la slice demandée est absente, l'interpolation doit se faire
-// entre les slices EXISTANTES les plus proches (la dernière <= t et la
-// première >= t), jamais avec une slice arbitraire.
+// @file  test_al_gap_linear.cpp
+// @brief Verifies linear reads of a dynamic signal with gaps. When the
+//        requested slice is absent, the interpolation must be done between
+//        the closest EXISTING slices (the last one <= t and the first one >= t),
+//        never with an arbitrary slice.
 #include "al_context.h"
 #include "al_defs.h"
 #include "al_const.h"
@@ -34,9 +33,9 @@ static void write_fixture() {
     for (int i = 0; i < 5; ++i) {
         double t = 0.1 * i;
         backend.writeData(&ctxB, "time", "", &t, alconst::double_data, 0, nullptr);
-        if (i != 2)              // sigA: trou à la slice 2 (t=0.2)
+        if (i != 2)              // sigA: gap at slice 2 (t=0.2)
             { double v = 100.0 + i * 10.0; backend.writeData(&ctxB, "sigA", "time", &v, alconst::double_data, 0, nullptr); }
-        if (i != 1)              // sigB: trou à la slice 1
+        if (i != 1)              // sigB: gap at slice 1
             { double v = 200.0 + i * 10.0; backend.writeData(&ctxB, "sigB", "time", &v, alconst::double_data, 0, nullptr); }
         { double v = 300.0 + i * 10.0; backend.writeData(&ctxB, "sigC", "time", &v, alconst::double_data, 0, nullptr); }
         if (i < 4) ctxB.nextIndex(1);
@@ -82,7 +81,7 @@ static double read_scalar(int interp, double req_time,
 }
 
 static int nfail = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; nfail++; } } while(0)
+#include "fixtures/check.h"
 
 int main() {
     try {
@@ -92,38 +91,38 @@ int main() {
             CHECK(std::abs(got - exp) < 1e-6, std::string(what) + ": got " + std::to_string(got) + " expected " + std::to_string(exp));
         };
 
-        // ---- sigA: 100,110,(trou),130,140 (valeurs 100+i*10, trou à i=2) ----
-        // t=0.05 -> entre 0 (100) et 0.1 (110) -> 105
+        // ---- sigA: 100,110,(gap),130,140 (values 100+i*10, gap at i=2) ----
+        // t=0.05 -> between 0 (100) and 0.1 (110) -> 105
         check(lin(0.05, "sigA"), 105.0, "linear sigA@0.05");
-        // t=0.2 (TRU) -> entre 0.1 (110) et 0.3 (130) -> 120
+        // t=0.2 (gap) -> between 0.1 (110) and 0.3 (130) -> 120
         check(lin(0.2, "sigA"),  120.0, "linear sigA@0.2 (gap)");
-        // t=0.25 -> entre 0.1 (110) et 0.3 (130) -> factor (0.25-0.1)/(0.3-0.1)=0.75 -> 110+0.75*20=125
+        // t=0.25 -> between 0.1 (110) and 0.3 (130) -> factor (0.25-0.1)/(0.3-0.1)=0.75 -> 110+0.75*20=125
         check(lin(0.25, "sigA"), 125.0, "linear sigA@0.25");
-        // t=0.35-> entre 0.3 (130) et 0.4 (140) -> 135
+        // t=0.35 -> between 0.3 (130) and 0.4 (140) -> 135
         check(lin(0.35, "sigA"), 135.0, "linear sigA@0.35");
-        // t=0.4 -> 140 (dernier, pas d'interp)
+        // t=0.4 -> 140 (last, no interp)
         check(lin(0.4, "sigA"),  140.0, "linear sigA@0.4");
-        // t=0.0 -> 100 (premier)
+        // t=0.0 -> 100 (first)
         check(lin(0.0, "sigA"),  100.0, "linear sigA@0.0");
 
-        // ---- sigB: 200,(trou@t=0.1),220,230,240 ----
-        // Interpolation par temps entre slices existantes 0 (200) et 0.2 (220) :
+        // ---- sigB: 200,(gap@t=0.1),220,230,240 ----
+        // Time-based interpolation between existing slices 0 (200) and 0.2 (220):
         // t=0.05 -> factor 0.05/0.2=0.25 -> 200+0.25*20=205
         check(lin(0.05, "sigB"), 205.0, "linear sigB@0.05");
-        // t=0.1 (TRU) -> factor 0.1/0.2=0.5 -> 200+0.5*20=210
+        // t=0.1 (gap) -> factor 0.1/0.2=0.5 -> 200+0.5*20=210
         check(lin(0.1, "sigB"),  210.0, "linear sigB@0.1 (gap)");
         // t=0.15 -> factor 0.15/0.2=0.75 -> 200+0.75*20=215
         check(lin(0.15, "sigB"), 215.0, "linear sigB@0.15");
-        // t=0.2 -> 220 (présente)
+        // t=0.2 -> 220 (present)
         check(lin(0.2, "sigB"),  220.0, "linear sigB@0.2");
-        // t=0.3 -> 230 (présente)
+        // t=0.3 -> 230 (present)
         check(lin(0.3, "sigB"),  230.0, "linear sigB@0.3");
 
-        // ---- sigC: présent partout ----
+        // ---- sigC: present everywhere ----
         check(lin(0.2, "sigC"),  320.0, "linear sigC@0.2");
         check(lin(0.15, "sigC"), 315.0, "linear sigC@0.15");
 
-        // ---- Signal jamais écrit -> non disponible ----
+        // ---- Signal never written -> unavailable ----
         bool avail = false;
         read_scalar(alconst::linear_interp, 0.2, "sig_never", &avail);
         CHECK(!avail, "linear sig_never should be unavailable");

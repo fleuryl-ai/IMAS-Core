@@ -1,4 +1,6 @@
-// test_dynamic_aos_string_inhom.cpp
+// @file  test_al_dynamic_aos_string_inhom_slice.cpp
+// @brief Dynamic AoS with string and complex signals under inhomogeneous time:
+//        global write, slice reads, slice appends, then slice read-back.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -32,34 +34,34 @@ int main() {
             OperationContext opCtx(&dataEntryCtx, "test_ids", "", WRITE_OP);
             backend.beginAction(&opCtx);
 
-            // On définit le temps comme inhomogène
+            // Define the time as inhomogeneous
             int homogeneous_time = 0;
             backend.writeData(&opCtx, "ids_properties/homogeneous_time", "", &homogeneous_time, alconst::integer_data, 0, nullptr);
 
-            // En mode inhomogène, la base de temps est définie au sein de la structure de données.
-            // Il n'y a pas de vecteur 'time' global.
+            // In inhomogeneous mode, the time base is defined inside the data structure.
+            // There is no global 'time' vector.
 
-            // AoS A (Statique)
+            // AoS A (static)
             int size_A = 1;
             ArraystructContext ctxA(&opCtx, "A", "");
             backend.beginArraystructAction(&ctxA, &size_A);
 
-            // AoS B (Statique)
+            // AoS B (static)
             int size_B = 1;
             ArraystructContext ctxB(&ctxA, "B", "");
             backend.beginArraystructAction(&ctxB, &size_B);
 
-            // AoS C (Dynamique)
+            // AoS C (dynamic)
             int size_C = 10;
-            ArraystructContext ctxC(&ctxB, "C", "time"); // C est temporel, sa base de temps s'appelle "time"
+            ArraystructContext ctxC(&ctxB, "C", "time"); // C is temporal, its time base is named "time"
             backend.beginArraystructAction(&ctxC, &size_C);
 
             for(int t=0; t<size_C; ++t) {
-                // Pour chaque tranche de l'AoS dynamique, on doit fournir la valeur de temps.
+                // For each slice of the dynamic AoS, the time value must be provided.
                 double current_time = (double)t * 0.1;
                 backend.writeData(&ctxC, "time", "", &current_time, alconst::double_data, 0, nullptr);
 
-                // Écriture des autres signaux dynamiques
+                // Write the other dynamic signals
                 std::string val = "String_" + std::to_string(t);
                 int str_dim = 1;
                 int str_size[] = {(int)val.length()};
@@ -78,8 +80,8 @@ int main() {
             std::cout << GREEN << "[OK] Writing completed.\n" << RESET;
         }
 
-        // 2. Reading (Slice) - Cette partie doit fonctionner à l'identique du cas homogène.
-        // Le backend doit être capable de trouver la base de temps inhomogène correctement.
+        // 2. Reading (Slice) - this part must behave exactly like the homogeneous case.
+        // The backend must be able to locate the inhomogeneous time base correctly.
         std::vector<double> slice_times = {0.2, 0.5, 0.8}; // Indices 2, 5, 8
         for(double t_req : slice_times) {
             DataEntryContext dataEntryCtx(URI);
@@ -101,13 +103,13 @@ int main() {
             backend.beginArraystructAction(&ctxB, &size_B);
             assert(size_B == 1);
 
-            // L'AoS C est dynamique. En mode slice, sa taille doit être 1.
+            // AoS C is dynamic. In slice mode, its size must be 1.
             int size_C = 0;
             ArraystructContext ctxC(&ctxB, "C", "time");
             backend.beginArraystructAction(&ctxC, &size_C);
             assert(size_C == 1);
 
-            // Validation de dyn_str
+            // Validate dyn_str
             void* data_ptr = nullptr;
             int datatype = alconst::char_data;
             int dim = 0;
@@ -128,7 +130,7 @@ int main() {
             }
             free(data_ptr);
 
-            // Validation de dyn_complex
+            // Validate dyn_complex
             void* cplx_ptr = nullptr;
             int cplx_datatype = alconst::complex_data;
             int cplx_dim = 0;
@@ -233,7 +235,7 @@ int main() {
                 backend.beginArraystructAction(&ctxC, &size_C);
                 assert(size_C == 1);
 
-                // Validation de dyn_str
+                // Validation of dyn_str
                 void* data_ptr = nullptr;
                 int datatype = alconst::char_data;
                 int dim = 0;
@@ -254,7 +256,7 @@ int main() {
                 }
                 free(data_ptr);
 
-                // Validation de dyn_complex
+                // Validation of dyn_complex
                 void* cplx_ptr = nullptr;
                 int cplx_datatype = alconst::complex_data;
                 int cplx_dim = 0;

@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic.cpp
+// @file  test_al_profiles_1d_dynamic.cpp
+// @brief Tests a profiles_1d dynamic AoS with homogeneous time: global write of a
+//        scalar signal per time step and iterative read validation.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -48,16 +50,16 @@ int main() {
             backend.writeData(&opCtx, "time", "time", time_values.data(), alconst::double_data, time_dim, time_size);
 
             // profiles_1d Dynamic AoS
-            // profiles_1d est un tableau de structures indexé par le temps.
+            // profiles_1d is a time-indexed array of structures.
             ArraystructContext profilesCtx(&opCtx, "profiles_1d", "time");
             backend.beginArraystructAction(&profilesCtx, (int*)&time_steps);
 
             for (int t = 0; t < time_steps; ++t) {
                 // Signal inside profiles_1d. Let's call it "electrons/density_thermal".
-                // C'est un scalaire à chaque pas de temps (donc dimension 0 pour la slice).
+                // It is a scalar at each time step (so dimension 0 for the slice).
                 double val = 100.0 + t * 1.5;
                 
-                // On écrit la valeur pour l'instant t courant
+                // Write the value for the current time step t
                 backend.writeData(&profilesCtx, "electrons/density_thermal", "time", &val, alconst::double_data, 0, nullptr);
                 
                 if (t < time_steps - 1) profilesCtx.nextIndex(1);
@@ -102,8 +104,8 @@ int main() {
             for (int t = 0; t < time_steps; ++t) {
                 backend.readData(&profilesCtx, "electrons/density_thermal", "time", &data, &type, &dim, size);
                 
-                // En lecture globale itérative sur un AoS, on lit l'élément courant.
-                // Ici, c'est un scalaire (la valeur du signal à l'instant t).
+                // In an iterative global read on an AoS, the current element is read.
+                // Here, it is a scalar (the signal value at time t).
                 assert(dim == 0);
                 double val = *(double*)data;
                 double expected = 100.0 + t * 1.5;

@@ -1,4 +1,6 @@
-// test_core_sources_aos_fixed.cpp
+// @file  test_al_core_sources_put_slice.cpp
+// @brief Put-slice regression test for core_sources with nested AoS
+//        (source / profiles_1d / ion), verifying the written files exist.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -13,7 +15,7 @@ const std::string URI = "imas:hdf5?path=./test_db_test_core_sources";
 int main() {
   try {
     std::cout
-        << "=== Test core_sources : AOS imbriqués + putSlice (CORRIGÉ) ===\n";
+        << "=== Test core_sources: nested AoS + putSlice (FIXED) ===\n";
 
     int s = 5, t = 3;
     std::vector<double> time(t), vect1DDouble(t);
@@ -70,7 +72,7 @@ int main() {
         OperationContext sliceCtx(&dataEntryCtx, "core_sources", WRITE_OP,
         alconst::slice_op, nd_time, interpmode);
         backend.beginAction(&sliceCtx);*/
-        fprintf(stderr, "Ecriture core_sources.source[%d].profiles_1d[%d]\n", i,
+        fprintf(stderr, "Writing core_sources.source[%d].profiles_1d[%d]\n", i,
                 j);
 
         // int size_time[1] = {1};
@@ -132,7 +134,7 @@ int main() {
         profilesCtx->nextIndex(1);
       }
       backend.endAction(profilesCtx);
-      sourceCtx->nextIndex(1); // Correct : après source[i]
+      sourceCtx->nextIndex(1); // Correct: after source[i]
     }
 
     backend.endAction(sourceCtx);
@@ -142,14 +144,14 @@ int main() {
 
     std::string ids_file = "./test_db_test_core_sources/core_sources.h5";
     if (!fs::exists(ids_file)) {
-      std::cerr << "ERREUR : Fichier non créé\n";
+      std::cerr << "ERROR: file was not created\n";
       return 1;
     }
-    std::cout << "[OK] Fichier créé : " << ids_file << "\n";
+    std::cout << "[OK] File created: " << ids_file << "\n";
 
-    std::cout << "\n=== TEST RÉUSSI ===\n";
+    std::cout << "\n=== TEST SUCCESSFUL ===\n";
   } catch (const std::exception &e) {
-    std::cerr << "Exception : " << e.what() << std::endl;
+    std::cerr << "Exception: " << e.what() << std::endl;
     return 1;
   }
   return 0;

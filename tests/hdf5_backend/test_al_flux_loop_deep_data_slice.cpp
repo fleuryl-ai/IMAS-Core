@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_magnetics_repro.cpp
+// @file  test_al_flux_loop_deep_data_slice.cpp
+// @brief Magnetics repro test: write then read back flux_loop[j].flux.data
+//        (homogeneous time) and validate all values.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

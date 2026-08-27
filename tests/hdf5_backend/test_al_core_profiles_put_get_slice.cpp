@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_core_profiles_put_get_slice.cpp
+// @file  test_al_core_profiles_put_get_slice.cpp
+// @brief Put/get and put-slice/get-slice coverage for core_profiles:
+//        1D and 2D signals, string scalars/lists, and static ion AoS.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -89,13 +91,13 @@ void core_profiles_put() {
         int sig_size[] = {SPATIAL_SIZE};
         backend.writeData(&profilesCtx, "signal_1d", "", val.data(), alconst::double_data, sig_dim, sig_size);
 
-        // Ajout signal 0D char_data 'string_0d'
+        // Add 0D char_data signal 'string_0d'
         std::string str_val = "String_" + std::to_string(t);
         int str_dim = 1;
         int str_size_arr[] = {(int)str_val.length()};
         backend.writeData(&profilesCtx, "string_0d", "", (void*)str_val.c_str(), alconst::char_data, str_dim, str_size_arr);
 
-        // Ajout signal 1D char_data 'string_1d'
+        // Add 1D char_data signal 'string_1d'
         int str_1d_dim = 2;
         int str_1d_size_arr[] = {SPATIAL_SIZE, STR_1D_LEN};
         std::vector<char> str_1d_buf(SPATIAL_SIZE * STR_1D_LEN, 0);
@@ -105,7 +107,7 @@ void core_profiles_put() {
         }
         backend.writeData(&profilesCtx, "string_1d", "", str_1d_buf.data(), alconst::char_data, str_1d_dim, str_1d_size_arr);
 
-        // Ajout AOS statique 'ion' avec donnée 0D 'z_ion'
+        // Add static AoS 'ion' with 0D datum 'z_ion'
         ArraystructContext ionCtx(&profilesCtx, "ion", "");
         backend.beginArraystructAction(&ionCtx, (int*)&ION_SIZE);
         for (int i = 0; i < ION_SIZE; ++i) {
@@ -217,7 +219,7 @@ void core_profiles_get() {
         }
         delete[] (char*)str_1d_data;
 
-        // Validation AOS statique 'ion'
+        // Validate static AoS 'ion'
         ArraystructContext ionCtx(&profilesCtx, "ion", "");
         int ion_size = 0;
         backend.beginArraystructAction(&ionCtx, &ion_size);

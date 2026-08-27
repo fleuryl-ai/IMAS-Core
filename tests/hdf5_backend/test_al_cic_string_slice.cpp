@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_bug_cic_string_slice.cpp
+// @file  test_al_cic_string_slice.cpp
+// @brief Bug reproduction test: reading a slice of a 1-element string list
+//        nested inside a dynamic AoS of core_instant_changes.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

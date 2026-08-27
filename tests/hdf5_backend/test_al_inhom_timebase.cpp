@@ -1,4 +1,6 @@
-// test_inhom_timebase.cpp
+// @file  test_al_inhom_timebase.cpp
+// @brief Tests an inhomogeneous (per-element) timebase: each B[j] has its own
+//        timebase, written and read back as a full array.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

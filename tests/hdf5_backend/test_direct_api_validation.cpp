@@ -1,3 +1,6 @@
+// @file  test_direct_api_validation.cpp
+// @brief Direct access API test: validates index/time-slice reads, linear and closest
+//        interpolation, in-memory non-contiguous slicing, lists of strings, INT32 and metadata reads.
 #include "direct_access_api.h"
 #include "panzerdb.h"
 #include <iostream>
@@ -11,11 +14,11 @@ void generate_test_file(const std::string& filename) {
     if (std::filesystem::exists(filename)) std::filesystem::remove(filename);
     PanzerDB db(filename, PanzerDB::OpenMode::WRITE);
 
-    // --- Écrire la propriété homogeneous_time ---
+    // --- Write the homogeneous_time property ---
     int32_t homogeneous_time_val = 0; 
     db.writeData("ids_properties/homogeneous_time", {}, &homogeneous_time_val, 1);
 
-    // --- Données pour les tests ---
+    // --- Data for the tests ---
     const int time_steps = 5;
     const int ion_size = 3;
     const int state_size = 2;
@@ -40,12 +43,12 @@ void generate_test_file(const std::string& filename) {
             for (int s = 0; s < state_size; ++s) {
                 db.setCurrentArrayIndex(s);
                 
-                // Écrire la donnée double
+                // Write the double value
                 double z_ion_val = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
                 db.writeData("z_ion", {}, &z_ion_val, 1);
                 
-                // CORRECTION : Écrire la donnée entière qui manquait
-                int32_t a_z_val = t * 100 + i * 10 + s; // Valeur unique pour le test
+                // CORRECTION: Write the missing integer value
+                int32_t a_z_val = t * 100 + i * 10 + s; // Unique value for the test
                 db.writeData("a_z", {}, &a_z_val, 1);
             }
             db.endArray(); // state
@@ -54,12 +57,12 @@ void generate_test_file(const std::string& filename) {
     }
     db.endArray(); // profiles_1d
 
-    // --- Données pour le test de liste de chaînes de caractères (CORRIGÉ) ---
+    // --- Data for the list of strings test (FIXED) ---
     const std::vector<const char*> diags = {"bolometer", "interferometer", "thomson_scattering", "ece"};
     db.beginArray("diagnostics", diags.size());
     for (size_t i = 0; i < diags.size(); ++i) {
         db.setCurrentArrayIndex(i);
-        // CORRECTION: Utiliser writeDataSlices, qui est la bonne méthode pour les chaînes.
+        // CORRECTION: Use writeDataSlices, which is the right method for strings.
         db.writeDataSlices("name", {1}, &diags[i], 1, "");
     }
     db.endArray(); // diagnostics
@@ -132,7 +135,7 @@ void validate_time_interp_read() {
     assert(view.dims()[2] == 2);
 
     const double* data = view.as<double>();
-    int t = 2; // t=2.7 est plus proche de 3.0 (index 2)
+    int t = 2; // t=2.7 is closer to 3.0 (index 2)
     for (int i = 0; i < 3; ++i) {
         for (int s = 0; s < 2; ++s) {
             double expected = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
@@ -147,26 +150,26 @@ void validate_linear_interp_read() {
     std::cout << "\n--- Validating Time Interpolation (Linear) ---\n";
     const std::string ids_name = "test_direct_api_validation";
     // Le temps est [1.0, 2.0, 3.0, 4.0, 5.0].
-    // On demande le point de temps 2.5, qui est à mi-chemin entre 2.0 (index 1) et 3.0 (index 2).
+    // We request time point 2.5, which is midway between 2.0 (index 1) and 3.0 (index 2).
     const std::string path = "profiles_1d[time=2.5,interp=linear]/ion/state/z_ion";
     
     auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
-    // Les dimensions doivent correspondre à une seule tranche de temps interpolée
+    // The dimensions must correspond to a single interpolated time slice
     assert(view.dims().size() == 2);
     assert(view.dims()[0] == 3); // 3 ions
     assert(view.dims()[1] == 2); // 2 states
 
     const double* data = view.as<double>();
 
-    // Vérifier les valeurs interpolées
+    // Check the interpolated values
     for (int i = 0; i < 3; ++i) {
         for (int s = 0; s < 2; ++s) {
-            // Valeur au temps t=2.0 (index 1)
+            // Value at time t=2.0 (index 1)
             double val_t1 = 100.0 + (1 * 10.0) + (i * 1.0) + (s * 0.1);
-            // Valeur au temps t=3.0 (index 2)
+            // Value at time t=3.0 (index 2)
             double val_t2 = 100.0 + (2 * 10.0) + (i * 1.0) + (s * 0.1);
-            // La valeur interpolée à t=2.5 doit être la moyenne
+            // The value interpolated at t=2.5 must be the average
             double expected = (val_t1 + val_t2) / 2.0;
             
             double actual = data[i * 2 + s];
@@ -179,12 +182,12 @@ void validate_linear_interp_read() {
 void validate_in_memory_slice() {
     std::cout << "\n--- Validating In-Memory Slicing ---\n";
     const std::string ids_name = "test_direct_api_validation";
-    // 1. Lire un bloc de données multidimensionnel en mémoire
+    // 1. Read a multidimensional data block in memory
     const std::string path = "profiles_1d[1:3]/ion/state/z_ion"; // Dims: {2, 3, 2}
     auto view_orig = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
-    // 2. Test 1: Extraire la première tranche de temps (indice 0 de la vue)
-    // Cela correspond au temps d'origine t=1
+    // 2. Test 1: Extract the first time slice (index 0 of the view)
+    // This corresponds to original time t=1
     auto view_t1 = view_orig.slice({ imas::direct_access::SliceSelection::at(0) });
     
     assert(view_t1.dims().size() == 2);
@@ -192,7 +195,7 @@ void validate_in_memory_slice() {
     assert(view_t1.dims()[1] == 2); // 2 states
 
     const double* data_t1 = view_t1.as<double>();
-    int t = 1; // Temps d'origine
+    int t = 1; // Original time
     for (int i = 0; i < 3; ++i) {
         for (int s = 0; s < 2; ++s) {
             double expected = 100.0 + (t * 10.0) + (i * 1.0) + (s * 0.1);
@@ -202,16 +205,16 @@ void validate_in_memory_slice() {
     }
     std::cout << "[OK] In-memory slice on first dimension validated.\n";
 
-    // 3. Test 2: Extraire le deuxième ion (indice 1) sur tous les temps
-    // C'est un test important car les données ne sont pas contiguës dans le buffer d'origine
+    // 3. Test 2: Extract the second ion (index 1) over all times
+    // This is an important test because the data are not contiguous in the original buffer
     auto view_i1 = view_orig.slice({ imas::direct_access::SliceSelection::all(), imas::direct_access::SliceSelection::at(1) });
 
     assert(view_i1.dims().size() == 2);
-    assert(view_i1.dims()[0] == 2); // 2 tranches de temps
+    assert(view_i1.dims()[0] == 2); // 2 time slices
     assert(view_i1.dims()[1] == 2); // 2 states
 
     const double* data_i1 = view_i1.as<double>();
-    int i = 1; // Ion d'origine
+    int i = 1; // Original ion
     for (int t_slice = 0; t_slice < 2; ++t_slice) {
         t = 1 + t_slice;
         for (int s = 0; s < 2; ++s) {
@@ -239,7 +242,7 @@ void validate_list_of_strings_read() {
 
     assert(view.type() == imas::direct_access::DataType::LIST_OF_STRINGS);
     assert(view.dims().size() == 2);
-    assert(view.dims()[0] == 4); // 4 chaînes
+    assert(view.dims()[0] == 4); // 4 strings
     assert(view.dims()[1] == string_dim);
 
     const char* data = view.as<char>();
@@ -255,17 +258,17 @@ void validate_list_of_strings_read() {
 void validate_int_read() {
     std::cout << "\n--- Validating INT32 Read ---\n";
     const std::string ids_name = "test_direct_api_validation";
-    // Lire la donnée entière pour le temps t=1, ion i=0, state s=0
+    // Read the integer value for time t=1, ion i=0, state s=0
     const std::string path = "profiles_1d[1]/ion[0]/state[0]/a_z";
     
     auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
-    // Vérifier le type et les dimensions
+    // Check the type and dimensions
     assert(view.type() == imas::direct_access::DataType::INT32);
     assert(view.dims().size() == 1);
     assert(view.dims()[0] == 1);
 
-    // Vérifier la valeur
+    // Check the value
     const int32_t* data = view.as<int32_t>();
     int32_t expected = 6;
     assert(data[0] == expected);
@@ -276,12 +279,12 @@ void validate_int_read() {
 void validate_metadata_read() {
     std::cout << "\n--- Validating Metadata Read ---\n";
     const std::string ids_name = "test_direct_api_validation";
-    // On lit n'importe quelle instance de z_ion, les métadonnées sont les mêmes pour toutes.
+    // We read any instance of z_ion; the metadata are the same for all of them.
     const std::string path = "profiles_1d[0]/ion[0]/state[0]/z_ion";
     
     auto view = imas::direct_access::read_tensor(ids_name + ".h5", path);
 
-    // Récupérer et valider les métadonnées
+    // Retrieve and validate the metadata
     const auto& metadata = view.metadata();
     assert(!metadata.empty());
     assert(metadata.count("units") == 1);
@@ -294,22 +297,22 @@ void validate_dynamic_parent_read() {
     std::cout << "\n--- Validating Read from Dynamic Parent (sig_dyn) ---\n";
     const std::string ids_name = "test_direct_api_validation";
     
-    // Test 1: Lecture d'un slice temporel (t=2, index temporel 2)
+    // Test 1: Read a time slice (t=2, time index 2)
     const std::string path_slice = "profiles_1d[2]/sig_dyn";
     auto view_slice = imas::direct_access::read_tensor(ids_name + ".h5", path_slice);
     
     assert(view_slice.type() == imas::direct_access::DataType::DOUBLE);
-    assert(view_slice.dims().size() == 1); // C'est un scalaire par slice, donc 1 valeur
+    assert(view_slice.dims().size() == 1); // It is a scalar per slice, so 1 value
     assert(view_slice.dims()[0] == 1);
     assert(std::abs(view_slice.as<double>()[0] - 20.0) < 1e-9);
 
-    // Test 2: Lecture de tous les temps (-1)
+    // Test 2: Read all times (-1)
     const std::string path_all = "profiles_1d/sig_dyn";
     auto view_all = imas::direct_access::read_tensor(ids_name + ".h5", path_all);
     
     assert(view_all.type() == imas::direct_access::DataType::DOUBLE);
     assert(view_all.dims().size() == 1);
-    assert(view_all.dims()[0] == 5); // 5 pas de temps
+    assert(view_all.dims()[0] == 5); // 5 time steps
     
     const double* data_all = view_all.as<double>();
     for (int t = 0; t < 5; ++t) {

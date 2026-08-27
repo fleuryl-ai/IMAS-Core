@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_magnetics_resampling_vector.cpp
+// @file  test_al_resampling_user_vector.cpp
+// @brief Tests magnetics resampling with a user-provided time vector and with a
+//        single dtime element (resampling step) in time-range reads.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

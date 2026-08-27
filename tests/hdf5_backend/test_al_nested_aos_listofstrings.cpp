@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_nested_aos_char_data.cpp
+// @file  test_al_nested_aos_listofstrings.cpp
+// @brief Tests a nested static AoS (coordinate_system > coordinate) holding a
+//        list of strings per element, written and read back.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -28,7 +30,7 @@ int main() {
         const int string_list_count = 3;      // Number of strings in the list
         const int max_string_len = 32;        // Max length for each string
 
-        // 1. Writingen 
+        // 1. Writing
         {
             std::cout << "\n--- Phase 1: Writing Data ---\n";
             DataEntryContext dataEntryCtx(URI);

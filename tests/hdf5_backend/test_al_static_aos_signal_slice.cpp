@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_bug_static_aos_slice.cpp
+// @file  test_al_static_aos_signal_slice.cpp
+// @brief Bug reproduction test: reading a slice of a dynamic signal (with its own
+//        time vector) nested in a static AoS (flux_loop/flux).
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -33,7 +35,7 @@ int main() {
         const std::vector<double> times = {0.1, 0.2, 0.3};
 
         // ===================================================================
-        // 1. Écriture (simule ids_put of magnetics)
+        // 1. Writing (simulates ids_put for magnetics)
         // ===================================================================
         {
             std::cout << "\n--- Phase 1: Writing Data (Global Write) ---\n";
@@ -82,7 +84,7 @@ int main() {
         }
 
         // ===================================================================
-        // 2. Lecture (simule ids_get_slice) et Vérification
+        // 2. Reading (simulates ids_get_slice) and validation
         // ===================================================================
         {
             std::cout << "\n--- Phase 2: Reading Slice and checking for bug ---\n";

@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic_signal_1d.cpp
+// @file  test_al_profiles_1d_dynamic_signal_1d.cpp
+// @brief Tests profiles_1d dynamic AoS with 1D signals (homogeneous time): global
+//        write, iterative read validation, and slice reads.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -57,15 +59,15 @@ int main() {
             backend.writeData(&opCtx, "time", "time", time_values.data(), alconst::double_data, time_dim, time_size);
 
             // profiles_1d Dynamic AoS
-            // profiles_1d est un tableau de structures indexé par le temps.
+            // profiles_1d is a time-indexed array of structures.
             ArraystructContext profilesCtx(&opCtx, "profiles_1d", "time");
             backend.beginArraystructAction(&profilesCtx, (int*)&time_steps);
 
             for (int t = 0; t < time_steps; ++t) {
                 // Signal inside profiles_1d. Let's call it "signal_1d".
-                // C'est un tableau 1D spatial (taille 10) à chaque pas de temps.
-                // Pour écrire une slice temporelle d'un tableau 1D, on doit passer dim=2 et size={spatial, 1}
-                // pour indiquer qu'on écrit 1 slice de taille spatiale donnée.
+                // It is a 1D spatial array (size 10) at each time step.
+                // To write a time slice of a 1D array, dim=2 and size={spatial, 1} must be passed
+                // to indicate that one slice of a given spatial size is written.
                 
                 std::vector<double> val(spatial_size);
                 for(int x=0; x<spatial_size; ++x) {
@@ -73,23 +75,23 @@ int main() {
                 }
                 int sig_dim = 1;
                 int sig_size[] = {spatial_size};
-                // On écrit la valeur pour l'instant t courant
+                // Write the value for the current time step t
                 backend.writeData(&profilesCtx, "signal_1d", "", val.data(), alconst::double_data, sig_dim, sig_size);
 
-                // Ajout d'un deuxième signal 1D spatial ("signal_1d_bis")
+                // Add a second 1D spatial signal ("signal_1d_bis")
                 std::vector<double> val_bis(spatial_size);
                 for(int x=0; x<spatial_size; ++x) {
                     val_bis[x] = 500.0 + t * 20.0 + x * 2.0;
                 }
                 backend.writeData(&profilesCtx, "signal_1d_bis", "", val_bis.data(), alconst::double_data, sig_dim, sig_size);
                 
-                // Ajout signal 0D char_data 'string_0d'
+                // Add 0D char_data signal 'string_0d'
                 std::string str_val = "String_" + std::to_string(t);
                 int str_dim = 1;
                 int str_size_arr[] = {(int)str_val.length()};
                 backend.writeData(&profilesCtx, "string_0d", "", (void*)str_val.c_str(), alconst::char_data, str_dim, str_size_arr);
 
-                // Ajout signal 1D char_data 'string_1d'
+                // Add 1D char_data signal 'string_1d'
                 int str_1d_len = 32;
                 int str_1d_dim = 2;
                 int str_1d_size_arr[] = {spatial_size, str_1d_len};
@@ -100,7 +102,7 @@ int main() {
                 }
                 backend.writeData(&profilesCtx, "string_1d", "", str_1d_buf.data(), alconst::char_data, str_1d_dim, str_1d_size_arr);
 
-                // Ajout AOS statique 'ion' avec donnée 0D 'z_ion'
+                // Add static AoS 'ion' with 0D data 'z_ion'
                 int ion_size = 3;
                 ArraystructContext ionCtx(&profilesCtx, "ion", "");
                 backend.beginArraystructAction(&ionCtx, &ion_size);
@@ -109,7 +111,7 @@ int main() {
                     double z_ion_val = 1.0 + t + i;
                     backend.writeData(&ionCtx, "z_ion", "", &z_ion_val, alconst::double_data, 0, nullptr);
 
-                    // Ajout AOS statique 'element' dans 'ion' avec donnée 0D 'a_dyn'
+                    // Add static AoS 'element' inside 'ion' with 0D data 'a_dyn'
                     int element_size = 2;
                     ArraystructContext elementCtx(&ionCtx, "element", "");
                     backend.beginArraystructAction(&elementCtx, &element_size);
@@ -166,8 +168,8 @@ int main() {
             for (int t = 0; t < time_steps; ++t) {
                 backend.readData(&profilesCtx, "signal_1d", "", &data, &type, &dim, size);
                 
-                // En lecture globale itérative sur un AoS, on lit l'élément courant (la slice).
-                // Ici, c'est un tableau 1D spatial.
+                // In an iterative global read on an AoS, the current element (the slice) is read.
+                // Here, it is a 1D spatial array.
                 //printf("dim=%d size[0]=%d\n", dim, size[0]);
                 assert(dim == 1);
                 assert(size[0] == spatial_size);
@@ -231,7 +233,7 @@ int main() {
                 }
                 delete[] (char*)str_1d_data;
 
-                // Validation AOS statique 'ion'
+                // Validation of static AoS 'ion'
                 ArraystructContext ionCtx(&profilesCtx, "ion", "");
                 int ion_size = 0;
                 backend.beginArraystructAction(&ionCtx, &ion_size);
@@ -248,7 +250,7 @@ int main() {
                     }
                     free(z_data);
 
-                    // Validation AOS statique 'element'
+                    // Validation of static AoS 'element'
                     ArraystructContext elementCtx(&ionCtx, "element", "");
                     int element_size = 0;
                     backend.beginArraystructAction(&elementCtx, &element_size);

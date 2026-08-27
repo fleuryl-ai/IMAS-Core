@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_timerange_root_string.cpp
+// @file  test_al_timerange_root_string.cpp
+// @brief AL-level test: writes a root static string plus a new static AoS and an
+//        infrastructure name field, then reads the static string via a TimeRange op (tmin/tmax).
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -60,16 +62,16 @@ int main() {
             int str_size[] = {(int)strlen(str_value)};
             backend.writeData(&opCtx, "static_string", "", (void*)str_value, alconst::char_data, str_dim, str_size);
 
-            // --- Ajout d'un nouvel AoS statique ---
+            // --- Adding a new static AoS ---
             ArraystructContext newAosCtx(&opCtx, "new_static_aos", "");
             backend.beginArraystructAction(&newAosCtx, (int*)&new_aos_size);
 
             for (int i = 0; i < new_aos_size; ++i) {
-                // Écriture d'un scalaire double
+                // Writing a double scalar
                 double dbl_val = dbl_scalar_base + i;
                 backend.writeData(&newAosCtx, "double_scalar", "", &dbl_val, alconst::double_data, 0, nullptr);
 
-                // Écriture d'une chaîne de caractères
+                // Writing a string
                 std::string aos_str_val = "String_in_AOS_" + std::to_string(i);
                 int aos_str_dim = 1;
                 int aos_str_size[] = {(int)aos_str_val.length()};
@@ -81,7 +83,7 @@ int main() {
             }
             backend.endAction(&newAosCtx);
 
-            // Écriture du champ statique ids_properties/plugins/infrastructure_get/name
+            // Writing the static field ids_properties/plugins/infrastructure_get/name
             int infra_dim = 1;
             int infra_size[] = {(int)strlen(infra_name_val)};
             backend.writeData(&opCtx, "ids_properties/plugins/infrastructure_get/name", "", (void*)infra_name_val, alconst::char_data, infra_dim, infra_size);
@@ -124,7 +126,7 @@ int main() {
             
             delete[] char_data;
 
-            // --- Validation du nouvel AoS statique ---
+            // --- Validation of the new static AoS ---
             int read_aos_size = 0;
             ArraystructContext newAosCtx(&opCtx, "new_static_aos", "");
             backend.beginArraystructAction(&newAosCtx, &read_aos_size);
@@ -137,7 +139,7 @@ int main() {
                 int aos_dim;
                 int aos_size_arr[H5S_MAX_RANK];
 
-                // Valider le scalaire double
+                // Validate the double scalar
                 aos_datatype = alconst::double_data;
                 backend.readData(&newAosCtx, "double_scalar", "", &aos_data_ptr, &aos_datatype, &aos_dim, aos_size_arr);
                 assert(aos_dim == 0);
@@ -145,7 +147,7 @@ int main() {
                 std::cout << "    double_scalar: " << *(double*)aos_data_ptr << " [OK]\n";
                 free(aos_data_ptr);
 
-                // Valider la chaîne de caractères
+                // Validate the string
                 aos_datatype = alconst::char_data;
                 backend.readData(&newAosCtx, "string_in_aos", "", &aos_data_ptr, &aos_datatype, &aos_dim, aos_size_arr);
                 assert(aos_dim == 1);
@@ -160,7 +162,7 @@ int main() {
             }
             backend.endAction(&newAosCtx);
 
-            // Validation du champ statique ids_properties/plugins/infrastructure_get/name
+            // Validation of the static field ids_properties/plugins/infrastructure_get/name
             void* infra_ptr = nullptr;
             int infra_datatype = alconst::char_data;
             int infra_dim = 0;

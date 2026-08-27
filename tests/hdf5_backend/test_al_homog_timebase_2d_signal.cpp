@@ -1,4 +1,6 @@
-// test_homog_2d.cpp
+// @file  test_al_homog_timebase_2d_signal.cpp
+// @brief Tests a homogeneous timebase with a 2D dynamic signal: write, read
+//        back, append slices, and global validation.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

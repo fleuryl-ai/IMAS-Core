@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_timerange_aos_string_list.cpp
+// @file  test_al_timerange_aos_string_list.cpp
+// @brief Tests time-range reads of a static AoS containing a static string list,
+//        validating the dim=2 size={count, max_len} AL convention.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -26,7 +28,7 @@ int main() {
         const int aos_size = 1;
         const int str_list_size = 3;
         const int max_len = 10;
-        // Création d'un buffer plat pour simuler le comportement standard de l'AL
+        // Create a flat buffer to simulate the standard AL behavior
         char str_values_flat[3][10];
         memset(str_values_flat, 0, 3*10);
         strcpy(str_values_flat[0], "Static_1");

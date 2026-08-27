@@ -1,4 +1,6 @@
-// test_panzer_empty_aos.cpp
+// @file  test_engine_empty_aos_getshape.cpp
+// @brief Tests getAOSShape on an AoS "A" (with child AoS "B") that was iterated
+//        but has no data leaves written.
 #include "panzerdb.h"
 #include <iostream>
 #include <cassert>
@@ -47,10 +49,10 @@ int main() {
 
         auto shapeB = db.getAOSShape("A/0/B");
         printf("shapeB[0]=%ld\n", shapeB[0]);
-        assert(shapeB[0] == 1 && "La taille de B doit être 1.");    
+        assert(shapeB[0] == 1 && "The size of B must be 1.");    
 
         auto shape1B = db.getAOSShape("A/1/B");
-        assert(shape1B[0] == 1 && "La taille de B doit être 1.");
+        assert(shape1B[0] == 1 && "The size of B must be 1.");
 
     }
 

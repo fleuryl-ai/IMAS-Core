@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_profiles_1d_dynamic_0d_append.cpp
+// @file  test_al_profiles_1d_dynamic_0d_append.cpp
+// @brief Tests appending slices to a profiles_1d dynamic AoS with 0D/1D
+//        signals, nested ion, time_slice and constraints, then validation.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

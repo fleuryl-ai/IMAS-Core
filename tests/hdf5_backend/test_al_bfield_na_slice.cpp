@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_bug_b_field_na_slice.cpp
+// @file  test_al_bfield_na_slice.cpp
+// @brief Bug reproduction test: reading a slice of b_field_non_axisymmetric
+//        (homogeneous_time = 0) with closest/linear/previous interpolation.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

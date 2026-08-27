@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_magnetics_repro_slice.cpp
+// @file  test_al_flux_loop_deep_data_getslice.cpp
+// @brief Magnetics repro test: full GET of flux_loop deep data, then a
+//        linear-interpolated GET-SLICE of flux_loop(0).flux.data.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -25,7 +27,7 @@ int main() {
         int staticsize = 3;
 
         // ==============================================================
-        // 1. SETUP: WRITE DATA (Création du Pulse)
+        // 1. SETUP: WRITE DATA (creating the pulse)
         // ==============================================================
         {
             std::cout << CYAN << "[1] Setting up data (Write)...\n" << RESET;
@@ -106,7 +108,7 @@ int main() {
                 
                 if (d != dynamicsize) throw std::runtime_error("Flux data size mismatch");
                 
-                // Verification sommaire des données
+                // Brief verification of the data
                 double* vals = (double*)data;
                 // for (int i=0; i<d; i++) std::cout << "data(" << i << ") = " << vals[i] << std::endl;
                 
@@ -138,7 +140,7 @@ int main() {
             int fl = 0;
             backend.beginArraystructAction(&fluxLoopCtx, &fl);
             
-            // On lit flux/data pour le premier élément (j=0)
+            // Read flux/data for the first element (j=0)
             void* data = nullptr;
             int type = alconst::double_data;
             int dim = 0;
@@ -151,11 +153,11 @@ int main() {
             double val = *(double*)data;
             std::cout << "flux_loop(0).flux.data(0) = " << val << std::endl;
             
-            // Calcul de la valeur attendue (Interpolation Linéaire)
+            // Computation of the expected value (linear interpolation)
             // Time array: 0.0, 0.1, 0.2, 0.3 ...
             // Target: 0.21
-            // Indices: 2 (0.2) et 3 (0.3)
-            // Data pour j=0: 0.0, 1.0, 2.0, 3.0 ... (valeur = index)
+            // Indices: 2 (0.2) and 3 (0.3)
+            // Data for j=0: 0.0, 1.0, 2.0, 3.0 ... (value = index)
             // Val(0.2) = 2.0
             // Val(0.3) = 3.0
             // Interp: 2.0 + (3.0 - 2.0) * (0.21 - 0.20) / (0.30 - 0.20)

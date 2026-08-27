@@ -1,4 +1,6 @@
-// test_panzer_root_scalar.cpp
+// @file  test_engine_write_read_root_scalar.cpp
+// @brief PanzerDB root scalar test: writes two scalars directly at the root
+//        ('temperature' and 'pression') and reads them back with readScalar.
 #include "panzerdb.h"
 #include <iostream>
 #include <cassert>
@@ -10,34 +12,34 @@ int main() {
     const std::string filename = "test_root_scalar.panzer";
 
     // ===================================================================
-    // 1. Écriture d'un scalaire à la racine
+    // 1. Write a scalar at the root
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::WRITE, true);
 
-        std::cout << "Écriture d'un scalaire 'temperature' à la racine...\n";
+        std::cout << "Writing a scalar 'temperature' at the root...\n";
         double temp_value = 98.6;
-        // On appelle writeData directement, sans beginArray
+        // We call writeData directly, without beginArray
         db.writeData("temperature", {}, &temp_value, 1);
 
-        std::cout << "Écriture d'un second scalaire 'pression' à la racine...\n";
+        std::cout << "Writing a second scalar 'pression' at the root...\n";
         double pressure_value = 1013.25;
         db.writeData("pression", {}, &pressure_value, 1);
 
         db.close();
-        std::cout << "Fichier fermé.\n\n";
+        std::cout << "File closed.\n\n";
     }
 
     // ===================================================================
-    // 2. Réouverture et lecture du scalaire
+    // 2. Reopen and read the scalar
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
 
-        /*std::cout << "Lecture du scalaire 'temperature'...\n";
+        /*std::cout << "Reading the scalar 'temperature'...\n";
         auto leaves = db.getLeaves();
 
-        assert(leaves.size() == 2 && "Il devrait y avoir exactement deux feuilles.");
+        assert(leaves.size() == 2 && "There should be exactly two leaves.");
 
         const PanzerDB::Leaf* temperature_leaf = nullptr;
         for (const auto& leaf : leaves) {
@@ -47,32 +49,32 @@ int main() {
             }
         }
 
-        assert(temperature_leaf != nullptr && "La feuille 'temperature' doit être trouvée.");
+        assert(temperature_leaf != nullptr && "The leaf 'temperature' must be found.");
 
-        assert(temperature_leaf->parent_path == "" && "Le parent du scalaire à la racine doit être vide.");
-        assert(temperature_leaf->shape.empty() && "La shape d'un scalaire doit être vide.");
-        assert(temperature_leaf->count == 1 && "Le count d'un scalaire doit être 1.");
+        assert(temperature_leaf->parent_path == "" && "The parent of the root scalar must be empty.");
+        assert(temperature_leaf->shape.empty() && "The shape of a scalar must be empty.");
+        assert(temperature_leaf->count == 1 && "The count of a scalar must be 1.");
 
         std::vector<double> data = db.readTensor(*temperature_leaf);
-        assert(data.size() == 1 && "Le tenseur lu doit contenir un seul élément.");
-        assert(std::abs(data[0] - 98.6) < 1e-9 && "La valeur du scalaire doit être 98.6.");
+        assert(data.size() == 1 && "The read tensor must contain a single element.");
+        assert(std::abs(data[0] - 98.6) < 1e-9 && "The value of the scalar must be 98.6.");
 
-        std::cout << "Scalaire lu avec succès: " << data[0] << " (attendu: 98.6)\n";*/
+        std::cout << "Scalar read successfully: " << data[0] << " (expected: 98.6)\n";*/
 
-        std::cout << "Lecture du scalaire 'temperature'...\n";
+        std::cout << "Reading the scalar 'temperature'...\n";
         int status = -1;
         double temp = db.readScalar<double>("temperature", &status);
         assert(status == 0);
         assert(std::abs(temp - 98.6) < 1e-9);
-        std::cout << "Scalaire 'temperature' lu avec succès: " << temp << "\n";
+        std::cout << "Scalar 'temperature' read successfully: " << temp << "\n";
 
-        std::cout << "Lecture du scalaire 'pression'...\n";
+        std::cout << "Reading the scalar 'pression'...\n";
         double pressure = db.readScalar<double>("pression", &status);
         assert(status == 0);
         assert(std::abs(pressure - 1013.25) < 1e-9);
-        std::cout << "Scalaire 'pression' lu avec succès: " << pressure << "\n";
+        std::cout << "Scalar 'pression' read successfully: " << pressure << "\n";
     }
 
-    std::cout << "\nTOUS LES TESTS RÉUSSIS !\n";
+    std::cout << "\nALL TESTS PASSED!\n";
     return 0;
 }

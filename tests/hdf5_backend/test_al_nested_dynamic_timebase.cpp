@@ -1,4 +1,6 @@
-// test_nested_dynamic_timebase.cpp
+// @file  test_al_nested_dynamic_timebase.cpp
+// @brief Tests slice reading (getTimeIndex) with a timebase inside a nested
+//        dynamic AoS: write, then read slices by time.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -12,7 +14,7 @@
 
 namespace fs = std::filesystem;
 
-// Couleurs ANSI pour debug
+// ANSI colors for debug
 #define RESET ""
 #define BOLD ""
 #define GREEN ""
@@ -27,12 +29,12 @@ const std::string URI = "imas:hdf5?path=./test_db_nested_dynamic_timebase";
 int main() {
   try {
     std::cout << BOLD << MAGENTA
-              << "\n=== Test getTimeIndex avec base de temps dans un AoS "
-                 "dynamique imbriqué ===\n"
+              << "\n=== Test getTimeIndex with a timebase inside a "
+                  "nested dynamic AoS ===\n"
               << RESET;
 
     // ==============================================================
-    // 1. Écriture des données
+    // 1. Writing data
     // ==============================================================
     {
       DataEntryContext dataEntryCtx(URI);
@@ -42,7 +44,7 @@ int main() {
       OperationContext opCtx(&dataEntryCtx, "test_ids", "", WRITE_OP);
       backend.beginAction(&opCtx);
 
-      // On force le mode non-homogène pour que chaque AOS puisse avoir sa propre base de temps
+      // Force non-homogeneous mode so that each AoS can have its own timebase
       //OperationContext opCtxIds(&dataEntryCtx, "test_ids", "", WRITE_OP);
 
       //backend.beginAction(&opCtxIds);
@@ -56,38 +58,38 @@ int main() {
         std::vector<double> time_data(dyn_1d_time_size);
         //std::vector<double> dyn_1d_data(dyn_1d_time_size);
         for(int t=0; t<dyn_1d_time_size; ++t) {
-            time_data[t] = (double)t * 0.1; // ex: [0.0..0.9] pour i=0
-            //dyn_1d_data[t] = time_data[t] * 10.0 + 6.5; // Donnée simple pour validation
+            time_data[t] = (double)t * 0.1; // e.g. [0.0..0.9] for i=0
+            //dyn_1d_data[t] = time_data[t] * 10.0 + 6.5; // Simple data for validation
         }
         int dim[] = {dyn_1d_time_size};
         backend.writeData(&opCtx, "time", "time", time_data.data(), alconst::double_data, 1, dim);
 
-      // --- AoS Statique 'static_aos' ---
+      // --- Static AoS 'static_aos' ---
       int static_aos_size = 2;
       ArraystructContext staticAosCtx(&opCtx, "static_aos", "");
       backend.beginArraystructAction(&staticAosCtx, &static_aos_size);
 
       for (int i = 0; i < static_aos_size; ++i) {
-        // Signal statique dans l'AoS statique
+        // Static signal in the static AoS
         double static_signal_data = 100.0 + i;
         backend.writeData(&staticAosCtx, "static_signal", "",
                           &static_signal_data, alconst::double_data, 0,
                           nullptr);
 
-        // --- AoS Dynamique 'dynamic_aos' imbriqué ---
+        // --- Nested dynamic AoS 'dynamic_aos' ---
         int dynamic_aos_size = 10;
         ArraystructContext dynamicAosCtx(&staticAosCtx, "dynamic_aos", "time");
         backend.beginArraystructAction(&dynamicAosCtx, &dynamic_aos_size);
 
-        // Écriture de la base de temps et des signaux pour cet AoS dynamique
+        // Write the timebase and the signals for this dynamic AoS
         for (int t = 0; t < dynamic_aos_size; ++t) {
-          // Écrire la valeur de temps pour cette tranche
-          // Temps différents pour chaque instance de static_aos
+          // Write the time value for this slice
+          // Different times for each instance of static_aos
           double current_time = 0.1 * (t);
           backend.writeData(&dynamicAosCtx, "time", "time", &current_time,
                             alconst::double_data, 0, nullptr);
 
-          // Écriture de deux signaux dynamiques
+          // Write two dynamic signals
           double signal1_data = 1000.0 + t*10;
           double signal2_data = 2000.0 + t*10;
           backend.writeData(&dynamicAosCtx, "signal1", "time", &signal1_data,
@@ -101,14 +103,14 @@ int main() {
         }
         backend.endAction(&dynamicAosCtx);
 
-        // --- AJOUT : Signal dynamique 1D 'dyn_1d' dans static_aos ---
-        // Ce signal a sa propre base de temps, indépendante de celle de dynamic_aos
+        // --- ADDED: 1D dynamic signal 'dyn_1d' inside static_aos ---
+        // This signal has its own timebase, independent of the one from dynamic_aos
         //int dyn_1d_time_size = 10;
         //std::vector<double> time_data(dyn_1d_time_size);
         std::vector<double> dyn_1d_data(dyn_1d_time_size);
         for(int t=0; t<dyn_1d_time_size; ++t) {
-            //time_data[t] = (double)t * 0.1 + i; // ex: [0.0..0.9] pour i=0
-            dyn_1d_data[t] = time_data[t] * 10.0 + 6.5; // Donnée simple pour validation
+            //time_data[t] = (double)t * 0.1 + i; // e.g. [0.0..0.9] for i=0
+            dyn_1d_data[t] = time_data[t] * 10.0 + 6.5; // Simple data for validation
         }
         //int dim[] = {dyn_1d_time_size};
         //backend.writeData(&staticAosCtx, "time", "time", time_data.data(), alconst::double_data, 1, dim);
@@ -124,13 +126,13 @@ int main() {
       backend.endAction(&opCtx);
       backend.closePulse(&dataEntryCtx, FORCE_CREATE_PULSE);
 
-      std::cout << GREEN << "[OK] Écriture terminée.\n" << RESET;
+      std::cout << GREEN << "[OK] Write complete.\n" << RESET;
     }
 
     // ==============================================================
-    // 2. Lecture par Slices 
+    // 2. Reading by Slices
     // ==============================================================
-    std::cout << BOLD << MAGENTA << "\n[3] Test de lecture par Slices...\n" << RESET;
+    std::cout << BOLD << MAGENTA << "\n[3] Slice reading test...\n" << RESET;
 
     std::vector<double> target_times = {0.55, 0.85};
     double expected_val[2] = {1055, 1085};  
@@ -142,7 +144,7 @@ int main() {
             HDF5Backend readBackend;
             readBackend.openPulse(&readDataEntryCtx, OPEN_PULSE);
 
-            std::cout << YELLOW << "[DEBUG] Lecture slice t=" << target_time << "...\n" << RESET;
+            std::cout << YELLOW << "[DEBUG] Reading slice t=" << target_time << "...\n" << RESET;
 
             int interpmode = alconst::linear_interp;
             OperationContext opCtx(&readDataEntryCtx, "test_ids", READ_OP, alconst::slice_op, target_time, interpmode);
@@ -156,7 +158,7 @@ int main() {
 
             for (int i = 0; i < static_size; ++i) {
                 
-                // --- Validation dyn_1d (dans static_aos) ---
+                // --- Validate dyn_1d (in static_aos) ---
                 void* dyn_ptr = nullptr;
                 int dyn_datatype = alconst::double_data;
                 int dyn_dim = 0;
@@ -164,14 +166,14 @@ int main() {
                 
                 readBackend.readData(&staticAosCtx, "dyn_1d", "time", &dyn_ptr, &dyn_datatype, &dyn_dim, dyn_size);
                 
-                assert(dyn_dim == 1); // En mode slice, on lit un scalaire
+                assert(dyn_dim == 1); // In slice mode, we read a scalar
                 
                 double read_val = static_cast<double*>(dyn_ptr)[0];
-                // La donnée écrite est time*10 + 6.5, donc la valeur interpolée doit être target_time*10 + 6.5
+                // The written data is time*10 + 6.5, so the interpolated value must be target_time*10 + 6.5
                 double expected_val1 = target_time * 10.0 + 6.5;
 
                 if (std::abs(read_val - expected_val1 ) > 1e-6) {
-                    std::cerr << RED << "Erreur lecture dyn_1d t=" << target_time << " static_aos[" << i << "]: Attendu " << expected_val << ", Reçu " << read_val << RESET << std::endl;
+                    std::cerr << RED << "Error reading dyn_1d t=" << target_time << " static_aos[" << i << "]: expected " << expected_val << ", got " << read_val << RESET << std::endl;
                     return 1;
                 }
                 
@@ -196,8 +198,8 @@ int main() {
                     free(data_ptr);
                     
                     if (std::abs(read_val - expected_val[k] ) > 1e-6) {
-                         std::cerr << RED << "Erreur lecture signal1 at t=" << target_time << " static_aos[" << i << "]: "
-                                  << "Attendu " << expected_val[k]  << ", Reçu " << read_val << RESET << std::endl;
+                          std::cerr << RED << "Error reading signal1 at t=" << target_time << " static_aos[" << i << "]: "
+                                   << "expected " << expected_val[k]  << ", got " << read_val << RESET << std::endl;
                          return 1;
                     }
                     dynamicAosCtx.nextIndex(1);
@@ -208,19 +210,19 @@ int main() {
             readBackend.endAction(&staticAosCtx);
             readBackend.endAction(&opCtx);
             readBackend.closePulse(&readDataEntryCtx, OPEN_PULSE);
-            std::cout << GREEN << "  [OK] Slice t=" << target_time << " validée.\n" << RESET;
+            std::cout << GREEN << "  [OK] Slice t=" << target_time << " validated.\n" << RESET;
 
         } catch (const std::exception &e) {
-            std::cerr << RED << "Exception lors de la lecture t=" << target_time << ": " << e.what() << RESET << std::endl;
+            std::cerr << RED << "Exception while reading t=" << target_time << ": " << e.what() << RESET << std::endl;
             return 1;
         }
         k++;
     }
 
-    std::cout << BOLD << GREEN << "\n✓ Tous les tests ont réussi !\n" << RESET;
+    std::cout << BOLD << GREEN << "\n✓ All tests passed!\n" << RESET;
 
   } catch (const std::exception &e) {
-    std::cerr << RED << BOLD << "\nException capturée : " << e.what() << RESET
+    std::cerr << RED << BOLD << "\nException caught: " << e.what() << RESET
               << std::endl;
     return 1;
   }

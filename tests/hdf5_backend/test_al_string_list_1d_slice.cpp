@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_bug_string_list_1d.cpp
+// @file  test_al_string_list_1d_slice.cpp
+// @brief Bug reproduction test: a list of strings containing a single element
+//        (value_labels) must be read with dim=2, not dim=1.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -45,7 +47,7 @@ int main() {
         }
 
         // ===================================================================
-        // 1. Écriture (simule ids_put)
+        // 1. Writing (simulates ids_put)
         // ===================================================================
         std::string expected_string;
 
@@ -72,23 +74,23 @@ int main() {
                 backend.beginArraystructAction(&coordCtx, &coord_size);
 
                 for (int j = 0; j < coord_size; ++j) {
-                    // Cas qui pose problème : Une liste de strings contenant UN SEUL élément.
-                    // Dans IMAS, c'est un tableau 1D de strings, donc 2D de chars [1, len].
+                    // Problematic case: a list of strings containing only a single element.
+                    // In IMAS, this is a 1D array of strings, i.e. a 2D char array [1, len].
                     expected_string = random_string(10 + (rand() % 10));
                     const char* single_string = expected_string.c_str();
                     int n_strings = 1;
                     int max_len = strlen(single_string) + 1; 
 
-                    // Preparation du buffer pour writeData (flat char array)
+                    // Prepare the buffer for writeData (flat char array)
                     // dim = 2, size = {n_strings, max_len}
                     int dim = 2;
                     int size[] = {n_strings, max_len};
                     
-                    // Allocation et copie
+                    // Allocate and copy
                     std::vector<char> buffer(n_strings * max_len, 0);
                     strncpy(buffer.data(), single_string, max_len);
 
-                    std::cout << "Écriture de 'value_labels' (liste de 1 string): " << single_string << "...\n";
+                    std::cout << "Writing 'value_labels' (list of 1 string): " << single_string << "...\n";
                     backend.writeData(&coordCtx, "value_labels", "", buffer.data(), alconst::char_data, dim, size);
 
                     if (j < coord_size - 1) coordCtx.nextIndex(1);
@@ -104,7 +106,7 @@ int main() {
         }
 
         // ===================================================================
-        // 2. Lecture (simule ids_get) et Vérification
+        // 2. Reading (simulates ids_get) and validation
         // ===================================================================
         {
             std::cout << "\n--- Phase 2: Reading Data ---\n";
@@ -125,7 +127,7 @@ int main() {
                 backend.beginArraystructAction(&coordCtx, &c_size);
 
                 for (int j = 0; j < c_size; ++j) {
-                    std::cout << "Lecture de 'value_labels' pour coordinate_system[" << i << "]/coordinate[" << j << "]...\n";
+                    std::cout << "Reading 'value_labels' for coordinate_system[" << i << "]/coordinate[" << j << "]...\n";
                     
                     void* data = nullptr;
                     int datatype = alconst::char_data;
@@ -134,24 +136,24 @@ int main() {
 
                     backend.readData(&coordCtx, "value_labels", "", &data, &datatype, &dim, size);
                     
-                    std::cout << "Dimensions retournées: " << dim << "D [";
+                    std::cout << "Returned dimensions: " << dim << "D [";
                     for(int k=0; k<dim; ++k) std::cout << size[k] << (k<dim-1 ? " x " : "");
                     std::cout << "]\n";
                     
                     if (dim == 1) {
-                        std::cout << RED << ">>> BUG REPRODUIT: dim=1 pour une liste de strings (attendu: 2)\n";
-                        std::cout << "    Le backend retourne un scalaire string au lieu d'une liste de taille 1.\n" << RESET;
+                        std::cout << RED << ">>> BUG REPRODUCED: dim=1 for a string list (expected: 2)\n";
+                        std::cout << "    The backend returns a scalar string instead of a list of size 1.\n" << RESET;
                     } else if (dim == 2) {
-                        // Vérification du contenu (optionnelle/simplifiée)
+                        // Content check (optional/simplified)
                         // char* chars = (char*)data;
-                        // size[0] = nombre de strings (1), size[1] = max_len
+                        // size[0] = number of strings (1), size[1] = max_len
                         /*if (size[0] == 1) {
                             std::string read_str(chars);
-                            // Validation complexe omise pour simplifier le test multi-éléments
+                            // Complex validation omitted to simplify the multi-element test
                         }*/
-                        std::cout << GREEN << ">>> SUCCÈS: dim=2. Le bug semble corrigé ou non reproduit.\n" << RESET;
+                        std::cout << GREEN << ">>> SUCCESS: dim=2. The bug appears fixed or is not reproduced.\n" << RESET;
                     } else {
-                        std::cout << RED << ">>> RÉSULTAT INATTENDU: dim=" << dim << "\n" << RESET;
+                        std::cout << RED << ">>> UNEXPECTED RESULT: dim=" << dim << "\n" << RESET;
                     }
 
                     if (data) free(data);

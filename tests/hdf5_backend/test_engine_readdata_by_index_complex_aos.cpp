@@ -1,4 +1,6 @@
-// test_panzer_read_by_index_complex_aos.cpp
+// @file  test_engine_readdata_by_index_complex_aos.cpp
+// @brief PanzerDB readDataByIndex test: writes a complex A/B/C structure with
+//        different B sizes per element, and reads "flux" and "field" by index.
 #include "panzerdb.h"
 #include <iostream>
 #include <cassert>
@@ -10,7 +12,7 @@ int main() {
     const std::string filename = "test_read_by_index_complex_aos.panzer";
 
     // ===================================================================
-    // 1. Écriture d'une structure complexe
+    // 1. Write a complex structure
     //    A (size=2)
     //    - A[0]/field
     //    - A[0]/B (size=2)
@@ -24,9 +26,9 @@ int main() {
     {
         PanzerDB db(filename, PanzerDB::OpenMode::WRITE, true);
 
-        std::cout << "Écriture de la structure complexe...\n";
+        std::cout << "Writing the complex structure...\n";
         db.beginArray("A", 2);
-        // --- Écriture dans A[0] ---
+        // --- Writing into A[0] ---
         std::vector<double> field_data_0 = {10.0, 11.0};
         db.writeData("field", {2}, field_data_0.data(), field_data_0.size());
         db.beginArray("B", 2);
@@ -35,12 +37,12 @@ int main() {
             std::vector<double> flux_data_0x = {1000.0 + (double)b};
             db.writeData("flux", {1}, flux_data_0x.data(), flux_data_0x.size());
             db.endArray(); // C
-            db.incrementArrayIndex(); // Incrémente l'index de B
+            db.incrementArrayIndex(); // Increments B's index
         }
         db.endArray(); // B
-        db.incrementArrayIndex(); // Incrémente l'index de A
+        db.incrementArrayIndex(); // Increments A's index
 
-        // --- Écriture dans A[1] ---
+        // --- Writing into A[1] ---
         std::vector<double> field_data_1 = {20.0, 21.0, 22.0};
         db.writeData("field", {3}, field_data_1.data(), field_data_1.size());
         db.beginArray("B", 3);
@@ -49,24 +51,24 @@ int main() {
             std::vector<double> flux_data_1x = {2000.0 + (double)b};
             db.writeData("flux", {1}, flux_data_1x.data(), flux_data_1x.size());
             db.endArray(); // C
-            db.incrementArrayIndex(); // Incrémente l'index de B
+            db.incrementArrayIndex(); // Increments B's index
         }
         db.endArray(); // B
-        db.incrementArrayIndex(); // Incrémente l'index de A
-
+        db.incrementArrayIndex(); // Increments A's index
+        
         db.endArray(); // A        
         db.close();
-        std::cout << "Fichier fermé.\n\n";
+        std::cout << "File closed.\n\n";
     }
 
     // ===================================================================
-    // 2. Réouverture et lecture des signaux
+    // 2. Reopen and read the signals
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
 
-        // --- Validation de "flux" dans A[1]/B[2]/C[0] ---
-        std::cout << "Lecture de 'flux' dans A[1]/B[2]/C[0]...\n";
+        // --- Validation of "flux" in A[1]/B[2]/C[0] ---
+        std::cout << "Reading 'flux' in A[1]/B[2]/C[0]...\n";
         {
             uint64_t static_indices[] = {1, 2, 0}; // A[1], B[2], C[0]
             int64_t time_index = -1;
@@ -80,12 +82,12 @@ int main() {
             assert(ndim_out == 1);
             assert(shape_out[0] == 1);
             assert(std::abs(data_out[0] - 2002.0) < 1e-9);
-            std::cout << "Données 'flux' lues: " << data_out[0] << " (attendu: 2002.0)\n";
+            std::cout << "Read 'flux' data: " << data_out[0] << " (expected: 2002.0)\n";
             delete[] data_out;
         }
 
-        // --- Validation de "field" dans A[0] ---
-        std::cout << "\nLecture de 'field' dans A[0]...\n";
+        // --- Validation of "field" in A[0] ---
+        std::cout << "\nReading 'field' in A[0]...\n";
         {
             uint64_t static_indices[] = {0}; // A[0]
             int64_t time_index = -1;
@@ -100,11 +102,11 @@ int main() {
             assert(shape_out[0] == 2);
             assert(std::abs(data_out[0] - 10.0) < 1e-9);
             assert(std::abs(data_out[1] - 11.0) < 1e-9);
-            std::cout << "Données 'field' lues: " << data_out[0] << ", " << data_out[1] << " (attendu: 10.0, 11.0)\n";
+            std::cout << "Read 'field' data: " << data_out[0] << ", " << data_out[1] << " (expected: 10.0, 11.0)\n";
             delete[] data_out;
         }
     }
 
-    std::cout << "\nTOUS LES TESTS RÉUSSIS !\n";
+    std::cout << "\nALL TESTS PASSED!\n";
     return 0;
 }

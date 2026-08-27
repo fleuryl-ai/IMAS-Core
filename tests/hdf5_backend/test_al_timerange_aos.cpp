@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_timerange_aos.cpp
+// @file  test_al_timerange_aos.cpp
+// @brief Tests time-range reads (without resampling) of a static AoS containing
+//        a static signal and a dynamic signal.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

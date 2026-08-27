@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_timerange_nested_dynamic_aos.cpp
+// @file  test_al_timerange_nested_dynamic_aos.cpp
+// @brief Tests time-range reads without resampling of a nested dynamic AoS
+//        (signal_in_dyn_aos) inside a static AoS.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

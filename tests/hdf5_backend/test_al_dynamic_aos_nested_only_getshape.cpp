@@ -1,7 +1,7 @@
-// tests/hdf5_backend/test_dynamic_aos_nested_only.cpp
+// @file  test_al_dynamic_aos_nested_only_getshape.cpp
+// @brief Regression test for getAOSShape on a DYNAMIC AoS whose leaves are all
+//        behind NESTED static AoS (e.g. time_slice/ggd/theta/values).
 //
-// Regression test for getAOSShape on a DYNAMIC AoS whose leaves are all
-// behind NESTED static AoS (e.g. time_slice/ggd/theta/values).
 //
 // The size of a dynamic AoS must be the number of time slices that were
 // written, even when the only data leaves are deeply nested (no direct data

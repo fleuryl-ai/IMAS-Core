@@ -1,4 +1,6 @@
-// test_panzer_read_by_index.cpp
+// @file  test_engine_readdata_by_index.cpp
+// @brief PanzerDB readDataByIndex smoke test: writes a simple A[0]/B[0]/eeg
+//        structure with a 5-element signal and reads it back by index.
 #include "panzerdb.h"
 #include <iostream>
 #include <cassert>
@@ -10,12 +12,12 @@ int main() {
     const std::string filename = "test_read_by_index.panzer";
 
     // ===================================================================
-    // 1. Écriture d'une structure simple A[0]/B[0]/eeg
+    // 1. Write a simple A[0]/B[0]/eeg structure
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::WRITE, true);
 
-        std::cout << "Écriture de A[0]/B[0]/eeg...\n";
+        std::cout << "Writing A[0]/B[0]/eeg...\n";
         db.beginArray("A", 1);
         db.beginArray("B", 1);
 
@@ -26,19 +28,19 @@ int main() {
         db.endArray(); // A
 
         db.close();
-        std::cout << "Fichier fermé.\n\n";
+        std::cout << "File closed.\n\n";
     }
 
     // ===================================================================
-    // 2. Réouverture et lecture avec readDataByIndex
+    // 2. Reopen and read with readDataByIndex
     // ===================================================================
     {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
 
-        std::cout << "Lecture avec readDataByIndex...\n";
+        std::cout << "Reading with readDataByIndex...\n";
 
         uint64_t static_indices[] = {0, 0}; // A[0], B[0]
-        int64_t time_index = -1; // Statique
+        int64_t time_index = -1; // Static
         uint64_t ndim_out = 0;
         uint64_t shape_out[6] = {0};
         double* data_out = nullptr;
@@ -49,16 +51,16 @@ int main() {
         assert(ndim_out == 1);
         assert(shape_out[0] == 5);
 
-        std::cout << "Données lues: ";
+        std::cout << "Read data: ";
         for (uint64_t i = 0; i < shape_out[0]; ++i) {
             std::cout << data_out[i] << " ";
             assert(std::abs(data_out[i] - (101.0 + i)) < 1e-9);
         }
         std::cout << "\n";
 
-        delete[] data_out; // N'oubliez pas de libérer la mémoire
+        delete[] data_out; // Remember to free the memory
     }
 
-    std::cout << "\nTOUS LES TESTS RÉUSSIS !\n";
+    std::cout << "\nALL TESTS PASSED!\n";
     return 0;
 }

@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_static_aos_dynamic_signal_slice.cpp
+// @file  test_al_static_aos_dynamic_signal_slice.cpp
+// @brief Tests a static AoS containing a dynamic scalar signal: slice-by-slice
+//        writing followed by slice-by-slice reading and validation.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

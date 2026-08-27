@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_timerange.cpp
+// @file  test_al_timerange_basic.cpp
+// @brief Basic time-range read tests for a dynamic signal: no resampling,
+//        resampling with a step, and resampling with a user time vector.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"

@@ -1,4 +1,6 @@
-// tests/hdf5_backend/test_root_1d_dynamic_append.cpp
+// @file  test_al_root_1d_dynamic_append.cpp
+// @brief Tests appending slices of a root-level dynamic 1D signal: first slice
+//        written, second slice appended, then both slice reads validated.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
