@@ -33,7 +33,7 @@ std::vector<double> get_time_vector(PanzerDB& db, const std::string& aos_path, s
         if (status != 0) homogeneous_time = 1;
     } catch (...) { homogeneous_time = 1; }
 
-    if (db.is_dynamic_aos(aos_path)) {
+    if (db.isDynamicAOS(aos_path)) {
         std::vector<double> time_values;
         time_values.reserve(aos_size);
         for (size_t i = 0; i < aos_size; ++i) {
@@ -275,11 +275,11 @@ TensorView read_typed_tensor(
         int status = -1;
 
         if constexpr (std::is_same_v<T, double>) {
-            status = db.pz_readData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (double**)&temp_data);
+            status = db.readDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (double**)&temp_data);
         } else if constexpr (std::is_same_v<T, int>) {
-            status = db.pz_readIntData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (int32_t**)&temp_data);
+            status = db.readIntDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (int32_t**)&temp_data);
         } else if constexpr (std::is_same_v<T, std::complex<double>>) {
-            status = db.pz_readComplexData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (std::complex<double>**)&temp_data);
+            status = db.readComplexDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, (std::complex<double>**)&temp_data);
         }
 
         if (status == 0 && temp_data) {
@@ -301,10 +301,10 @@ TensorView read_typed_tensor(
     
     if constexpr (std::is_same_v<T, double>) {
         double* temp = nullptr;
-        if (db.pz_readData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &leaf_ndim, leaf_shape, &temp) == 0) if(temp) free(temp);
+        if (db.readDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &leaf_ndim, leaf_shape, &temp) == 0) if(temp) free(temp);
     } else if constexpr (std::is_same_v<T, int>) {
         int32_t* temp = nullptr;
-        if (db.pz_readIntData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &leaf_ndim, leaf_shape, &temp) == 0) if(temp) free(temp);
+        if (db.readIntDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &leaf_ndim, leaf_shape, &temp) == 0) if(temp) free(temp);
     }
     
     for (uint64_t d = 0; d < leaf_ndim; ++d) {
@@ -326,7 +326,7 @@ TensorView read_typed_tensor(
         
         if constexpr (std::is_same_v<T, double>) {
             double* temp_data = nullptr;
-            if (db.pz_readData_by_index(path.c_str(), time_idx, &ndim, shape, &temp_data) == 0 && temp_data) {
+            if (db.readDataByIndex(path.c_str(), time_idx, &ndim, shape, &temp_data) == 0 && temp_data) {
                 size_t count = 1; for(uint64_t d=0; d<ndim; ++d) count *= shape[d];
                 size_t to_copy = std::min(count, total_elements - global_offset);
                 std::copy(temp_data, temp_data + to_copy, final_data_ptr + global_offset);
@@ -334,7 +334,7 @@ TensorView read_typed_tensor(
             }
         } else if constexpr (std::is_same_v<T, int>) {
             int32_t* temp_data = nullptr;
-            if (db.pz_readIntData_by_index(path.c_str(), time_idx, &ndim, shape, &temp_data) == 0 && temp_data) {
+            if (db.readIntDataByIndex(path.c_str(), time_idx, &ndim, shape, &temp_data) == 0 && temp_data) {
                 size_t count = 1; for(uint64_t d=0; d<ndim; ++d) count *= shape[d];
                 size_t to_copy = std::min(count, total_elements - global_offset);
                 std::copy(temp_data, temp_data + to_copy, final_data_ptr + global_offset);
@@ -359,7 +359,7 @@ TensorView read_list_of_strings(
         uint64_t ndim = 0;
         uint64_t shape[6] = {0};
         
-        int status = db.pz_readStringData_by_index(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, &temp_data);
+        int status = db.readStringDataByIndex(leaf_paths[0].first.c_str(), leaf_paths[0].second, &ndim, shape, &temp_data);
         if (status == 0 && temp_data) {
             std::vector<size_t> actual_dims = selection_dims;
             for(uint64_t d=0; d<ndim; ++d) actual_dims.push_back(shape[d]);
@@ -376,7 +376,7 @@ TensorView read_list_of_strings(
         char* temp_data = nullptr;
         uint64_t ndim = 0;
         uint64_t shape[6] = {0};
-        int status = db.pz_readStringData_by_index(item.first.c_str(), item.second, &ndim, shape, &temp_data);
+        int status = db.readStringDataByIndex(item.first.c_str(), item.second, &ndim, shape, &temp_data);
         if (status == 0 && temp_data != nullptr) {
             std::string s(temp_data);
             if (s.length() > max_len) max_len = s.length();
@@ -417,7 +417,7 @@ TensorView read_tensor_impl_core(PanzerDB& db, const std::vector<PathSegment>& s
     }
 
     auto metadata = db.readMetadata(leaf_paths[0].first);
-    DataType data_type = db.get_leaf_type(leaf_paths[0].first);
+    DataType data_type = db.getLeafType(leaf_paths[0].first);
     
     switch (data_type) {
         case DataType::DOUBLE:

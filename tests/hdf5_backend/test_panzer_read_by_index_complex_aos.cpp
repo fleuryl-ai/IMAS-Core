@@ -6,7 +6,7 @@
 #include <vector>
 
 int main() {
-    std::cout << "=== TEST PanzerDB: pz_readData_by_index (complex AoS) ===\n\n";
+    std::cout << "=== TEST PanzerDB: readDataByIndex (complex AoS) ===\n\n";
     const std::string filename = "test_read_by_index_complex_aos.panzer";
 
     // ===================================================================
@@ -74,7 +74,7 @@ int main() {
             uint64_t shape_out[6] = {0};
             double* data_out = nullptr;
             const char* full_path = "A/1/B/2/C/0/flux";
-            int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+            int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
             assert(result == 0);
             assert(ndim_out == 1);
@@ -93,7 +93,7 @@ int main() {
             uint64_t shape_out[6] = {0};
             double* data_out = nullptr;
             const char* full_path = "A/0/field";
-            int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+            int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
             assert(result == 0);
             assert(ndim_out == 1);

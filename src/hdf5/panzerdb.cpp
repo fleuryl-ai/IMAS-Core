@@ -46,7 +46,7 @@
  *     - **Caching**: The `getLeaves` method caches the entire index table in memory.
  *
  * 4.  **Path Substitution**:
- *     - When reading dynamic data (e.g., `pz_readData_by_index`), the code must often
+ *     - When reading dynamic data (e.g., `readDataByIndex`), the code must often
  *       translate a logical path like `A/0/B` (requested at time `t=1`) into the
  *       actual stored path `A/1/B`. This is handled by finding the "Dynamic AoS Root"
  *       and substituting the index.
@@ -1456,7 +1456,7 @@ void PanzerDB::writeDataImpl(const std::string& name,
     append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags);
 }
 
-// OPTIMIZED PATH PARSING (for substitution in pz_readData_by_index)
+// OPTIMIZED PATH PARSING (for substitution in readDataByIndex)
 // ============================================================================
 
 
@@ -1903,7 +1903,7 @@ bool PanzerDB::isInsideDynamicAOS(std::string* timebase) const {
 }
 
 
-void PanzerDB::dumpLeavesCache() const {
+void PanzerDB::dumpLeafIndex() const {
     const auto& leaves = getLeaves();
     std::cerr << "=== PanzerDB Index Table (" << leaves.size() << " entries) ===" << std::endl;
     std::cerr << std::left << std::setw(60) << "Path" 
@@ -2204,7 +2204,7 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
     return highest_below; // tie -> smaller index
 }
 
-int PanzerDB::pz_readData_by_index(
+int PanzerDB::readDataByIndex(
                          const char* full_data_path,
                          int64_t time_index,
                          uint64_t* ndim_out,
@@ -2417,7 +2417,7 @@ int PanzerDB::pz_readData_by_index(
     return -1;
 }
 
-int PanzerDB::pz_readStringData_by_index(
+int PanzerDB::readStringDataByIndex(
                           const char* full_data_path,
                           int64_t time_index,
                           uint64_t* ndim_out,
@@ -2624,7 +2624,7 @@ int PanzerDB::pz_readStringData_by_index(
     return -1;
 }
 
-int PanzerDB::pz_readComplexData_by_index(
+int PanzerDB::readComplexDataByIndex(
                           const char* full_data_path,
                           int64_t time_index,
                           uint64_t* ndim_out,
@@ -2795,7 +2795,7 @@ int PanzerDB::pz_readComplexData_by_index(
     return -1;
 }
 
-int PanzerDB::pz_readIntData_by_index(
+int PanzerDB::readIntDataByIndex(
                          const char* full_data_path,
                          int64_t time_index,
                          uint64_t* ndim_out,
@@ -2888,7 +2888,7 @@ int PanzerDB::pz_readIntData_by_index(
 
         // 2. Search via index substitution in path (if not found yet)
         if (!target_leaf) {
-             // This logic would be a copy of pz_readData_by_index, adapted for int32.
+             // This logic would be a copy of readDataByIndex, adapted for int32.
              // For now, we keep it simple.
         }
 
@@ -2959,11 +2959,11 @@ int PanzerDB::readInterpolatedData(
     auto read_slice_at = [this, full_data_path, datatype, ndim_out, shape_out](int64_t idx, void** out_ptr) -> int {
         *out_ptr = nullptr;
         if (datatype == alconst::char_data) {
-            return pz_readStringData_by_index(full_data_path, idx, ndim_out, shape_out, (char**)out_ptr);
+            return readStringDataByIndex(full_data_path, idx, ndim_out, shape_out, (char**)out_ptr);
         } else if (datatype == alconst::complex_data) {
-            return pz_readComplexData_by_index(full_data_path, idx, ndim_out, shape_out, (std::complex<double>**)out_ptr);
+            return readComplexDataByIndex(full_data_path, idx, ndim_out, shape_out, (std::complex<double>**)out_ptr);
         } else {
-            return pz_readData_by_index(full_data_path, idx, ndim_out, shape_out, (double**)out_ptr);
+            return readDataByIndex(full_data_path, idx, ndim_out, shape_out, (double**)out_ptr);
         }
     };
 
@@ -3126,7 +3126,7 @@ std::string PanzerDB::stripIndices(const std::string& path) {
     return result;
 }
 
-void PanzerDB::writeMetaData(const std::string& path, const std::string& value) {
+void PanzerDB::writeMetadata(const std::string& path, const std::string& value) {
     // path is the full metadata key, e.g., "flux_loop/field@units"
     // value is the metadata value, e.g., "T"
 
@@ -3233,7 +3233,7 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
  * @param path Full logical path to the data node.
  * @return The data type as a DataType enum value.
  */
- imas::direct_access::DataType PanzerDB::get_leaf_type(const std::string& path)
+ imas::direct_access::DataType PanzerDB::getLeafType(const std::string& path)
  {
      // 1. Fetch the in-memory index (fast, uses the cache).
      const auto& leaves = getLeaves();
@@ -3271,7 +3271,7 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
      throw std::runtime_error("Path not found in the PanzerDB index: " + path);
  }
 
- bool PanzerDB::is_dynamic_aos(const std::string& aos_path) const
+ bool PanzerDB::isDynamicAOS(const std::string& aos_path) const
 {
     // Ensure the index is loaded in memory.
     const auto& leaves = getLeaves();

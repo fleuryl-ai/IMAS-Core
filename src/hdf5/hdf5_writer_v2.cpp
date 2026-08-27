@@ -277,7 +277,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
 
             // If the metadata's base path matches the current data's schema path, write it.
             if (meta_base_path == schema_path) {
-                panzer_db_ptr->writeMetaData(full_meta_path, meta_value);
+                panzer_db_ptr->writeMetadata(full_meta_path, meta_value);
             }
         }
     }
@@ -325,7 +325,7 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
     if (is_metadata) {
         DEBUG_PRINT("Writing metadata: " << dataset_name_copy.c_str() << " = " 
                     << (datatype == alconst::char_data ? std::string(static_cast<const char*>(data), size[0]) : "<non-string data>"));
-        panzer_db_ptr->writeMetaData(dataset_name_copy, std::string(static_cast<const char*>(data), size[0]));
+        panzer_db_ptr->writeMetadata(dataset_name_copy, std::string(static_cast<const char*>(data), size[0]));
         return;
     }
 

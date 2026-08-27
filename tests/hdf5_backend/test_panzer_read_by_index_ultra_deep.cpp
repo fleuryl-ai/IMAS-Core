@@ -7,7 +7,7 @@
 #include <numeric>
 
 int main() {
-    std::cout << "=== TEST PanzerDB: pz_readData_by_index (ultra deep & complex) ===\n\n";
+    std::cout << "=== TEST PanzerDB: readDataByIndex (ultra deep & complex) ===\n\n";
     const std::string filename = "test_read_by_index_ultra_deep.panzer";
 
     // ===================================================================
@@ -91,7 +91,7 @@ int main() {
             uint64_t shape_out[6] = {0};
             double* data_out = nullptr;
             const char* full_path = "A/0/B/1/C/0/D/0/E/0/tensor_7";
-            int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+            int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
             assert(result == 0);
             assert(ndim_out == 1);

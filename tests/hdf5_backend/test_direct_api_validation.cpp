@@ -63,7 +63,7 @@ void generate_test_file(const std::string& filename) {
         db.writeDataSlices("name", {1}, &diags[i], 1, "");
     }
     db.endArray(); // diagnostics
-    db.writeMetaData("profiles_1d/ion/state/z_ion@units", "eV");
+    db.writeMetadata("profiles_1d/ion/state/z_ion@units", "eV");
     db.close();
 }
 

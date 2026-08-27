@@ -6,7 +6,7 @@
 #include <vector>
 
 int main() {
-    std::cout << "=== TEST PanzerDB: pz_readData_by_index (deep, 2 signals) ===\n\n";
+    std::cout << "=== TEST PanzerDB: readDataByIndex (deep, 2 signals) ===\n\n";
     const std::string filename = "test_read_by_index_deep_2_signals.panzer";
 
     // ===================================================================
@@ -46,7 +46,7 @@ int main() {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
 
         // --- Validation de "flux" ---
-        std::cout << "Lecture de 'flux' avec pz_readData_by_index...\n";
+        std::cout << "Lecture de 'flux' avec readDataByIndex...\n";
         {
             uint64_t static_indices[] = {0, 0, 0}; // A[0], B[0], C[0]
             int64_t time_index = -1;
@@ -54,7 +54,7 @@ int main() {
             uint64_t shape_out[6] = {0};
             double* data_out = nullptr;
             const char* full_path = "A/0/B/0/C/0/flux";
-            int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+            int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
             assert(result == 0);
             assert(ndim_out == 1);
@@ -70,7 +70,7 @@ int main() {
         }
 
         // --- Validation de "field" ---
-        std::cout << "\nLecture de 'field' avec pz_readData_by_index...\n";
+        std::cout << "\nLecture de 'field' avec readDataByIndex...\n";
         {
             uint64_t static_indices[] = {0}; // A[0]
             int64_t time_index = -1;
@@ -78,7 +78,7 @@ int main() {
             uint64_t shape_out[6] = {0};
             double* data_out = nullptr;
             const char* full_path = "A/0/field";
-            int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+            int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
             assert(result == 0);
             assert(ndim_out == 1 && shape_out[0] == 2);
             assert(std::abs(data_out[0] - 55.5) < 1e-9 && std::abs(data_out[1] - 66.6) < 1e-9);

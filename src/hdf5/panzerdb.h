@@ -25,7 +25,7 @@
 #include <map>
 #include "metadata/metadata_extractor.h"
 
-#include "direct_access_api.h" // for imas::direct_access::DataType (return type of get_leaf_type)
+#include "direct_access_api.h" // for imas::direct_access::DataType (return type of getLeafType)
 
 /**
  * @class PanzerDB
@@ -450,13 +450,20 @@ public:
     PanzerDB& operator=(const PanzerDB&) = delete;
 
     /**
-     * @brief Destructor. Flushes any remaining data and closes the file.
-     */
+      * @brief Destructor. Flushes any remaining data and closes the file.
+      */
     ~PanzerDB();
 
-    OpenMode mode;
 
-     //==========================================================================
+    /**
+      * @brief Gets the current open mode of the database.
+      * @return The current OpenMode (READ, WRITE, or APPEND).
+      */
+    OpenMode getOpenMode() const { return mode; }
+
+
+
+    //==========================================================================
     // Write API - Array of Structures
     //==========================================================================
 
@@ -509,6 +516,38 @@ public:
      *       invalidated.
      */
     void endArray();
+
+     /**
+     * @brief Gets the current depth of the AoS stack.
+     * @return The number of active `beginArray` calls.
+     */
+    size_t getArrayStackSize() const { return array_stack.size(); }
+
+    /**
+     * @brief Synchronizes the PanzerDB array stack with the provided indices
+     * This method rebuilds the internal state (array_stack) to exactly match
+     * the AoS indices in the AL context.
+     * 
+     * @param aos_names Names of the AoS in hierarchical order (e.g., ["flux_loop", "channel"])
+     * @param indices Current indices for each level (e.g., [2, 5])
+     */
+    void synchronizeArrayStack(const std::vector<std::string>& aos_names, 
+                            const std::vector<int>& indices);
+
+    /**
+     * @brief Checks if the AoS stack is empty.
+     * @return True if not inside any AoS, false otherwise.
+     */
+    bool isArrayStackEmpty() const { return array_stack.empty(); }
+
+    /**
+     * @brief Advances the time counter of the enclosing dynamic AoS by n_steps.
+     * @param timebase_name Name of the time base (used for diagnostics).
+     * @param n_steps Number of time steps to skip.
+     * @pre Must be called while inside a dynamic AoS.
+     * @throws std::runtime_error if not inside a dynamic AoS.
+     */
+    void advanceTimebase(const std::string& timebase_name, uint64_t n_steps = 1);
 
     //==========================================================================
     // Write API - Data
@@ -584,24 +623,45 @@ public:
                                 const char* const* data, size_t n_slices,
                                 const std::string& timebase);
 
-     /**
-      * @brief Dumps the cached index table (leaves) to standard output, for debugging.
-      */
-      void dumpLeavesCache() const;
+    //==========================================================================
+    // Write API - Metadata
+    //==========================================================================
 
     /**
-     * @brief Flushes all in-memory write buffers to the HDF5 file.
-     * This makes the written data visible to other readers without closing the file.
-     */
-    void flush();
+      * @brief Writes a metadata entry for a given path.
+      * @param path The base path (e.g., "profiles_1d/t_e")
+      * @param value The metadata value to store
+      */
+    void writeMetadata(const std::string& path, const std::string& value);
 
-     /**
-     * @brief Flushes all in-memory write buffers to the HDF5 file and closes all handles.
+    /**
+     * @brief Utility to convert an instance path (e.g. "A/0/B/signal") to a schema path ("A/B/signal").
+     * Removes all purely numeric path segments. Useful for retrieving shared metadata.
      */
-    void close();
+    static std::string stripIndices(const std::string& path);
 
     //==========================================================================
-    // Read API - Metadata and Index
+    // Lifecycle - Terminal
+    //==========================================================================
+
+    /**
+      * @brief Flushes all in-memory write buffers to the HDF5 file.
+      * This makes the written data visible to other readers without closing the file.
+      */
+    void flush();
+
+    /**
+      * @brief Flushes all in-memory write buffers to the HDF5 file and closes all handles.
+      */
+    void close();
+
+    /**
+      * @brief Dumps the cached index table (leaves) to standard output, for debugging.
+      */
+    void dumpLeafIndex() const;
+
+    //==========================================================================
+    // Read API - Index
     //==========================================================================
 
     /**
@@ -626,6 +686,29 @@ public:
      */
     size_t getDynamicAOSSize(const std::string& aos_path) const;
 
+    /**
+     * @brief Determines the stored data type of a node from its full path.
+     * @param path The full instance path to the data node.
+     * @return The matching imas::direct_access::DataType.
+     * @throws ALBackendException if the path is not found in the index.
+     */
+    imas::direct_access::DataType getLeafType(const std::string& path);
+
+    /**
+     * @brief Checks if a given path corresponds to a dynamic Array of Structures (AoS).
+     * @param aos_path The full path to the AoS meta-node (e.g., "profiles_1d").
+     * @return True if the path points to a dynamic AoS, false otherwise.
+     */
+     bool isDynamicAOS(const std::string& aos_path) const;
+
+    /**
+     * @brief Checks whether a time index falls within the time steps stored in a leaf.
+     * @param leaf       The index leaf under test (must be a data leaf).
+     * @param time_index The time index to test.
+     * @return True if the leaf holds the requested time step.
+     */
+    bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
+
      /**
       * @brief Finds the index in a time base vector that is closest to a requested time.
       * @param timebase_path The full path to the 1D dataset representing the time base.
@@ -636,33 +719,28 @@ public:
      int64_t getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const;
 
     /**
-     * @brief Checks whether a time index falls within the time steps stored in a leaf.
-     * @param leaf       The index leaf under test (must be a data leaf).
-     * @param time_index The time index to test.
-     * @return True if the leaf holds the requested time step.
+     * @brief Finds the time index of the nearest available slice for a data path.
+     *
+     * Resolves missing slices ("gaps"): if the requested index has no data,
+     * returns the closest available one according to `prefer_direction`:
+     * - -1: prefer the largest index <= requested (fall back to the smallest
+     *      index >= requested if none below exists)
+     * - +1: prefer the smallest index >= requested (fall back to the largest
+     *      index <= requested if none above exists)
+     * -  0: nearest in time (ties resolved to the smaller index)
+     *
+     * @param full_data_path Full path of the data node.
+     * @param requested_idx The requested time index.
+     * @param prefer_direction -1, +1 or 0 (see above).
+     * @param time_basis Time basis of the dynamic structure.
+     * @param requested_time The actual requested time (used for distance
+     *        computation when prefer_direction == 0).
+     * @return The available time index, or -1 if no data exists for the path.
      */
-    bool isTimeInLeaf(const Leaf& leaf, int64_t time_index) const;
-
-    /**
-     * @brief Gets the current open mode of the database.
-     * @return The current OpenMode (READ, WRITE, or APPEND).
-     */
-    OpenMode getOpenMode() const { return mode; }
-
-    /**
-     * @brief Determines the stored data type of a node from its full path.
-     * @param path The full instance path to the data node.
-     * @return The matching imas::direct_access::DataType.
-     * @throws ALBackendException if the path is not found in the index.
-     */
-    imas::direct_access::DataType get_leaf_type(const std::string& path);
-
-    /**
-     * @brief Checks if a given path corresponds to a dynamic Array of Structures (AoS).
-     * @param aos_path The full path to the AoS meta-node (e.g., "profiles_1d").
-     * @return True if the path points to a dynamic AoS, false otherwise.
-     */
-     bool is_dynamic_aos(const std::string& aos_path) const;
+    int64_t nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
+                                       int64_t prefer_direction,
+                                       const std::vector<double>& time_basis,
+                                       double requested_time = -1.0) const;
 
     //==========================================================================
     // Read API - Data Retrieval
@@ -749,28 +827,13 @@ public:
                           bool expect_time_dim = true);
 
     /**
-     * @brief Finds the time index of the nearest available slice for a data path.
-     *
-     * Resolves missing slices ("gaps"): if the requested index has no data,
-     * returns the closest available one according to `prefer_direction`:
-     * - -1: prefer the largest index <= requested (fall back to the smallest
-     *      index >= requested if none below exists)
-     * - +1: prefer the smallest index >= requested (fall back to the largest
-     *      index <= requested if none above exists)
-     * -  0: nearest in time (ties resolved to the smaller index)
-     *
-     * @param full_data_path Full path of the data node.
-     * @param requested_idx The requested time index.
-     * @param prefer_direction -1, +1 or 0 (see above).
-     * @param time_basis Time basis of the dynamic structure.
-     * @param requested_time The actual requested time (used for distance
-     *        computation when prefer_direction == 0).
-     * @return The available time index, or -1 if no data exists for the path.
-     */
-    int64_t nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
-                                       int64_t prefer_direction,
-                                       const std::vector<double>& time_basis,
-                                       double requested_time = -1.0) const;
+      * @brief Reads a whole dynamic (time-evolving) double signal into memory.
+      * @param dataset_name The full path of the signal (outside an AoS instance).
+      * @return The concatenated time series, or an empty vector if not found.
+      */
+    std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
+
+
 
     /**
      * @brief C-style API to read double-precision data by path and time index.
@@ -782,7 +845,7 @@ public:
      * @param data_out Pointer to store the allocated output data buffer.
      * @return 0 on success, -1 on failure.
      */
-    int pz_readData_by_index(
+    int readDataByIndex(
         const char* full_data_path,  // ✅ Full path: "profiles_2d/1/ion/0/state/0/z_min"
         int64_t time_index,
         uint64_t* ndim_out,
@@ -798,13 +861,13 @@ public:
      * @param data_out       [out] Newly allocated buffer of null-terminated strings (caller frees).
      * @return 0 on success, -1 on failure.
      */
-     int pz_readStringData_by_index(
+     int readStringDataByIndex(
         const char* full_data_path,
         int64_t time_index,
         uint64_t* ndim_out,
         uint64_t shape_out[6],
         char** data_out);
-    
+
     /**
      * @brief C-style API to read complex data by path and time index.
      * @param full_data_path Full path to the complex signal.
@@ -814,7 +877,7 @@ public:
      * @param data_out       [out] Newly allocated buffer of std::complex<double> (caller frees).
      * @return 0 on success, -1 on failure.
      */
-    int pz_readComplexData_by_index(
+    int readComplexDataByIndex(
         const char* full_data_path,
         int64_t time_index,
         uint64_t* ndim_out,
@@ -830,66 +893,16 @@ public:
      * @param data_out       [out] Newly allocated buffer of int32_t (caller frees).
      * @return 0 on success, -1 on failure.
      */
-      int pz_readIntData_by_index(
+      int readIntDataByIndex(
         const char* full_data_path,
         int64_t time_index,
         uint64_t* ndim_out,
         uint64_t shape_out[6],
         int32_t** data_out);
 
-    /**
-     * @brief Advances the time counter of the enclosing dynamic AoS by n_steps.
-     * @param timebase_name Name of the time base (used for diagnostics).
-     * @param n_steps Number of time steps to skip.
-     * @pre Must be called while inside a dynamic AoS.
-     * @throws std::runtime_error if not inside a dynamic AoS.
-     */
-    void advanceTimebase(const std::string& timebase_name, uint64_t n_steps = 1);
-
-    /**
-     * @brief Reads a whole dynamic (time-evolving) double signal into memory.
-     * @param dataset_name The full path of the signal (outside an AoS instance).
-     * @return The concatenated time series, or an empty vector if not found.
-     */
-    std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
-
-     /**
-     * @brief Gets the current depth of the AoS stack.
-     * @return The number of active `beginArray` calls.
-     */
-    size_t getArrayStackSize() const { return array_stack.size(); }
-
-
-    /**
-     * @brief Synchronizes the PanzerDB array stack with the provided indices
-     * This method rebuilds the internal state (array_stack) to exactly match
-     * the AoS indices in the AL context.
-     * 
-     * @param aos_names Names of the AoS in hierarchical order (e.g., ["flux_loop", "channel"])
-     * @param indices Current indices for each level (e.g., [2, 5])
-     */
-    void synchronizeArrayStack(const std::vector<std::string>& aos_names, 
-                            const std::vector<int>& indices);
-
-    /**
-     * @brief Checks if the AoS stack is empty.
-     * @return True if not inside any AoS, false otherwise.
-     */
-    bool isArrayStackEmpty() const { return array_stack.empty(); }
-
-    /**
-     * @brief Utility to convert an instance path (e.g. "A/0/B/signal") to a schema path ("A/B/signal").
-     * Removes all purely numeric path segments. Useful for retrieving shared metadata.
-     */
-    static std::string stripIndices(const std::string& path);
-
-    /**
-      * @brief Writes a metadata entry for a given path.
-      * @param path The base path (e.g., "profiles_1d/t_e")
-      * @param value The metadata value to store
-      */
-    void writeMetaData(const std::string& path, const std::string& value);
-    
+    //==========================================================================
+    // Read API - Metadata
+    //==========================================================================
 
     /**
      * @brief Reads metadata associated with a dataset instance.
@@ -900,6 +913,9 @@ public:
     std::map<std::string, std::string> readMetadata(const std::string& instance_path);
 
 private:
+    // Current open mode (read-only; see getOpenMode()).
+    OpenMode mode = OpenMode::READ;
+
     /**
      * @brief Re-establishes the write-time context (aos_time_counters) from the
      *        on-disk leaves after opening an existing file (APPEND/READ).

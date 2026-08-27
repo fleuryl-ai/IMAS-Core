@@ -57,7 +57,7 @@ int main() {
         uint64_t shape_out[6] = {0};
         double* data_out = nullptr;
         const char* full_path = "A/0/B/signal";
-        int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+        int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
         assert(result == 0 && "La lecture de la slice 1 doit réussir.");
         

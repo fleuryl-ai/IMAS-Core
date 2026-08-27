@@ -80,14 +80,14 @@ int main() {
         // CORRECTION: Pour lire une donnée à la racine, n_static_levels doit être 0.
         // time_index doit être -1 pour les données statiques.
         const char* full_path_static_signal = "static_signal";
-        int result = db_read.pz_readData_by_index(full_path_static_signal, -1, &ndim_out, shape_out, &data_out);
+        int result = db_read.readDataByIndex(full_path_static_signal, -1, &ndim_out, shape_out, &data_out);
         assert(result == 0 && ndim_out == 1 && shape_out[0] == 4 && std::abs(data_out[0] - 42.0) < 1e-9 && std::abs(data_out[3] - 45.0) < 1e-9 && "Le signal statique doit être correct.");
         std::cout << "  Lu static_signal[0]: " << data_out[0] << ", static_signal[3]: " << data_out[3] << " (attendu: 42.0, 45.0)\n";
         delete[] data_out;
 
         // Validation du signal statique DANS l'AoS A[0]
         const char* full_path_static_in_aos = "A/0/static_in_aos";
-        result = db_read.pz_readData_by_index(full_path_static_in_aos, -1, &ndim_out, shape_out, &data_out);
+        result = db_read.readDataByIndex(full_path_static_in_aos, -1, &ndim_out, shape_out, &data_out);
         assert(result == 0 && "La lecture du signal statique dans l'AoS doit réussir.");
         assert(ndim_out == 1 && shape_out[0] == 3 && "La shape du signal statique dans l'AoS est incorrecte.");
         assert(std::abs(data_out[0] - 101.0) < 1e-9 && std::abs(data_out[2] - 103.0) < 1e-9 && "Les données du signal statique dans l'AoS sont incorrectes.");
@@ -97,7 +97,7 @@ int main() {
         // Validation du signal 2D statique dans A[0]/B[1]
         uint64_t nested_static_indices[] = {0, 1}; // A[0], B[1]
         const char* full_path_matrix = "A/0/B/1/matrix";
-        result = db_read.pz_readData_by_index(full_path_matrix, -1, &ndim_out, shape_out, &data_out);
+        result = db_read.readDataByIndex(full_path_matrix, -1, &ndim_out, shape_out, &data_out);
         assert(result == 0 && "La lecture du signal 2D dans l'AoS imbriqué doit réussir.");
         assert(ndim_out == 2 && "La dimension du signal 2D doit être 2.");
         assert(shape_out[0] == 2 && shape_out[1] == 3 && "La shape du signal 2D est incorrecte.");
@@ -107,11 +107,11 @@ int main() {
         std::cout << "  Lu matrix[0][0] dans A[0]/B[1]: " << data_out[0] << " (attendu: 1100.0)\n";
         delete[] data_out;
         //const char* full_path_matrix_last = "A/0/B/1/matrix";
-        //result = db_read.pz_readData_by_index(full_path_matrix_last, -1, &ndim_out, shape_out, &data_out);
+        //result = db_read.readDataByIndex(full_path_matrix_last, -1, &ndim_out, shape_out, &data_out);
         // Validation du signal dynamique, slice 0
         time_index = 0;
         const char* full_path_signal_0 = "A/0/signal";
-        result = db_read.pz_readData_by_index(full_path_signal_0, time_index, &ndim_out, shape_out, &data_out);
+        result = db_read.readDataByIndex(full_path_signal_0, time_index, &ndim_out, shape_out, &data_out);
         assert(result == 0 && std::abs(data_out[0] - 10.0) < 1e-9 && "Slice 0 doit être 10.0");
         std::cout << "  Lu signal[0]: " << data_out[0] << " (attendu: 10.0)\n";
         delete[] data_out;
@@ -119,7 +119,7 @@ int main() {
         // Validation du signal dynamique, slice 1
         time_index = 1;
         const char* full_path_signal_1 = "A/0/signal";
-        result = db_read.pz_readData_by_index(full_path_signal_1, time_index, &ndim_out, shape_out, &data_out);
+        result = db_read.readDataByIndex(full_path_signal_1, time_index, &ndim_out, shape_out, &data_out);
         assert(result == 0 && std::abs(data_out[0] - 20.0) < 1e-9 && "Slice 1 doit être 20.0");
         std::cout << "  Lu signal[1]: " << data_out[0] << " (attendu: 20.0)\n";
         delete[] data_out;
@@ -164,7 +164,7 @@ int main() {
         uint64_t shape_out[6] = {0};
         double* data_out = nullptr;
         const char* full_path_signal = "A/0/signal";
-        int result = db_final_read.pz_readData_by_index(full_path_signal, time_index, &ndim_out, shape_out, &data_out);
+        int result = db_final_read.readDataByIndex(full_path_signal, time_index, &ndim_out, shape_out, &data_out);
         assert(result == 0 && std::abs(data_out[0] - 30.0) < 1e-9 && "Slice 2 doit être 30.0");
         std::cout << "  Lu signal[2]: " << data_out[0] << " (attendu: 30.0)\n";
         delete[] data_out;

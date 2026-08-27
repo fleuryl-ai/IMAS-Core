@@ -71,7 +71,7 @@ TensorView DirectReader::read(const std::vector<PathSegment>& segments) {
             uint64_t ndim = 0;
             uint64_t shape[6] = {0};
 
-            int status = panzer_db.pz_readData_by_index(full_path.c_str(), -1, &ndim, shape, &data_out);
+            int status = panzer_db.readDataByIndex(full_path.c_str(), -1, &ndim, shape, &data_out);
             
             if (status != 0 || !data_out) {
                 throw std::runtime_error("Failed to read leaf at path: " + full_path);

@@ -105,20 +105,20 @@ int main() {
         // Valider A/B/C
         uint64_t abc_indices[] = {1, 2, 0}; 
         const char* full_path = "A/1/B/2/C/0/c_sig";
-        int result = db.pz_readData_by_index(full_path, -1, &ndim_out, shape_out, &data_out);
+        int result = db.readDataByIndex(full_path, -1, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         std::cout << "  [OK] A[1]/B[2]/C[0]/c_sig = " << data_out[0] << "\n";
         delete[] data_out;
 
         // Valider f_sig_dynamique (TI=0 car 1ere instance)
         uint64_t f_sig_dynamique_indices[] = {1, 0}; 
-        /*result = db.pz_readData_by_index("E", f_sig_dynamique_indices, 2, "f_sig_dynamique", 0, &ndim_out, shape_out, &data_out);
+        /*result = db.readDataByIndex("E", f_sig_dynamique_indices, 2, "f_sig_dynamique", 0, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         assert(std::abs(data_out[4] - 3504.0) < 1e-9);
         std::cout << "  [OK] E[1]/F[0]/f_sig_dynamique[1][1] = " << data_out[4] << "\n";
         delete[] data_out;*/
         const char* full_path_f_sig = "E/1/F/0/f_sig_dynamique";
-        result = db.pz_readData_by_index(full_path_f_sig, 0, &ndim_out, shape_out, &data_out);
+        result = db.readDataByIndex(full_path_f_sig, 0, &ndim_out, shape_out, &data_out);
         assert(result == 0);
 
         // Vérification
@@ -136,7 +136,7 @@ int main() {
         
         uint64_t efg_indices[] = {1, 0}; // <-- CORRECTION: Taille 2, pas 3
         const char* full_path_current = "E/1/F/0/G/0/current";
-        result = db.pz_readData_by_index(full_path_current, 0, &ndim_out, shape_out, &data_out);
+        result = db.readDataByIndex(full_path_current, 0, &ndim_out, shape_out, &data_out);
 
         assert(result == 0 && "Lecture de E[1]/F[0]/G/current");
         assert(ndim_out == 2 && shape_out[0] == 2 && shape_out[1] == 2);
@@ -189,7 +189,7 @@ int main() {
         // TI : Start(1) + Offset(4) = 5 (Car Phase 1 a fini à TI=0, donc append commence à TI=1)
         uint64_t efg_indices_append[] = {1, 0}; // <-- CORRECTION: Taille 2
         const char* full_path_append = "E/1/F/0/G/0/current";
-        int result = db.pz_readData_by_index(full_path_append, 5, &ndim_out, shape_out, &data_out);
+        int result = db.readDataByIndex(full_path_append, 5, &ndim_out, shape_out, &data_out);
 
         assert(result == 0);
         assert(std::abs(data_out[2] - 5018.0) < 1e-9); // 5018 est dans la slice d'offset 4 (index 4 du batch)
@@ -250,7 +250,7 @@ int main() {
         // Re-valider Current Original (TI=0)
         uint64_t efg_indices[] = {1, 0}; // E, F
         const char* full_path = "E/1/F/0/G/current";
-        int result = db.pz_readData_by_index(full_path, 0, &ndim_out, shape_out, &data_out);
+        int result = db.readDataByIndex(full_path, 0, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         assert(std::abs(data_out[3] - 10003.0) < 1e-9);
         std::cout << "  [OK] Re-valid Original Current\n";
@@ -258,7 +258,7 @@ int main() {
 
         // Re-valider Current Phase 3 (TI=5)
         const char* full_path_append = "E/1/F/0/G/current";
-        result = db.pz_readData_by_index(full_path_append, 5, &ndim_out, shape_out, &data_out);
+        result = db.readDataByIndex(full_path_append, 5, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         assert(std::abs(data_out[2] - 5018.0) < 1e-9);
         std::cout << "  [OK] Re-valid Append 1 Current\n";
@@ -268,7 +268,7 @@ int main() {
         // E[0]/F[0], TI start = 1. Offset = 1. Target TI = 2.
         uint64_t e0f0_indices[] = {0, 0};
         const char* full_path_f_sig = "E/0/F/0/f_sig_dynamique";
-        result = db.pz_readData_by_index(full_path_f_sig, 2, &ndim_out, shape_out, &data_out);
+        result = db.readDataByIndex(full_path_f_sig, 2, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         assert(std::abs(data_out[1] - 4010.0) < 1e-9);
         std::cout << "  [OK] Nouvelle slice f_sig_dynamique\n";
@@ -277,7 +277,7 @@ int main() {
         // Valider g_scalar_dynamic (TI=0)
         // E[0]/F[0], G est implicite car dynamique
         const char* full_path_g_scalar = "E/0/F/0/G/0/g_scalar_dynamic";
-        result = db.pz_readData_by_index(full_path_g_scalar, 0, &ndim_out, shape_out, &data_out);
+        result = db.readDataByIndex(full_path_g_scalar, 0, &ndim_out, shape_out, &data_out);
         assert(result == 0);
         assert(std::abs(data_out[0] - 7000.0) < 1e-9);
         std::cout << "  [OK] g_scalar_dynamic\n";

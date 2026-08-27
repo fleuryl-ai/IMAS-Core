@@ -7,7 +7,7 @@
 #include <numeric>
 
 int main() {
-    std::cout << "=== TEST PanzerDB: pz_readData_by_index (2D signal) ===\n\n";
+    std::cout << "=== TEST PanzerDB: readDataByIndex (2D signal) ===\n\n";
     const std::string filename = "test_read_2d_signal.panzer";
 
     // ===================================================================
@@ -69,7 +69,7 @@ int main() {
         uint64_t shape_out[6] = {0};
         double* data_out = nullptr;
         const char* full_path = "A/1/signal_2d";
-        int result = db.pz_readData_by_index(full_path, time_index, &ndim_out, shape_out, &data_out);
+        int result = db.readDataByIndex(full_path, time_index, &ndim_out, shape_out, &data_out);
 
         assert(result == 0 && "La lecture du signal 2D doit réussir.");
         assert(ndim_out == 2 && "La dimension du signal doit être 2.");
