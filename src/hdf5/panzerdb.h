@@ -502,6 +502,14 @@ public:
      */
     bool isInsideDynamicAOS(std::string* timebase) const;
 
+    /**
+     * @brief Exits the current AoS level, restoring the path prefix and counts.
+     * @note Symmetric to beginArray(). When leaving a dynamic AoS, the corresponding
+     *       dynamic-level state is cleared and caches that depend on the stack are
+     *       invalidated.
+     */
+    void endArray();
+
     //==========================================================================
     // Write API - Data
     //==========================================================================
@@ -522,23 +530,8 @@ public:
                    const T* data, size_t count,
                    const std::string& timebase = "");
 
-    /*
-     * (private) Shared implementation of writeData<T>.
-     * Resolves the target raw dataset and its buffer from dtype, grows the buffer,
-     * appends `count` elements, appends the 14-column index row, and bumps aos_time_counters.
-     */
-    template<typename T>
-    void writeDataImpl(const std::string& name,
-                               const std::vector<size_t>& shape,
-                               const T* data,
-                               size_t count,
-                               const std::string& timebase,
-                               DataType dtype,
-                               hid_t dataset_id,
-                               std::vector<T>& buffer);
-
-    /**
-     * @brief Writes one or more time slices of a dynamic double-precision floating point signal.
+     /**
+      * @brief Writes one or more time slices of a dynamic double-precision floating point signal.
      * @param name The name of the signal.
      * @param base_shape The shape of a single time slice.
      * @param data Pointer to the contiguous data for all slices.
@@ -591,35 +584,12 @@ public:
                                 const char* const* data, size_t n_slices,
                                 const std::string& timebase);
 
-    /*
-     * (private) Shared implementation of writeDataSlices<T>: computes the base time from
-     * aos_time_counters, appends the slices to the raw dataset buffer and one index row,
-     * then advances the counters.
-     */
-    template<typename T>
-    void writeDataSlicesImpl(const std::string& name,
-                                     const std::vector<size_t>& base_shape,
-                                     const T* data,
-                                     size_t n_slices,
-                                     const std::string& timebase,
-                                     DataType dtype,
-                                     hid_t dataset_id,
-                                     std::vector<T>& buffer);
-
-    /**
-     * @brief Dumps the cached index table (leaves) to standard output, for debugging.
-     */
-     void dumpLeavesCache() const;
-
-    /**
-     * @brief Exits the current AoS level, restoring the path prefix and counts.
-     * @note Symmetric to beginArray(). When leaving a dynamic AoS, the corresponding
-     *       dynamic-level state is cleared and caches that depend on the stack are
-     *       invalidated.
-     */
-     void endArray();
-
      /**
+      * @brief Dumps the cached index table (leaves) to standard output, for debugging.
+      */
+      void dumpLeavesCache() const;
+
+    /**
      * @brief Flushes all in-memory write buffers to the HDF5 file.
      * This makes the written data visible to other readers without closing the file.
      */
@@ -977,6 +947,37 @@ private:
      * @param delta    Number of time steps to add.
      */
     void advanceTimeForAOS(const std::string& aos_path, uint64_t delta);
+
+    /**
+     * @brief Shared implementation of writeData<T>.
+     * Resolves the target raw dataset and its buffer from dtype, grows the buffer,
+     * appends `count` elements, appends the 14-column index row, and bumps
+     * aos_time_counters.
+     */
+    template<typename T>
+    void writeDataImpl(const std::string& name,
+                       const std::vector<size_t>& shape,
+                       const T* data,
+                       size_t count,
+                       const std::string& timebase,
+                       DataType dtype,
+                       hid_t dataset_id,
+                       std::vector<T>& buffer);
+
+    /**
+     * @brief Shared implementation of writeDataSlices<T>.
+     * Computes the base time from aos_time_counters, appends the slices to the raw
+     * dataset buffer and one index row, then advances the counters.
+     */
+    template<typename T>
+    void writeDataSlicesImpl(const std::string& name,
+                             const std::vector<size_t>& base_shape,
+                             const T* data,
+                             size_t n_slices,
+                             const std::string& timebase,
+                             DataType dtype,
+                             hid_t dataset_id,
+                             std::vector<T>& buffer);
 
 };
 

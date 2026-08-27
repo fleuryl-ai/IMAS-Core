@@ -573,8 +573,22 @@ public:
         std::replace(s.begin(), s.end(), '/', '&');
     }
 
-public:
-    std::string sanitize_path(Context* ctx, const std::string& path) {
+ public:
+
+    /**
+     * @brief Normalizes a (potentially partial) path relative to `ctx` so it can be
+     *        matched against the leaf paths of the PanzerDB index.
+     *
+     * Handles:
+     *  - leading '/' (stripped);
+     *  - '/' -> '&' translation of the context blocks (e.g. "flux_loop/channel" stays
+     *    intact);
+     *  - caching keyed on (ctx, input path) so repeated reads are O(1).
+     * @param ctx  The context against which the path is to be interpreted.
+     * @param path The raw path (may be empty, "/", "time", "A/B", etc.).
+     * @return The normalized path ("" for empty input).
+     */
+     std::string sanitize_path(Context* ctx, const std::string& path) {
         // We build the full path to apply the logic
         std::string fullPath = path;
 
