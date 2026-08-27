@@ -260,6 +260,12 @@ private:
     mutable std::vector<std::string> cached_dynamic_aos_roots;
     mutable std::map<TimeRangeP, size_t> time_range_index;
 
+    // For each dynamic AoS root: the highest time_index found among ALL of its
+    // descendants (any depth), built in getLeaves(). Used by getAOSShape so a
+    // dynamic AoS that only contains nested static AoS (e.g. time_slice/ggd/
+    // theta/values) still reports the correct size.
+    mutable std::unordered_map<std::string_view, uint64_t> max_time_at_dynamic_root;
+
     // Reusable scratch buffers to avoid repetitive malloc/free on reads
     mutable std::vector<double> scratch_f64;
     mutable std::vector<int32_t> scratch_i32; // Not used in current code but ready
@@ -281,6 +287,11 @@ private:
     
     void buildTimeIndex() const;
     const Leaf* findLeafByTime(const std::string& path, int64_t time_index) const;
+
+    // Rebuilds max_time_at_dynamic_root from the currently cached leaves:
+    // for every dynamic AoS root, the max time_index of ALL descendant
+    // data leaves (any depth). Called once per cache (re)build.
+    void rebuildDynamicRootTimeIndex() const;
 
     PathComponents parsePath(const std::string& path, 
                                    const std::string& aos_path) const;

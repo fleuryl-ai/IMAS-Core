@@ -1355,6 +1355,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     cached_leaves.clear();
     leaf_lookup.clear();
     parent_lookup.clear();
+    max_time_at_dynamic_root.clear();
 
     // 1. Read size of /index
     hsize_t dims[2];
@@ -1380,6 +1381,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             cached_leaves.clear();
             leaf_lookup.clear();
             parent_lookup.clear();
+            max_time_at_dynamic_root.clear();
             cached_dynamic_aos_roots.clear();
             cached_paths_blocks.clear();
             cached_parent_paths_blocks.clear();
@@ -1387,6 +1389,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     }
 
     if (n_rows == 0) {
+        max_time_at_dynamic_root.clear();
         leaves_cache_valid = true; // Cache is now valid (but empty).
         return cached_leaves;
     }
@@ -1502,8 +1505,36 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         }
     }
 
+    rebuildDynamicRootTimeIndex();
+
     leaves_cache_valid = true;
     return cached_leaves;
+}
+
+void PanzerDB::rebuildDynamicRootTimeIndex() const {
+    max_time_at_dynamic_root.clear();
+    if (cached_dynamic_aos_roots.empty() || cached_leaves.empty()) return;
+
+    // For each dynamic AoS root, track the highest time_index among ALL of its
+    // descendant DATA leaves (any depth). This makes getAOSShape correct for
+    // dynamic AoS that only contain nested static AoS (e.g. time_slice/ggd/
+    // theta/values) where none of the direct children carry a time index.
+    for (const auto& root : cached_dynamic_aos_roots) {
+        const std::string prefix = root + "/";
+        uint64_t max_t = 0;
+        bool found = false;
+        for (const auto& leaf : cached_leaves) {
+            if ((leaf.flags & 0xF) != 0) continue; // data leaves only
+            if (leaf.path.compare(0, prefix.size(), prefix) != 0) continue;
+            if (!found || leaf.time_index > max_t) {
+                max_t = leaf.time_index;
+                found = true;
+            }
+        }
+        if (found) {
+            max_time_at_dynamic_root[std::string_view(root)] = max_t;
+        }
+    }
 }
 
 template<typename T>
@@ -2239,25 +2270,18 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
 
   // NEW LOGIC FOR DYNAMIC AoS
   if (aos_root_leaf->flags == 3) { // flags == 3 indicates dynamic AoS
-    long long max_time_index = -1;
-    
-    // OPTIMIZATION: Use parent_lookup
-    auto it = parent_lookup.find(aos_root_leaf->path);
-    if (it != parent_lookup.end()) {
-      for (size_t idx : it->second) {
-         if (static_cast<long long>(leaves[idx].time_index) > max_time_index) {
-             max_time_index = leaves[idx].time_index;
-         }
-      }
-    }
-
-    if (max_time_index >= 0) {
-      shapes.push_back(static_cast<size_t>(max_time_index + 1));
+    // Use the max time_index computed over ALL descendant data leaves (any
+    // depth) at cache build time. Looking at direct children only would miss
+    // leaves behind nested static AoS (e.g. time_slice/ggd/theta/values)
+    // where no direct child carries a time index.
+    auto it = max_time_at_dynamic_root.find(std::string_view(level_name));
+    if (it != max_time_at_dynamic_root.end()) {
+      shapes.push_back(static_cast<size_t>(it->second + 1));
     } else {
-      // No data children found, but AoS exists. Size is 0.
+      // No data leaves found under this dynamic AoS. Size is 0.
       shapes.push_back(0);
     }
-    //printf("Dynamic AoS detected. max_time_index: %lld, inferred size: %zu\n", max_time_index, shapes[0]);
+    //printf("Dynamic AoS detected. inferred size: %zu\n", shapes[0]);
 
     return shapes;
   }

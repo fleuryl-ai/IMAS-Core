@@ -203,12 +203,9 @@ offset: 0        1        2        3   | 4   5   6  | 7   8    9  | 10  11  12 |
 
 ¹ Pour une AoS **dynamique**, la taille n'est pas connue à la création :
 `shape[0]` de la méta-ligne vaut 0. La taille effective est déduite à la
-lecture : `max time_index des feuilles **directes** + 1` (§6). Dans le
-vraie `core_profiles`, cet ancre provient des champs directs de
-`profiles_1d` (`t_e`, `t_r`, `n_ion`, …). À noter : dans cet exemple
-simplifié, les seules feuilles directes de `profiles_1d` sont des
-méta-lignes imbriquées (time_index = 0) ; la dérive « AoS dynamique qui
-n'a aucune feuille directe de donnée » est documentée en §9.2.
+lecture : `max time_index` de **toutes** les feuilles descendantes (tout
+niveau d'imbrication) + 1 (§6) — ce qui rend l'exemple ci-dessus
+valable tel quel, sans champ direct nécessaire.
 
 ² Les nœuds écrits à la racine du dataobject (aucun AoS ouvert lors de
 l'appel) ont `parent_paths` vide (voir `append_index_row` :
@@ -381,22 +378,32 @@ un nombre constant de transactions.
 
 **Dynamiques** (flags=3) :
 
-1. `parent_lookup.find(niveau)` → enfants → O(c).
-2. **Taille = max `time_index` des feuilles enfants + 1**
-   (le numéro de slice *est* l'instance).
+1. Une fois par session, au chargement du cache (`getLeaves`) :
+   pour chaque racine dynamique, on calcule le **max `time_index` de toutes
+   les feuilles de donnée descendantes, quelle que soit leur profondeur**
+   (map `max_time_at_dynamic_root`, `rebuildDynamicRootTimeIndex`), O(feux ×
+   racines) sur une passe unique.
+2. Lookup de la taille : `parent_lookup` est remplacé par un accès map O(1)
+   → **Taille = max `time_index` (toute profondeur) + 1**. Le numéro de
+   slice *est* l'instance.
 3. Côté écriture (sans relecture du fichier) :
    `aos_time_counters[niveau]` → O(1) ; exposé par
    `getDynamicAOSSize` (panzerdb.cpp:2309).
 4. En mode APPEND, ces compteurs sont **restaurés** par
    `restoreTimeContext` (panzerdb.cpp:637) : O(N) une fois à l'ouverture,
    à partir de la table seule (aucune donnée lue).
+5. Le parcours ancien (enfants **directs** uniquement) est volontairement
+   écarté car il renvoyait 0 pour une AoS dynamique qui ne contient que des
+   sous-structures statiques (ex. IMAS réel `time_slice/ggd/theta/values`
+   ou `profiles_1d/e_field_n_phi/{plus,minus,parallel}`) — corrigée, test
+   `test_dynamic_aos_nested_only`.
 
 **Cas d'AoS imbriquées** : une AoS statique dans une AoS dynamique
-(`profiles_1d/k/neutral`) porte un chemin **par instance** k : la taille
-de `profiles_1d` est donc obtenue par le `max time_index` des feuilles
-directes (§9.2 documente la limite du cas « aucune feuille directe »), et
-la taille de `neutral` — identique pour tout k — par sa propre méta-ligne
-(§6 statique).
+(`time_slice/k/ggd/theta/values`) porte un chemin **par instance** k : la
+taille de `time_slice` est obtenue par le `max time_index` de **toutes**
+ses feuilles descendantes (profondeur quelconque), et la taille de `ggd` /
+`theta` par la route statique (§6 ci-dessus) — la dérive « feuille directe
+seule » qui limitait ce calcul est corrigée au §9.2.
 
 ---
 
@@ -553,7 +560,7 @@ re-lire tout le fichier.
 | 6 dimensions max par feuille | Le modèle IMAS n'exige pas plus de 3. |
 | Taille AoS statique inférée | Déduite des enfants (ou du déclarant) ; si un AoS est créé **et** vide (`size>0` mais 0 écriture), il n'apparaît pas dans la table ni côté enfants. |
 | Un seul AoS dynamique par niveau | Contrainte documentée et vérifiée (`beginArray` lève une exception si deux AoS dynamique sont imbriqués) — cohérent avec le modèle IMAS (un seul `timed` par chaîne). |
-| `getAOSShape` sur une AoS dynamique « sans champs directs » | La taille d'une AoS dynamique est déduite du `max time_index` de ses **feuilles directes** (ex. `profiles_1d/t_e`). Si un niveau dynamique ne contenait que des sous-structures (feuilles uniquement via `profiles_1d/<t>/sous/…`), aucun enfant direct n'existerait en `parent_lookup` et la taille renverrait 0 — les lectures de slice restent correctes (chemin par instance), seuls les accès « combien d'instances ? » seraient affectés. Ce cas ne se présente pas dans le modèle IMAS courant (chaque niveau dynamique porte des champs directs), il est signalé comme limite du format. |
+| ~~`getAOSShape` sur une AoS dynamique « sans champs directs »~~ | **Corrigé** : la taille d'une AoS dynamique est maintenant déduite du `max time_index` de **toutes** ses feuilles descendantes (profondeur quelconque), calculée une unique fois par session dans `rebuildDynamicRootTimeIndex` (panzerdb.cpp) et lue en O(1) dans `getAOSShape`. Précédemment on ne regardait que les enfants *directs* : la taille renvoyait 0 et la lecture globale était tronquée à zéro pour les 24 AoS dynamiques du modèle IMAS qui ne contiennent que des sous-structures — ex. `time_slice/ggd/theta/values`, `profiles_1d/e_field_n_phi/{plus,minus,parallel}`, `temporary/dynamic_float1d`… Test de régression dédié : `test_dynamic_aos_nested_only` (échoue sans le correctif, passe avec). |
 
 ### 9.3 Glossaire rapide
 
@@ -579,7 +586,7 @@ re-lire tout le fichier.
 | Création des 7 datasets | `panzerdb.cpp:158-233` ; `createOptimizedDataset` `:464` |
 | Buffers & seuils de flush | `panzerdb.h:219-226` ; `flush()` `panzerdb.cpp:714` |
 | `getLeaves` (cache + lookups) | `panzerdb.cpp:1349` |
-| `getAOSShape` (tailles) | `panzerdb.cpp:2219` ; `getDynamicAOSSize` `:2309` |
+| `getAOSShape` (tailles) | `panzerdb.cpp:2250` (dynamique : map `max_time_at_dynamic_root`) ; `rebuildDynamicRootTimeIndex` (panzerdb.h / .cpp, à la construction du cache) ; `getDynamicAOSSize` `:2309` |
 | Lecture slice direct | `readSliceDirect` `panzerdb.cpp:992` ; `pz_readData_by_index` `:2481` |
 | Interpolation + gaps | `readInterpolatedData` `:3205` ; `nearestAvailableSliceIndex` `:2385` |
 | Lecture batch | `readLeavesUnion` `:1146` |
@@ -590,4 +597,4 @@ re-lire tout le fichier.
 | Writer AL→PanzerDB | `hdf5_writer_v2.cpp` (`beginWriteArraystructAction` `:79`, `write_ND_Data` `:192`, `endAction` `:577`) |
 | Lecteur AL→PanzerDB | `slice_read_strategy.cpp` (`read_ND_Data` `:83`) ; `iread_strategy.h:542` (`buildFullPath`) |
 | Correctif gaps (rapport) | `docs/REPORT_correction_lecture_gaps.md` §7 (homogène) ; `docs/PLANS_gap_homog_timebase.md` |
-| Tests de référence | `tests/hdf5_backend/test_profiles_1d_dynamic_signal_1d.cpp`, `test_gap_closest_prev_read.cpp`, `test_gap_homog_slice_read.cpp`, `test_gap_homog_timerange_read.cpp` |
+| Tests de référence | `tests/hdf5_backend/test_profiles_1d_dynamic_signal_1d.cpp`, `test_gap_closest_prev_read.cpp`, `test_gap_homog_slice_read.cpp`, `test_gap_homog_timerange_read.cpp`, **`test_dynamic_aos_nested_only.cpp`** (AoS dynamique contenant uniquement des AoS statiques imbriquées) |
