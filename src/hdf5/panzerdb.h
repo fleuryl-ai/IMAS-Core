@@ -112,24 +112,6 @@ struct ArrayLevel {
 };
 
 /**
- * @struct TimeRangeP
- * @brief Represents a time range [start, end) for indexing.
- */
-struct TimeRangeP {
-    uint64_t start;
-    uint64_t end;
-    
-    bool contains(uint64_t t) const {
-        return t >= start && t < end;
-    }
-    
-    bool operator<(const TimeRangeP& other) const {
-        if (start != other.start) return start < other.start;
-        return end < other.end;
-    }
-};
-
-/**
  * @struct PathComponents
  * @brief Helper struct to hold the parsed components of a data path within a dynamic AoS.
  */
@@ -221,10 +203,6 @@ private:
     static constexpr size_t INITIAL_STRING_BUFFER_SIZE = 512;      
     static constexpr size_t BUFFER_GROWTH_FACTOR = 2;              
     
-    // Thresholds for auto-flush (to avoid too large buffers in memory)
-    static constexpr size_t AUTO_FLUSH_THRESHOLD = 100'000'000;    // 100 MB
-    static constexpr size_t CRITICAL_FLUSH_THRESHOLD = 500'000'000; // 500 MB
-
     // Cache to avoid reconstructions
     mutable std::string cached_path_prefix;
     mutable bool path_prefix_dirty = true;
@@ -237,8 +215,6 @@ private:
     
     void invalidateDynamicAOSCache();
     
-    size_t getTotalBufferSize() const;
-    void autoFlushIfNeeded();
     void growBufferIfNeeded(size_t required_space);
     void flushComplexBuffer();
     void flushStringBuffer() ;
@@ -258,7 +234,6 @@ private:
     mutable std::unordered_map<std::string_view, std::vector<size_t>> leaf_lookup;
     mutable std::unordered_map<std::string_view, std::vector<size_t>> parent_lookup;
     mutable std::vector<std::string> cached_dynamic_aos_roots;
-    mutable std::map<TimeRangeP, size_t> time_range_index;
 
     // For each dynamic AoS root: the highest time_index found among ALL of its
     // descendants (any depth), built in getLeaves(). Used by getAOSShape so a
@@ -274,19 +249,6 @@ private:
 
     std::unordered_set<std::string> written_metadata_schema_paths;
     std::map<std::string, std::string> metadata_map;
-
-    mutable bool time_index_valid = false;
-    
-    // Metadata cache
-    struct LeafMetadata {
-        size_t slice_volume;
-        size_t n_time_steps;
-        TimeRangeP time_range;
-    };
-    mutable std::vector<LeafMetadata> leaf_metadata_cache;
-    
-    void buildTimeIndex() const;
-    const Leaf* findLeafByTime(const std::string& path, int64_t time_index) const;
 
     // Rebuilds max_time_at_dynamic_root from the currently cached leaves:
     // for every dynamic AoS root, the max time_index of ALL descendant

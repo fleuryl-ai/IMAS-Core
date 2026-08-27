@@ -44,7 +44,6 @@
  *       chunks (e.g., a time series scattered across the file) into a single HDF5
  *       read operation using `H5S_SELECT_OR`.
  *     - **Caching**: The `getLeaves` method caches the entire index table in memory.
- *       `buildTimeIndex` creates an O(log n) lookup structure for fast time-based queries.
  *
  * 4.  **Path Substitution**:
  *     - When reading dynamic data (e.g., `pz_readData_by_index`), the code must often
@@ -908,85 +907,7 @@ void PanzerDB::close() {
 }
 
 
-// 2. CONSTRUCTION DE L'INDEX TEMPOREL (une seule fois)
-// ============================================================================
-
-void PanzerDB::buildTimeIndex() const {
-    if (time_index_valid) return;
-    
-    time_range_index.clear();
-    leaf_metadata_cache.clear();
-    
-    const auto& leaves = getLeaves();
-    leaf_metadata_cache.resize(leaves.size());
-    
-    for (size_t i = 0; i < leaves.size(); ++i) {
-        const auto& leaf = leaves[i];
-        
-        // Skip meta-nodes (AoS)
-        if ((leaf.flags & 0xF) != 0) continue;
-        
-        // Calculer métadonnées UNE SEULE FOIS
-        size_t slice_volume = 1;
-        for (auto s : leaf.shape) {
-            if (s > 0) slice_volume *= s;
-        }
-        if (slice_volume == 0) slice_volume = 1;
-        
-        size_t n_steps = leaf.count / slice_volume;
-        if (n_steps == 0 && leaf.count > 0) n_steps = 1;
-        
-        TimeRangeP range{leaf.time_index, leaf.time_index + n_steps};
-        
-        // Stocker métadonnées
-        leaf_metadata_cache[i] = {slice_volume, n_steps, range};
-        
-        // Indexer par time range
-        time_range_index.insert({range, i});
-    }
-    
-    time_index_valid = true;
-}
-
-// 3. RECHERCHE OPTIMISÉE O(log n) AU LIEU DE O(n)
-// ============================================================================
-
-const PanzerDB::Leaf* PanzerDB::findLeafByTime(const std::string& path, 
-                                                 int64_t time_index) const {
-    buildTimeIndex(); // Construit l'index si nécessaire (une seule fois)
-    
-    const auto& leaves = getLeaves();
-    
-    // Recherche par path
-    auto path_it = leaf_lookup.find(path);
-    if (path_it == leaf_lookup.end()) return nullptr;
-    
-    // Recherche optimisée par time range
-    TimeRangeP query{static_cast<uint64_t>(time_index), 
-                    static_cast<uint64_t>(time_index + 1)};
-    
-    auto range_it = time_range_index.lower_bound(query);
-    
-    // Parcourir les candidats (très peu, généralement 1-3)
-    for (; range_it != time_range_index.end(); ++range_it) {
-        size_t leaf_idx = range_it->second;
-        
-        // Vérifier que c'est le bon path
-        if (leaves[leaf_idx].path != path) continue;
-        
-        // Vérifier que le time_index est dans le range
-        if (range_it->first.contains(time_index)) {
-            return &leaves[leaf_idx];
-        }
-        
-        // Si on a dépassé, arrêter
-        if (range_it->first.start > static_cast<uint64_t>(time_index)) break;
-    }
-    
-    return nullptr;
-}
-
-// 4. LECTURE DIRECTE VIA HYPERSLAB (sans buffer intermédiaire)
+// 2. LECTURE DIRECTE VIA HYPERSLAB (sans buffer intermédiaire)
 // ============================================================================
 
 template<typename T>
@@ -994,11 +915,13 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
                                int64_t time_index,
                                T* out_buffer) const {
     
-    // Utiliser les métadonnées en cache
-    buildTimeIndex();
-    size_t leaf_idx = &leaf - &getLeaves()[0]; // Index du leaf
-    const auto& meta = leaf_metadata_cache[leaf_idx];
-    
+    // Volume d'une slice temporelle (re-calculé depuis leaf.shape : déjà en mémoire)
+    uint64_t slice_volume = 1;
+    for (size_t s : leaf.shape) {
+        if (s > 0) slice_volume *= s;
+    }
+    if (slice_volume == 0) slice_volume = 1;
+
     uint64_t local_step = time_index - leaf.time_index;
     
     // Déterminer le dataset et type appropriés
@@ -1026,8 +949,8 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
     hid_t file_space = H5Dget_space(dset_id);
     
     // Sélectionner exactement le slice voulu
-    hsize_t offset[1] = {leaf.offset + local_step * meta.slice_volume};
-    hsize_t count[1] = {meta.slice_volume};
+    hsize_t offset[1] = {leaf.offset + local_step * slice_volume};
+    hsize_t count[1] = {slice_volume};
     
     H5Sselect_hyperslab(file_space, H5S_SELECT_SET, offset, NULL, count, NULL);
     
@@ -1368,55 +1291,21 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     H5Sclose(space);
     uint64_t n_rows = dims[0];
 
-    uint64_t start_row = 0;
-    if (!cached_leaves.empty()) {
-        if (n_rows == cached_leaves.size()) {
-            leaves_cache_valid = true;
-            return cached_leaves;
-        }
-        if (n_rows > cached_leaves.size()) {
-            start_row = cached_leaves.size();
-        } else {
-            // File shrank or reset? Full reload.
-            cached_leaves.clear();
-            leaf_lookup.clear();
-            parent_lookup.clear();
-            max_time_at_dynamic_root.clear();
-            cached_dynamic_aos_roots.clear();
-            cached_paths_blocks.clear();
-            cached_parent_paths_blocks.clear();
-        }
-    }
-
     if (n_rows == 0) {
         max_time_at_dynamic_root.clear();
         leaves_cache_valid = true; // Cache is now valid (but empty).
         return cached_leaves;
     }
 
-    uint64_t read_count = n_rows - start_row;
-    
-    if (start_row == 0) {
-        cached_dynamic_aos_roots.clear();
-        cached_paths_blocks.clear();
-        cached_parent_paths_blocks.clear();
-    }
+    uint64_t read_count = n_rows;
 
-    // 2. Read index and paths (Incremental or Full)
+    cached_dynamic_aos_roots.clear();
+    cached_paths_blocks.clear();
+    cached_parent_paths_blocks.clear();
+
+    // 2. Read index and paths (full reload)
     std::vector<uint64_t> idx(read_count * 14);
-    
-    if (start_row == 0) {
-        H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
-    } else {
-        hsize_t offset[2] = {start_row, 0};
-        hsize_t count[2] = {read_count, 14};
-        hid_t memspace = H5Screate_simple(2, count, NULL);
-        hid_t filespace = H5Dget_space(index_dset);
-        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, NULL, count, NULL);
-        H5Dread(index_dset, H5T_NATIVE_UINT64, memspace, filespace, H5P_DEFAULT, idx.data());
-        H5Sclose(filespace);
-        H5Sclose(memspace);
-    }
+    H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
 
     cached_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
     cached_parent_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
@@ -1432,16 +1321,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         H5Sget_simple_extent_dims(paths_space, paths_dims, nullptr);
         
         if (paths_dims[0] >= n_rows) { // Ensure data exists
-            if (start_row == 0) {
-                H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
-            } else {
-                hsize_t offset[1] = {start_row};
-                hsize_t count[1] = {read_count};
-                hid_t memspace = H5Screate_simple(1, count, NULL);
-                H5Sselect_hyperslab(paths_space, H5S_SELECT_SET, offset, NULL, count, NULL);
-                H5Dread(paths_dset, str_type, memspace, paths_space, H5P_DEFAULT, paths_data.data());
-                H5Sclose(memspace);
-            }
+            H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
         }
         H5Sclose(paths_space);
 
@@ -1452,16 +1332,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             H5Sget_simple_extent_dims(ppaths_space, ppaths_dims, nullptr);
             
             if (ppaths_dims[0] >= n_rows) {
-                if (start_row == 0) {
-                    H5Dread(parent_paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, parent_paths_data.data());
-                } else {
-                    hsize_t offset[1] = {start_row};
-                    hsize_t count[1] = {read_count};
-                    hid_t memspace = H5Screate_simple(1, count, NULL);
-                    H5Sselect_hyperslab(ppaths_space, H5S_SELECT_SET, offset, NULL, count, NULL);
-                    H5Dread(parent_paths_dset, str_type, memspace, ppaths_space, H5P_DEFAULT, parent_paths_data.data());
-                    H5Sclose(memspace);
-                }
+                H5Dread(parent_paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, parent_paths_data.data());
             }
             H5Sclose(ppaths_space);
         }
@@ -1716,8 +1587,6 @@ void PanzerDB::writeDataImpl(const std::string& name,
 
     uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
     append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags);
-
-    //autoFlushIfNeeded();
 }
 
 // 6. PATH PARSING OPTIMISÉ (pour substitution dans pz_readData_by_index)
