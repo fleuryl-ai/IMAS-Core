@@ -92,7 +92,6 @@ struct ChunkingConfig {
     int compression_level = 6;                // 0-9, 6 is a good compromise
     
     // Cache settings (HDF5 metadata cache)
-    size_t metadata_cache_size = 16 * 1024 * 1024;  // 16 MB
     size_t chunk_cache_size = 64 * 1024 * 1024;     // 64 MB
     size_t chunk_cache_nslots = 10007;               // Prime number for hash
 };
@@ -204,10 +203,6 @@ private:
     static constexpr size_t BUFFER_GROWTH_FACTOR = 2;              
     
     // Cache to avoid reconstructions
-    mutable std::string cached_path_prefix;
-    mutable bool path_prefix_dirty = true;
-    
-    void rebuildPathPrefix();
     std::string buildPathFromStack(const std::vector<ArrayLevel>& stack_vector) const;
 
     mutable std::string cached_dynamic_aos_path;
@@ -243,12 +238,9 @@ private:
 
     // Reusable scratch buffers to avoid repetitive malloc/free on reads
     mutable std::vector<double> scratch_f64;
-    mutable std::vector<int32_t> scratch_i32; // Not used in current code but ready
-    mutable std::vector<std::complex<double>> scratch_c128;
     mutable std::vector<std::string> scratch_str;
 
     std::unordered_set<std::string> written_metadata_schema_paths;
-    std::map<std::string, std::string> metadata_map;
 
     // Rebuilds max_time_at_dynamic_root from the currently cached leaves:
     // for every dynamic AoS root, the max time_index of ALL descendant
@@ -392,10 +384,6 @@ public:
      * @return True if inside a dynamic AoS, false otherwise.
      */
     bool isInsideDynamicAOS(std::string* timebase) const;
-
-
-    uint64_t getTimeBaseLength(const std::string& timebase_name) const;
-    uint64_t getLastTimeIndex(const std::string& data_path) const;
 
     //==========================================================================
     // Write API - Data
@@ -568,16 +556,6 @@ public:
     template<typename T>
     int readSliceDirect(const Leaf& leaf, int64_t time_index, T* out_buffer) const;
 
-     /**
-     * @brief Reads multiple contiguous data chunks in a single HDF5 operation.
-     * @tparam T The data type.
-     * @param leaves A vector of Leaf pointers that are contiguous in the raw data file.
-     * @param output A pre-allocated buffer to hold the combined data.
-     * @return 0 on success, -1 on failure.
-     */
-    template<typename T>
-    int readMultipleSlices(const std::vector<const Leaf*>& leaves, T* output) const;
-
     /**
      * @brief Reads multiple leaves into a contiguous buffer using Hyperslab Union (H5S_SELECT_OR).
      *        Optimized for monotonic offsets. Falls back to sequential reads if offsets are not monotonic.
@@ -742,10 +720,10 @@ public:
     static std::string stripIndices(const std::string& path);
 
     /**
-     * @brief Writes a set of metadata for a given path.
-     * @param path The base path (e.g., "profiles_1d/t_e")
-     * @param metadata_map Map containing {metadata_name, value} pairs
-     */
+      * @brief Writes a metadata entry for a given path.
+      * @param path The base path (e.g., "profiles_1d/t_e")
+      * @param value The metadata value to store
+      */
     void writeMetaData(const std::string& path, const std::string& value);
     
 
@@ -767,8 +745,6 @@ private:
     std::string getDynamicAOSPath() const;
     uint64_t getCurrentTimeForAOS(const std::string& aos_path);
     void advanceTimeForAOS(const std::string& aos_path, uint64_t delta);
-    std::string findDynamicAOSParent(const std::string& parent_path,
-                                           const std::vector<Leaf>& leaves);
     
 };
 

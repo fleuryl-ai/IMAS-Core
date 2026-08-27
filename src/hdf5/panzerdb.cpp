@@ -625,14 +625,6 @@ std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_ve
     return result;
 }
 
-void PanzerDB::rebuildPathPrefix() {
-    if (!path_prefix_dirty) return;
-    
-    // Avec vector, array_stack est déjà dans le bon ordre (racine -> feuille)
-    path_prefix = buildPathFromStack(array_stack);
-    path_prefix_dirty = false;
-}
-
 void PanzerDB::restoreTimeContext() {
     if (mode != OpenMode::APPEND && mode != OpenMode::READ) return;
 
@@ -690,22 +682,6 @@ void PanzerDB::restoreTimeContext() {
             }
         }
     }
-}
-
-// Helper to find dynamic AOS parent of a leaf
-std::string PanzerDB::findDynamicAOSParent(const std::string& parent_path,
-                                           const std::vector<Leaf>& leaves) {
-    // OPTIMISATION: Utiliser le cache des racines dynamiques au lieu de parcourir toutes les feuilles
-    std::string best_match = "";
-    for (const auto& aos_path : cached_dynamic_aos_roots) {
-        if (parent_path.find(aos_path) == 0) {
-            // Vérifier frontières (ex: "A/B" match "A" mais pas "A_suffix")
-            if (parent_path.length() == aos_path.length() || parent_path[aos_path.length()] == '/') {
-                if (aos_path.length() > best_match.length()) best_match = aos_path;
-            }
-        }
-    }
-    return best_match;
 }
 
 PanzerDB::~PanzerDB() { close(); }
@@ -977,95 +953,6 @@ template int PanzerDB::readSliceDirect<int32_t>(const Leaf&, int64_t, int32_t*) 
 template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_t, 
                                                               std::complex<double>*) const;
 
-// 5. LECTURE GROUPÉE POUR SIGNAUX CONTIGUS
-// ============================================================================
-
-template<typename T>
-int PanzerDB::readMultipleSlices(const std::vector<const Leaf*>& leaves,
-                                  T* output) const {
-    if (leaves.empty()) return -1;
-    
-    // Trier par offset pour détecter contiguïté
-    std::vector<const Leaf*> sorted_leaves = leaves;
-    std::sort(sorted_leaves.begin(), sorted_leaves.end(),
-              [](const Leaf* a, const Leaf* b) {
-                  return a->offset < b->offset;
-              });
-    
-    // Grouper les leaves contigus
-    std::vector<std::vector<const Leaf*>> groups;
-    std::vector<const Leaf*> current_group;
-    
-    for (size_t i = 0; i < sorted_leaves.size(); ++i) {
-        if (current_group.empty()) {
-            current_group.push_back(sorted_leaves[i]);
-        } else {
-            const Leaf* prev = current_group.back();
-            const Leaf* curr = sorted_leaves[i];
-            
-            // Vérifier contiguïté
-            if (prev->offset + prev->count == curr->offset) {
-                current_group.push_back(curr);
-            } else {
-                groups.push_back(current_group);
-                current_group.clear();
-                current_group.push_back(curr);
-            }
-        }
-    }
-    if (!current_group.empty()) {
-        groups.push_back(current_group);
-    }
-    
-    // Lire chaque groupe en une seule opération HDF5
-    size_t total_offset = 0;
-    
-    for (const auto& group : groups) {
-        uint64_t group_offset = group[0]->offset;
-        uint64_t group_count = 0;
-        for (const auto* leaf : group) {
-            group_count += leaf->count;
-        }
-        
-        // Déterminer dataset
-        DataType type = static_cast<DataType>(group[0]->flags >> 4);
-        hid_t dset_id = -1;
-        hid_t mem_type = -1;
-        
-        if (type == DataType::FLOAT64) {
-            dset_id = data_dset_f64;
-            mem_type = H5T_NATIVE_DOUBLE;
-        } else if (type == DataType::INT32) {
-            dset_id = data_dset_i32;
-            mem_type = H5T_NATIVE_INT;
-        } else {
-            continue; // Skip unsupported types for grouped read
-        }
-        
-        // Lecture groupée
-        hid_t file_space = H5Dget_space(dset_id);
-        hsize_t offset[1] = {group_offset};
-        hsize_t count[1] = {group_count};
-        
-        H5Sselect_hyperslab(file_space, H5S_SELECT_SET, offset, NULL, count, NULL);
-        hid_t mem_space = H5Screate_simple(1, count, NULL);
-        
-        H5Dread(dset_id, mem_type, mem_space, file_space, H5P_DEFAULT, 
-                output + total_offset);
-        
-        H5Sclose(mem_space);
-        H5Sclose(file_space);
-        
-        total_offset += group_count;
-    }
-    
-    return 0;
-}
-
-template int PanzerDB::readMultipleSlices<double>(const std::vector<const Leaf*>&, double*) const;
-template int PanzerDB::readMultipleSlices<int32_t>(const std::vector<const Leaf*>&, int32_t*) const;
-template int PanzerDB::readMultipleSlices<std::complex<double>>(const std::vector<const Leaf*>&, std::complex<double>*) const;
-
 int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const {
     if (leaves.empty()) return 0;
 
@@ -1182,7 +1069,6 @@ void PanzerDB::beginArray(const std::string& name, size_t size) {
     beginArray(level);
     //printf("[DEBUG beginArray AFTER] array_stack.size() = %zu\n", array_stack.size());
 
-    path_prefix_dirty = true;
     invalidateDynamicAOSCache();
 }
 
@@ -2020,31 +1906,6 @@ void PanzerDB::append_index_row(const std::string& full_path,
     index_buffer.insert(index_buffer.end(), row, row + 14);
 }
 
-uint64_t PanzerDB::getTimeBaseLength(const std::string& timebase_name) const {
-    const auto& leaves = getLeaves();
-    uint64_t count = 0;
-    for (const auto& leaf : leaves) {
-        // Assume timebase is a 1D signal
-        if (leaf.path == timebase_name) {
-            count += leaf.count;
-        }
-    }
-    return count;
-}
-
-uint64_t PanzerDB::getLastTimeIndex(const std::string& data_path) const {
-    const auto& leaves = getLeaves();
-    int64_t max_ti = -1;
-    for (const auto& leaf : leaves) {
-        if (leaf.path == data_path) {
-            if (static_cast<int64_t>(leaf.time_index) > max_ti) {
-                max_ti = leaf.time_index;
-            }
-        }
-    }
-    return (max_ti == -1) ? 0 : max_ti;
-}
-
 bool PanzerDB::isInsideDynamicAOS(std::string* timebase) const {
     if (array_stack.empty()) {
         return false;
@@ -2112,7 +1973,6 @@ void PanzerDB::endArray() {
         array_stack.back().actual_count += level.actual_count ? level.actual_count : 1;
     }
 
-    path_prefix_dirty = true;
     invalidateDynamicAOSCache();
 }
 

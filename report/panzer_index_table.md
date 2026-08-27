@@ -116,9 +116,10 @@ Les chemins sont stockés dans deux datasets séparés (une valeur par ligne,
 allocation en régime permanent. `flush()` (fin de session, ou `close()`
 ) : 7 extensions de dataset + 7 écritures hyperslab → **une seule**
 transaction HDF5 par buffer, donc une I/O par flush quelle que soit la
-taille des données. Seuil mémoire défensif (non déclenché actuellement en
-production, code présent) : `AUTO_FLUSH_THRESHOLD` = 100 Mo, critique à
-500 Mo.
+taille des données. Le seul flush déclenché est l'explicite
+(`HDF5Writer_v2::endAction` / destructeur) — l'ancien seuil mémoire
+(`AUTO_FLUSH_THRESHOLD`) n'était jamais appelé et a été supprimé le
+27/08/2026 (cf. `panzerdb_removing_dead_codes.md`).
 
 ---
 
@@ -345,8 +346,6 @@ fusionnés) → 1 I/O ; sinon repli séquentiel (k I/O) pour préserver l'ordre.
 **Recherche par temps** (`getTimeIndex`) : `leaf_lookup.find(chemin_timebase)`
 → concaténation des feuilles O(T log T) (T = nb pas) → interpolation
 `DataInterpolation::getSlicesTimesIndices` → O(T) (T petit par signal).
-Version indexée : `findLeafByTime` construit un `std::map<TimeRange>` en
-O(N log N) puis chaque requête est O(log N + candidats).
 
 ### 5.3 Écriture
 
@@ -472,14 +471,13 @@ la table porte les slices 0..4, chacune adressée par son `time_index`.
 
 | Cache | Contenu | Rôle | Invalidation / coût |
 |---|---|---|---|
-| `cached_leaves` | `vector<Leaf>` (path/parent en `string_view`) | Représentation RAM **complète** de la table ; base de toutes les recherches | Re-construction incrémentale si N grandit ; `leaves_cache_valid=false` après flush |
+| `cached_leaves` | `vector<Leaf>` (path/parent en `string_view`) | Représentation RAM **complète** de la table ; base de toutes les recherches | Recharger intégral si invalidé ; `leaves_cache_valid=false` après flush |
 | `leaf_lookup` | `map<string_view, vector<size_t>>` | « chemin → feuilles » : le cœur des O(1) | Replié avec `cached_leaves` |
 | `parent_lookup` | `map<string_view, vector<size_t>>` | « parent → enfants » : taille AoS, enfants directs, sans parsing | idem |
 | `cached_paths_blocks` / `cached_parent_paths_blocks` | Blocs 256 B/ligne | Support mémoire des `string_view` (zéro-copy) | idem |
 | `cached_dynamic_aos_roots` | `vector<string>` | Racines AoS dynamiques (flags=3) : stratégies générique/substituée sans parcours N | idem |
-| `time_range_index` | `map<TimeRangeP,size_t>` | Recherche par temps O(log N) (`findLeafByTime`) | `buildTimeIndex` (lazy, une fois) |
-| `leaf_metadata_cache` | `(slice_volume, n_steps, range)` par feuille | Évitent le recomptage du volume dans `readSliceDirect` | idem |
-| `scratch_f64/i32/c128/str` | Buffers de travail | Éviter malloc/free à chaque lecture | — |
+| `max_time_at_dynamic_root` | `map<string_view,uint64>` | max `time_index` descendant par racine dynamique ; sert `getAOSShape` | `rebuildDynamicRootTimeIndex`, idem |
+| `scratch_str` | Buffer de travail | Éviter malloc/free des `std::string` dans `pz_readStringData_by_index` | — |
 | `disk_size_*` | Taille courante des `data_raw_*` en RAM | Offset d'écriture sans `H5Dget_space` | Mis à jour au flush (WRITE), `updateDiskSizes` (APPEND) |
 
 ### 8.2 Caches d'écriture
@@ -487,7 +485,7 @@ la table porte les slices 0..4, chacune adressée par son `time_index`.
 | Cache | Rôle |
 |---|---|
 | `aos_time_counters` | `chemin → prochaine slice libre` ; O(1) pour base_time, détection de gaps, restauration APPEND (`restoreTimeContext`) |
-| `path_prefix` + `path_prefix_dirty` | Pré-construction du préfixe de chemin ; reconstruit uniquement quand le stack AoS change (`synchronizeArrayStack`, `beginArray`, `endArray`) — évite le re-joignage à chaque écriture |
+| `path_prefix` | Préfixe de chemin courant, maintenu directement par `beginArray(ArrayLevel)`/`endArray` — évite le re-joignage à chaque écriture |
 | `cached_dynamic_aos_path` + `dynamic_aos_path_valid` | Chemin de l'AoS dynamique courant, invalidé par `invalidateDynamicAOSCache()` dans les 3 `beginArray*` et `endArray` (une invalidation manquante dans la signature temporelle est à l'origine de la régression « gaps homogènes », corrigée en 07/2026) |
 | `written_metadata_schema_paths` | Dédup des métadonnées IMAS (`schema@attribut`) : une seule écriture par attribut, y compris en APPEND |
 | Buffers RAM (section 2.3) | Amortissement I/O (le plus gros « cache » : tout n'est écrit qu'au flush) |
