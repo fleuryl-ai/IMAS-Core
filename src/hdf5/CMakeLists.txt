@@ -95,6 +95,14 @@ al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
 al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
 al_add_hdf5_test(test_engine_append_complex)
 
+# Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +
+# getAOSShape + stripIndices). Default CTest mode is `verify`; `capture`
+# regenerates the committed oracle. See tests/hdf5_backend/test_index_golden.cpp.
+al_add_hdf5_test(test_index_golden)
+target_compile_definitions(test_index_golden PRIVATE
+    PZGOLD_GOLDEN_DIR="${PROJECT_SOURCE_DIR}/tests/hdf5_backend/fixtures/goldens")
+target_include_directories(test_index_golden PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
 # --------------------------------------------------------------------------
 # AL-level tests (via HDF5Backend / ALContext, dispatching to v2)
 # --------------------------------------------------------------------------

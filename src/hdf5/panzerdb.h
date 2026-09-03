@@ -125,7 +125,15 @@ struct ArrayLevel {
 
     // Full path of the AoS (for lookup in aos_time_counters).
     std::string aos_full_path;
+
+    // Row position in /index of this AoS's meta-node, assigned by beginArray.
+    // Children record it as their parent_id so parent_path can be rebuilt on read
+    // without duplicating the full parent text on every leaf.
+    uint64_t container_row_id = 0;
 };
+
+// Sentinel for the parent_id column of a root row (no enclosing AoS meta node).
+inline constexpr uint64_t PANZER_NO_PARENT_ROW = 0xFFFFFFFFFFFFFFFFULL;
 
 /**
  * @struct PathComponents
@@ -228,8 +236,13 @@ private:
     bool last_level_had_write = false;
     bool should_close_loc_id = false;
 
+    // Running /index row id. In WRITE mode it starts at 0; in APPEND mode it is
+    // seeded from the on-disk /index row count so appended rows keep the same ids
+    // a later READ observes (parent-first ordering).
+    uint64_t next_row_id = 0;
+
     // RAM Buffers (only what is necessary)
-    std::vector<uint64_t> index_buffer;   // 14 columns: type, ndim, shape[6], time_index, offset, count, flags
+    std::vector<uint64_t> index_buffer;   // 14 columns: name_id, ndim, shape[6], time_index, offset, count, flags, parent_id, index_value
     std::vector<double> data_buffer_f64;
     std::vector<int32_t> data_buffer_i32;
     std::vector<std::complex<double>> data_buffer_c128;
@@ -932,18 +945,22 @@ private:
 
     /**
      * @brief Appends one 14-column row to the index buffer (no HDF5 I/O).
-     * @param full_path    Full instance path of the node.
-     * @param parent_path  Path of the parent node.
+     * @param full_path    Full instance path of the node (written to /paths).
+     * @param parent_path  Path of the parent node (reconstructed on read; not stored).
      * @param shape        Node shape (up to 6 dimensions).
-     * @param type         Data type (DataType value, stored in the type column).
+     * @param type         Data type (DataType value; M1 keeps the always-zero value in row[0]).
      * @param time_idx     First time step of the row (0 for static data).
      * @param offset       Element offset inside the raw data dataset.
      * @param count        Number of stored elements.
      * @param flags        Node kind (low 4 bits) or metadata marker.
+     * @param parent_id    Row id of the enclosing AoS meta node, or PANZER_NO_PARENT_ROW.
+     * @param index_value  Instance index within that parent AoS (0 if absent).
+     * @return The row id assigned to the appended row (stable parent-first order).
      */
-    void append_index_row(const std::string& full_path, const std::string& parent_path,
+    uint64_t append_index_row(const std::string& full_path, const std::string& parent_path,
                                  const std::vector<size_t>& shape, uint64_t type,
-                                 uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags);
+                                 uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags,
+                                 uint64_t parent_id, uint64_t index_value);
 
     /**
      * @brief Returns the path of the enclosing dynamic AoS, or an empty string.

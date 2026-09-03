@@ -1,0 +1,85 @@
+# PANZERDB INDEX SURFACE GOLDEN v1
+[leaves 41]
+dyn |  | flags=3 kind=3 dtype=0 time=0 off=0 cnt=0 shape=(0) empty=0 schema=dyn
+dyn/sig | dyn | flags=0 kind=0 dtype=0 time=0 off=21 cnt=3 shape=(1) empty=0 schema=dyn/sig
+dyn/sig1d | dyn | flags=0 kind=0 dtype=0 time=0 off=26 cnt=8 shape=(4) empty=0 schema=dyn/sig1d
+dyn/sig_more | dyn | flags=0 kind=0 dtype=0 time=0 off=24 cnt=2 shape=(1) empty=0 schema=dyn/sig_more
+dyn/sigc | dyn | flags=32 kind=0 dtype=2 time=0 off=3 cnt=3 shape=(1) empty=0 schema=dyn/sigc
+dyn/sigi | dyn | flags=16 kind=0 dtype=1 time=0 off=8 cnt=4 shape=(1) empty=0 schema=dyn/sigi
+dyn/sigstr | dyn | flags=48 kind=0 dtype=3 time=0 off=5 cnt=1 shape=(1) empty=0 schema=dyn/sigstr
+dyn/sigstr | dyn | flags=48 kind=0 dtype=3 time=1 off=6 cnt=1 shape=(1) empty=0 schema=dyn/sigstr
+dyn/sigstr | dyn | flags=48 kind=0 dtype=3 time=2 off=7 cnt=1 shape=(1) empty=0 schema=dyn/sigstr
+na |  | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(3) empty=0 schema=na
+na/0/nb | na | flags=3 kind=3 dtype=0 time=0 off=0 cnt=0 shape=(0) empty=0 schema=na/nb
+na/0/nb/sigsig | na/0/nb | flags=0 kind=0 dtype=0 time=0 off=34 cnt=3 shape=(1) empty=0 schema=na/nb/sigsig
+na/0/nb/sigstrd | na/0/nb | flags=48 kind=0 dtype=3 time=0 off=8 cnt=1 shape=(1) empty=0 schema=na/nb/sigstrd
+na/0/nb/sigstrd | na/0/nb | flags=48 kind=0 dtype=3 time=1 off=9 cnt=1 shape=(1) empty=0 schema=na/nb/sigstrd
+na/1/nb | na | flags=3 kind=3 dtype=0 time=0 off=0 cnt=0 shape=(0) empty=0 schema=na/nb
+na/1/nb/sigsig | na/1/nb | flags=0 kind=0 dtype=0 time=0 off=37 cnt=5 shape=(1) empty=0 schema=na/nb/sigsig
+na/2/nb | na | flags=3 kind=3 dtype=0 time=0 off=0 cnt=0 shape=(0) empty=0 schema=na/nb
+na/2/nb/sigcplx | na/2/nb | flags=32 kind=0 dtype=2 time=0 off=6 cnt=2 shape=(1) empty=0 schema=na/nb/sigcplx
+na/2/nb/sigsig | na/2/nb | flags=0 kind=0 dtype=0 time=0 off=42 cnt=2 shape=(1) empty=0 schema=na/nb/sigsig
+root_1d |  | flags=0 kind=0 dtype=0 time=0 off=1 cnt=4 shape=(4) empty=0 schema=root_1d
+root_2d |  | flags=0 kind=0 dtype=0 time=0 off=5 cnt=6 shape=(2,3) empty=0 schema=root_2d
+root_bytes |  | flags=48 kind=0 dtype=3 time=0 off=4 cnt=1 shape=(4) empty=0 schema=root_bytes
+root_c |  | flags=32 kind=0 dtype=2 time=0 off=0 cnt=1 shape=() empty=0 schema=root_c
+root_c1d |  | flags=32 kind=0 dtype=2 time=0 off=1 cnt=2 shape=(2) empty=0 schema=root_c1d
+root_d |  | flags=0 kind=0 dtype=0 time=0 off=0 cnt=1 shape=() empty=0 schema=root_d
+root_i |  | flags=16 kind=0 dtype=1 time=0 off=0 cnt=1 shape=() empty=0 schema=root_i
+root_i1d |  | flags=16 kind=0 dtype=1 time=0 off=1 cnt=3 shape=(3) empty=0 schema=root_i1d
+root_liststr |  | flags=48 kind=0 dtype=3 time=0 off=1 cnt=3 shape=(3) empty=0 schema=root_liststr
+root_str |  | flags=48 kind=0 dtype=3 time=0 off=0 cnt=1 shape=() empty=0 schema=root_str
+sd |  | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd
+sd/0/b | sd | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(2) empty=0 schema=sd/b
+sd/0/b/0/c | sd/0/b | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd/b/c
+sd/0/b/1/c | sd/0/b | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(2) empty=0 schema=sd/b/c
+sd/0/b/1/c/0/d | sd/0/b/1/c | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd/b/c/d
+sd/0/b/1/c/0/d/0/e | sd/0/b/1/c/0/d | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd/b/c/d/e
+sd/0/b/1/c/0/d/0/e/0/t2 | sd/0/b/1/c/0/d/0/e/0 | flags=0 kind=0 dtype=0 time=0 off=14 cnt=2 shape=(2) empty=0 schema=sd/b/c/d/e/t2
+sd/0/b/1/c/0/d/0/e/0/t3 | sd/0/b/1/c/0/d/0/e/0 | flags=0 kind=0 dtype=0 time=0 off=11 cnt=3 shape=(3) empty=0 schema=sd/b/c/d/e/t3
+sd/0/b/1/c/0/d/0/e/0/ti | sd/0/b/1/c/0/d/0/e/0 | flags=16 kind=0 dtype=1 time=0 off=4 cnt=4 shape=(4) empty=0 schema=sd/b/c/d/e/ti
+sd/0/b/1/c/1/d | sd/0/b/1/c | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd/b/c/d
+sd/0/b/1/c/1/d/0/e | sd/0/b/1/c/1/d | flags=2 kind=2 dtype=0 time=0 off=0 cnt=0 shape=(1) empty=0 schema=sd/b/c/d/e
+sd/0/b/1/c/1/d/0/e/0/t4 | sd/0/b/1/c/1/d/0/e/0 | flags=0 kind=0 dtype=0 time=0 off=16 cnt=5 shape=(5) empty=0 schema=sd/b/c/d/e/t4
+[list_nodes 31]
+dyn | AOS_DYNAMIC dims=() dyn=0
+dyn/sig | DATASET dims=(1) dyn=1
+dyn/sig1d | DATASET dims=(1,4) dyn=1
+dyn/sig_more | DATASET dims=(1) dyn=1
+dyn/sigc | DATASET dims=(1) dyn=1
+dyn/sigi | DATASET dims=(1) dyn=1
+dyn/sigstr | DATASET dims=(3) dyn=1
+na | AOS_STATIC dims=() dyn=0
+na/nb | AOS_DYNAMIC dims=() dyn=0
+na/nb/sigcplx | DATASET dims=(1,3) dyn=1
+na/nb/sigsig | DATASET dims=(1,3) dyn=1
+na/nb/sigstrd | DATASET dims=(1,3) dyn=1
+root_1d | DATASET dims=(4) dyn=0
+root_2d | DATASET dims=(2,3) dyn=0
+root_bytes | DATASET dims=(4) dyn=0
+root_c | DATASET dims=() dyn=0
+root_c1d | DATASET dims=(2) dyn=0
+root_d | DATASET dims=() dyn=0
+root_i | DATASET dims=() dyn=0
+root_i1d | DATASET dims=(3) dyn=0
+root_liststr | DATASET dims=(3) dyn=0
+root_str | DATASET dims=() dyn=0
+sd | AOS_STATIC dims=() dyn=0
+sd/b | AOS_STATIC dims=() dyn=0
+sd/b/c | AOS_STATIC dims=() dyn=0
+sd/b/c/d | AOS_STATIC dims=() dyn=0
+sd/b/c/d/e | AOS_STATIC dims=() dyn=0
+sd/b/c/d/e/t2 | DATASET dims=(1,2,2,1,1,2) dyn=0
+sd/b/c/d/e/t3 | DATASET dims=(1,2,2,1,1,3) dyn=0
+sd/b/c/d/e/t4 | DATASET dims=(1,2,2,1,1,5) dyn=0
+sd/b/c/d/e/ti | DATASET dims=(1,2,2,1,1,4) dyn=0
+[getAOSShape 8]
+dyn | shape=(3)
+na | shape=(3)
+na/nb | shape=()
+sd | shape=(1)
+sd/b | shape=()
+sd/b/c | shape=()
+sd/b/c/d | shape=()
+sd/b/c/d/e | shape=()
+[end]

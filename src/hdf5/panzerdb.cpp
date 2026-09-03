@@ -213,11 +213,12 @@ void PanzerDB::init(OpenMode mode) {
         H5Tset_size(str_type, PATH_MAX_LEN);
         H5Tset_strpad(str_type, H5T_STR_NULLPAD);
         
-        paths_dset = createOptimizedDataset("paths", str_type, 
+        paths_dset = createOptimizedDataset("paths", str_type,
                                             chunk_config.path_chunk_entries, true, dapl);
-        parent_paths_dset = createOptimizedDataset("parent_paths", str_type, 
-                                                   chunk_config.path_chunk_entries, true, dapl);
         H5Tclose(str_type);
+        // M1: /parent_paths is no longer materialised; parent_path is reconstructed
+        // on read from (parent_id, kind, full path).  See getLeaves().
+        parent_paths_dset = H5I_INVALID_HID;
         
         // Optimized buffers
         index_buffer.reserve(chunk_config.index_chunk_rows * 14);
@@ -234,12 +235,23 @@ void PanzerDB::init(OpenMode mode) {
     } else if (mode == OpenMode::APPEND) {
         // Open existing datasets
         if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) index_dset = H5Dopen2(file_id, "index", dapl);
+        // APPEND: continue row ids from the on-disk /index row count so new parent
+        // references stay aligned with the order a later READ observes.
+        next_row_id = 0;
+        if (index_dset >= 0) {
+            hid_t ispace = H5Dget_space(index_dset);
+            hsize_t idims[2] = {0, 0};
+            H5Sget_simple_extent_dims(ispace, idims, nullptr);
+            H5Sclose(ispace);
+            next_row_id = idims[0];
+        }
         if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) data_dset_f64 = H5Dopen2(file_id, "data_raw_f64", dapl);
         if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) data_dset_i32 = H5Dopen2(file_id, "data_raw_i32", dapl);
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) paths_dset = H5Dopen2(file_id, "paths", dapl);
         if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", dapl);
         if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", dapl);
-        if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) parent_paths_dset = H5Dopen2(file_id, "parent_paths", dapl);
+        // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
+        parent_paths_dset = H5I_INVALID_HID;
         leaves_cache_valid = false;
         
         // NOUVEAU: Lire la configuration de chunking du fichier existant
@@ -261,7 +273,8 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) paths_dset = H5Dopen2(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
-        if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) parent_paths_dset = H5Dopen2(file_id, "parent_paths", H5P_DEFAULT);
+        // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
+        parent_paths_dset = H5I_INVALID_HID;
         leaves_cache_valid = false;
         
         // NOUVEAU: Lire la configuration de chunking
@@ -373,7 +386,7 @@ void PanzerDB::configureReadCache() {
     reopen_dataset(data_dset_str, "data_raw_str");
     reopen_dataset(data_dset_c128, "data_raw_c128");
     reopen_dataset(paths_dset, "paths");
-    reopen_dataset(parent_paths_dset, "parent_paths");
+    // M1: /parent_paths no longer exists; it is never reopened.
 
     H5Pclose(dapl);
 
@@ -731,25 +744,9 @@ void PanzerDB::flush() {
         H5Sclose(filespace);
     }
 
-    // --- Flush Parent Paths Buffer ---
-    if (!parent_paths_buffer.empty()) {
-        hsize_t n_new_paths = parent_paths_buffer.size() / PATH_MAX_LEN;
-        filespace = H5Dget_space(parent_paths_dset);
-        hsize_t current_parent_dims[1];
-        H5Sget_simple_extent_dims(filespace, current_parent_dims, NULL);
-        H5Sclose(filespace);
-
-        hsize_t new_parent_dims[1] = {current_parent_dims[0] + n_new_paths};
-        H5Dset_extent(parent_paths_dset, new_parent_dims);
-        
-        filespace = H5Dget_space(parent_paths_dset);
-        hsize_t parent_offset[1] = {current_parent_dims[0]};
-        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, parent_offset, NULL, &n_new_paths, NULL);
-        memspace = H5Screate_simple(1, &n_new_paths, NULL);
-        H5Dwrite(parent_paths_dset, H5Dget_type(parent_paths_dset), memspace, filespace, H5P_DEFAULT, parent_paths_buffer.data());
-        H5Sclose(memspace);
-        H5Sclose(filespace);
-    }
+    // M1: the /parent_paths dataset is no longer written; the parent path of each
+    // row is reconstructed on read from the row's parent_id + kind + full path
+    // (see getLeaves).  /paths still carries the full path text.
 
     // --- Flush Data Buffers (one for each type) ---
     if (!data_buffer_f64.empty()) {
@@ -1142,9 +1139,24 @@ void PanzerDB::beginArray(ArrayLevel& level) {
          if (it != leaf_lookup.end()) already_exists = true;
     }
 
+    // Anchor this meta-node to the enclosing AoS (if any) so its children can
+    // record a numeric parent_id instead of a duplicated parent text.
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
     if (!already_exists) {
         uint64_t aos_flags = level.is_dynamic ? 3 : 2; // 3 for dynamic AoS, 2 for static AoS
-        append_index_row(new_node_path, parent_path, {(uint64_t)level.declared_size}, 0, 0, 0, 0, aos_flags);
+        level.container_row_id = append_index_row(
+            new_node_path, parent_path, {(uint64_t)level.declared_size}, 0, 0, 0, 0, aos_flags,
+            parent_row, inst);
+    } else {
+        // APPEND/READ dedup: reuse the existing meta-node's row id as the anchor for
+        // the children about to be appended.  In parent-first order the leaf index is
+        // the stable row id.
+        if (auto it = leaf_lookup.find(new_node_path); it != leaf_lookup.end() && !it->second.empty()) {
+            level.container_row_id = it->second.front();
+        }
     }
 
     path_prefix = new_node_path;
@@ -1207,28 +1219,40 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
         }
         H5Sclose(paths_space);
-
-        if (parent_paths_dset >= 0) {
-            // Same logic for parent_paths
-            hid_t ppaths_space = H5Dget_space(parent_paths_dset);
-            hsize_t ppaths_dims[1];
-            H5Sget_simple_extent_dims(ppaths_space, ppaths_dims, nullptr);
-            
-            if (ppaths_dims[0] >= n_rows) {
-                H5Dread(parent_paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, parent_paths_data.data());
-            }
-            H5Sclose(ppaths_space);
-        }
     }
     H5Tclose(str_type);
+
+    // M1: /parent_paths is no longer read.  parent_paths_data (already allocated and
+    // zero-initialised above) simply backs the reconstructed parent paths, which the
+    // loop below fills from each row's (parent_id, kind, full path).
 
     // 3. Iterate over each row and build Leaf objects
     // Only reserve if we are starting from scratch or growing significantly
     if (cached_leaves.capacity() < n_rows) {
         cached_leaves.reserve(n_rows);
-        // Note: reserving map/lookup is not standard but we can hint if needed, 
+        // Note: reserving map/lookup is not standard but we can hint if needed,
         // but standard containers manage this.
     }
+
+    // M1: reconstruct each row's parent_path without a /parent_paths dataset.  The
+    // writer builds a DATA leaf's full path as  parent_path + "/" + name  and an AoS
+    // META row's full path as  parent_path + "/" + instance + "/" + name,  storing
+    // parent_path = path_prefix respectively.  So the stored parent_path is exactly:
+    //   - ""                         for a root row          (parent_id == NO_PARENT)
+    //   - full_path minus  1 segment (last name)             for a data leaf (kind 0/1)
+    //   - full_path minus  2 segments (instance + name)      for an AoS meta (kind 2/3)
+    auto parent_path_of = [&](uint64_t i) -> std::string {
+        if (idx[i * 14 + 12] == PANZER_NO_PARENT_ROW) return std::string();
+        const uint64_t leaf_kind = idx[i * 14 + 11] & 0xFULL;
+        const std::string full(static_cast<const char*>(paths_data.data() + i * PATH_MAX_LEN));
+        const size_t n_strip = (leaf_kind == 2 || leaf_kind == 3) ? 2 : 1;
+        size_t end = full.size();
+        for (size_t k = 0; k < n_strip && end > 0; ++k) {
+            const size_t slash = full.rfind('/', end - 1);
+            end = (slash == std::string::npos) ? 0 : slash;
+        }
+        return full.substr(0, end);
+    };
 
     for (uint64_t i = 0; i < read_count; ++i) {
         const uint64_t* row = &idx[i * 14];
@@ -1238,7 +1262,16 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         Leaf& leaf = cached_leaves.back();
 
         leaf.path         = std::string_view(paths_data.data() + i * PATH_MAX_LEN);
-        leaf.parent_path  = std::string_view(parent_paths_data.data() + i * PATH_MAX_LEN);
+
+        // Materialise the reconstructed parent path into the persistent backing
+        // buffer so the std::string_view stays valid for the life of the leaf cache.
+        const std::string recon_parent = parent_path_of(i);
+        char* pp_slot = parent_paths_data.data() + i * PATH_MAX_LEN;
+        const size_t copy_len = std::min(recon_parent.size(), (size_t)(PATH_MAX_LEN - 1));
+        std::memcpy(pp_slot, recon_parent.data(), copy_len);
+        pp_slot[copy_len] = '\0';
+        leaf.parent_path  = std::string_view(pp_slot);
+
         leaf.time_index   = row[8];
         leaf.offset       = row[9];
         leaf.count        = row[10];
@@ -1453,7 +1486,10 @@ void PanzerDB::writeDataImpl(const std::string& name,
     buffer.insert(buffer.end(), data, data + count);
 
     uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
-    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags);
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags, parent_row, inst);
 }
 
 // OPTIMIZED PATH PARSING (for substitution in readDataByIndex)
@@ -1562,7 +1598,10 @@ void PanzerDB::writeData<char>(const std::string& name,
     data_buffer_str.emplace_back(data, str_length);  // std::string(ptr, length)
 
     uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
-    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, 1, flags);
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, 1, flags, parent_row, inst);
     //                                                                    ↑ count = 1 (single string)
 }
 
@@ -1675,12 +1714,15 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
     buffer.insert(buffer.end(), data, data + slice_size * n_slices);
     
     uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
-    
-    append_index_row(full_path, parent_path, base_shape, 0, 
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
+    append_index_row(full_path, parent_path, base_shape, 0,
                     base_time,                  // Start time
                     start_offset,               // Start offset
                     slice_size * n_slices,      // TOTAL Count
-                    flags);
+                    flags, parent_row, inst);
 
     last_level_had_write = true;
     
@@ -1789,15 +1831,21 @@ void PanzerDB::writeDataSlices(const std::string& name,
     // ✅ DIFFERENCE: count_per_slice for strings
     size_t count_per_slice = base_shape.empty() ? 1 : base_shape[0];
 
+    // Enclosing AoS is constant across the loop: one parent anchor for all slices.
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
     for (size_t i = 0; i < n_slices; ++i) {
         const char* const* slice_data = data + (i * count_per_slice);
         for (size_t j = 0; j < count_per_slice; ++j) {
             data_buffer_str.emplace_back(slice_data[j]);
         }
-        
+
         uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
         append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
-                        start_offset + (i * count_per_slice), count_per_slice, flags);
+                        start_offset + (i * count_per_slice), count_per_slice, flags,
+                        parent_row, inst);
     }
     
     last_level_had_write = true;
@@ -1830,45 +1878,35 @@ void PanzerDB::setCurrentArrayIndex(size_t new_index) {
 // APPEND_INDEX_ROW: AVOID STRING COPIES
 // ============================================================================
 
-void PanzerDB::append_index_row(const std::string& full_path, 
-                                const std::string& parent_path,
-                                const std::vector<size_t>& shape, 
-                                uint64_t type,
-                                uint64_t time_idx, 
-                                uint64_t offset, 
-                                uint64_t count, 
-                                uint64_t flags) {
-    
-    // OPTIMIZATION 1: preallocate exactly what is needed
+uint64_t PanzerDB::append_index_row(const std::string& full_path,
+                                    const std::string& parent_path,
+                                    const std::vector<size_t>& shape,
+                                    uint64_t type,
+                                    uint64_t time_idx,
+                                    uint64_t offset,
+                                    uint64_t count,
+                                    uint64_t flags,
+                                    uint64_t parent_id, uint64_t index_value) {
+
+    const uint64_t assigned_row_id = next_row_id++;
+    // M1: parent_path is no longer stored on disk; it is reconstructed in
+    // getLeaves() from (parent_id, kind, full path).
+    (void)parent_path;
+
+    // OPTIMIZATION 1: preallocate exactly what is needed for the /paths entry
     size_t required_paths = paths_buffer.size() + PATH_MAX_LEN;
     if (paths_buffer.capacity() < required_paths) {
         size_t new_cap = std::max(required_paths, paths_buffer.capacity() * BUFFER_GROWTH_FACTOR);
         paths_buffer.reserve(new_cap);
     }
 
-    size_t required_parent = parent_paths_buffer.size() + PATH_MAX_LEN;
-    if (parent_paths_buffer.capacity() < required_parent) {
-        size_t new_cap = std::max(required_parent, parent_paths_buffer.capacity() * BUFFER_GROWTH_FACTOR);
-        parent_paths_buffer.reserve(new_cap);
-    }
-    
-    // OPTIMISATION 2: Construction directe sans buffer temporaire
     size_t current_path_size = paths_buffer.size();
     paths_buffer.resize(current_path_size + PATH_MAX_LEN, 0);
-    
+
     // optimized copy (strncpy is fast for fixed-size buffers)
-    strncpy(paths_buffer.data() + current_path_size, 
-            full_path.c_str(), 
-            PATH_MAX_LEN - 1);
-    
-    size_t current_parent_size = parent_paths_buffer.size();
-    parent_paths_buffer.resize(current_parent_size + PATH_MAX_LEN, 0);
-    
-    strncpy(parent_paths_buffer.data() + current_parent_size, 
-            parent_path.c_str(), 
-            PATH_MAX_LEN - 1);
-    
-    // build the row (unchanged layout)
+    strncpy(paths_buffer.data() + current_path_size, full_path.c_str(), PATH_MAX_LEN - 1);
+
+    // build the row (layout: row[0]=type, row[12]=parent_id, row[13]=index_value)
     uint64_t row[14] = {0};
     row[0] = type;
     row[1] = shape.size();
@@ -1879,8 +1917,11 @@ void PanzerDB::append_index_row(const std::string& full_path,
     row[9] = offset;
     row[10] = count;
     row[11] = flags;
+    row[12] = parent_id;     // enclosing AoS meta-node row id (PANZER_NO_PARENT_ROW for root)
+    row[13] = index_value;   // instance index within that parent AoS
 
     index_buffer.insert(index_buffer.end(), row, row + 14);
+    return assigned_row_id;
 }
 
 bool PanzerDB::isInsideDynamicAOS(std::string* timebase) const {
