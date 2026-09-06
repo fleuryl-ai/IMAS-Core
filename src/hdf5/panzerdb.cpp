@@ -54,6 +54,11 @@
 
 constexpr size_t PATH_MAX_LEN = 256;
 
+// Fixed maximum bytes for a single string element in the data_raw_str column
+// (variable-length -> fixed-width conversion, SWMR-safe like `paths`).
+// A string value longer than (STRING_MAX_LEN - 1) bytes is rejected at write time.
+constexpr size_t STRING_MAX_LEN = 512;
+
 // PanzerDB constructor modification
 PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty)
     : preserve_empty_nodes(preserve_empty)
@@ -193,13 +198,16 @@ void PanzerDB::init(OpenMode mode) {
         data_dset_i32 = createOptimizedDataset("data_raw_i32", H5T_STD_I32LE, 
                                                 chunk_config.data_chunk_i32, true, dapl);
         
-         // String dataset (compression less effective, but still useful)
-        hid_t str_type_vl = H5Tcopy(H5T_C_S1);
-        H5Tset_size(str_type_vl, H5T_VARIABLE);
-        H5Tset_cset(str_type_vl, H5T_CSET_UTF8);
-        data_dset_str = createOptimizedDataset("data_raw_str", str_type_vl, 
+         // String dataset: FIXED-WIDTH, NUL-padded C1 (SWMR-safe; no vlen heap).
+         // Element = STRING_MAX_LEN bytes; a value longer than STRING_MAX_LEN-1 is
+         // rejected at write time (see flush()). Mirrors the `paths` column.
+        hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+        H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+        H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+        H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
+        data_dset_str = createOptimizedDataset("data_raw_str", str_type_fixed,
                                                 chunk_config.data_chunk_str, false, dapl);
-        H5Tclose(str_type_vl);
+        H5Tclose(str_type_fixed);
         
         // Complex dataset
         hsize_t complex_dims[1] = {2};
@@ -790,6 +798,21 @@ void PanzerDB::flush() {
 
     if (!data_buffer_str.empty()) {
         hsize_t n_new_data = data_buffer_str.size();
+
+        // SWMR-safe fixed-width write: validate, then memcpy into a flat NUL-padded
+        // buffer (one STRING_MAX_LEN-byte slot per element). This mirrors the `paths`
+        // column and avoids the vlen heap (which is not SWMR-safe and is excluded from
+        // HDF5's official SWMR feature).
+        std::vector<char> flat(n_new_data * STRING_MAX_LEN, 0);
+        for (hsize_t i = 0; i < n_new_data; ++i) {
+            const std::string& s = data_buffer_str[i];
+            // Strings are already validated to <= STRING_MAX_LEN-1 at write time;
+            // the min() is a defensive bound so a copy can never overflow the slot.
+            size_t n = std::min(s.size(), (size_t)STRING_MAX_LEN);
+            if (n)
+                memcpy(flat.data() + (size_t)i * STRING_MAX_LEN, s.data(), n);
+        }
+
         filespace = H5Dget_space(data_dset_str);
         hsize_t current_data_dims[1];
         H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
@@ -803,18 +826,12 @@ void PanzerDB::flush() {
         H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
         memspace = H5Screate_simple(1, &n_new_data, NULL);
 
-        // Conversion de std::vector<std::string> en char*[] pour HDF5
-        std::vector<const char*> c_str_vector;
-        c_str_vector.reserve(data_buffer_str.size());
-        for (const auto& s : data_buffer_str) {
-            c_str_vector.push_back(s.c_str());
-        }
-
-        hid_t str_type_vl = H5Tcopy(H5T_C_S1);
-        H5Tset_size(str_type_vl, H5T_VARIABLE);
-        H5Tset_cset(str_type_vl, H5T_CSET_UTF8);
-        H5Dwrite(data_dset_str, str_type_vl, memspace, filespace, H5P_DEFAULT, c_str_vector.data());
-        H5Tclose(str_type_vl);
+        hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+        H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+        H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+        H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
+        H5Dwrite(data_dset_str, str_type_fixed, memspace, filespace, H5P_DEFAULT, flat.data());
+        H5Tclose(str_type_fixed);
         disk_size_str = new_data_dims[0];
         H5Sclose(memspace);
         H5Sclose(filespace);
@@ -844,9 +861,6 @@ void PanzerDB::flush() {
         H5Sclose(filespace);
     }
 
-    // OPTIMIZATION: do not force a disk flush on every call.
-    // Let the OS and HDF5 coalesce writes in their caches.
-    
     index_buffer.clear();
     data_buffer_f64.clear();
     data_buffer_i32.clear();
@@ -855,7 +869,17 @@ void PanzerDB::flush() {
     paths_buffer.clear();
     parent_paths_buffer.clear();
     leaves_cache_valid = false;
-    
+
+    // SWMR commit barrier. The H5Dwrite calls above only update HDF5's in-memory file
+    // image; they are NOT visible to another process yet. Push the whole file image to
+    // the OS (page cache / disk) so this commit becomes visible, as one unit: a reader
+    // on the same file sees either the previous committed state or the complete new
+    // state, never a torn mix of index row + payload. This single GLOBAL flush is what
+    // makes the "index row = commit point" protocol hold across processes.
+    if (file_id >= 0) {
+        H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+    }
+
 }
 
 void PanzerDB::close() {
@@ -1393,28 +1417,30 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
     }
     hid_t memspace = H5Screate_simple(1, &hcount, NULL);
 
-    // HDF5 reads variable-length strings into a char* array
-    char** rdata = (char**)calloc(hcount, sizeof(char*)); 
-    hid_t str_type_vl = H5Tcopy(H5T_C_S1);
-    H5Tset_size(str_type_vl, H5T_VARIABLE);
-    H5Tset_cset(str_type_vl, H5T_CSET_UTF8);
+    // data_raw_str is now a FIXED-WIDTH, NUL-padded C1 column (SWMR-safe).
+    // Read hcount elements of STRING_MAX_LEN bytes, then copy each to a
+    // std::string trimmed at its NUL terminator.
+    hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+    H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+    H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
 
-    herr_t status = H5Dread(dset_id, str_type_vl, memspace, space, H5P_DEFAULT, rdata);
+    std::vector<char> buf((size_t)hcount * STRING_MAX_LEN, 0);
+
+    herr_t status = H5Dread(dset_id, str_type_fixed, memspace, space, H5P_DEFAULT, buf.data());
     if (status < 0) {
+        H5Tclose(str_type_fixed);
+        H5Sclose(memspace);
+        H5Sclose(space);
         throw ALBackendException("H5Dread failed for string tensor", LOG);
     }
 
-    for (size_t i = 0; i < hcount; ++i) {
-        if (rdata[i] != nullptr) {
-            out_buffer[i] = rdata[i]; 
-        } else {
-            out_buffer[i] = "";
-        }
-        free(rdata[i]); // Free individual strings allocated by HDF5
+    for (size_t i = 0; i < (size_t)hcount; ++i) {
+        const char* slot = buf.data() + (size_t)i * STRING_MAX_LEN;
+        out_buffer[i] = std::string(slot, strnlen(slot, STRING_MAX_LEN));
     }
-    free(rdata); // Free array of pointers
 
-    H5Tclose(str_type_vl);
+    H5Tclose(str_type_fixed);
     H5Sclose(memspace);
     H5Sclose(space);
 }
@@ -1595,6 +1621,12 @@ void PanzerDB::writeData<char>(const std::string& name,
 
     // ✅ Construct std::string from raw buffer
     size_t str_length = shape.empty() ? count : shape[0];
+    if (str_length > STRING_MAX_LEN - 1) {
+        throw ALBackendException(
+            "writeStrings: string of " + std::to_string(str_length) +
+            " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
+            std::to_string(STRING_MAX_LEN - 1) + " bytes", LOG);
+    }
     data_buffer_str.emplace_back(data, str_length);  // std::string(ptr, length)
 
     uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
@@ -1839,6 +1871,13 @@ void PanzerDB::writeDataSlices(const std::string& name,
     for (size_t i = 0; i < n_slices; ++i) {
         const char* const* slice_data = data + (i * count_per_slice);
         for (size_t j = 0; j < count_per_slice; ++j) {
+            size_t slen = std::strlen(slice_data[j]);
+            if (slen > STRING_MAX_LEN - 1) {
+                throw ALBackendException(
+                    "writeStrings: string of " + std::to_string(slen) +
+                    " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
+                    std::to_string(STRING_MAX_LEN - 1) + " bytes", LOG);
+            }
             data_buffer_str.emplace_back(slice_data[j]);
         }
 
