@@ -95,6 +95,13 @@ al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
 al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
 al_add_hdf5_test(test_engine_append_complex)
 
+# --- SWMR: fixed-width data_raw_str boundary + writer/reader smoke --------
+# `test_swmr_string_fixed_width` uses std::thread (pthreads on Linux).
+find_package(Threads REQUIRED)
+al_add_hdf5_test(test_engine_write_read_string_512)
+al_add_hdf5_test(test_swmr_string_fixed_width)
+target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
+
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +
 # getAOSShape + stripIndices). Default CTest mode is `verify`; `capture`
 # regenerates the committed oracle. See tests/hdf5_backend/test_index_golden.cpp.
