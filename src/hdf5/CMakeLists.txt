@@ -100,6 +100,9 @@ al_add_hdf5_test(test_engine_append_complex)
 find_package(Threads REQUIRED)
 al_add_hdf5_test(test_engine_write_read_string_512)
 al_add_hdf5_test(test_swmr_string_fixed_width)
+# Crash-safe commit ordering: reader guardrail against a dangling index row
+# (offset past the materialised data_raw_* extent — see PanzerDB::getLeaves).
+al_add_hdf5_test(test_engine_commit_order_guardrail)
 target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +

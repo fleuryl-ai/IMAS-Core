@@ -710,27 +710,13 @@ PanzerDB::~PanzerDB() { close(); }
 void PanzerDB::flush() {
     if (index_buffer.empty()) return;
 
-    // --- Flush Index Buffer ---
-    hsize_t n_new_rows = index_buffer.size() / 14;
-    hid_t filespace = H5Dget_space(index_dset);
-    hsize_t current_dims[2];
-    H5Sget_simple_extent_dims(filespace, current_dims, NULL);
-    H5Sclose(filespace);
-
-    // IMPORTANT: Extend dimensions, do not replace them
-    hsize_t new_dims[2] = {current_dims[0] + n_new_rows, 14};
-    H5Dset_extent(index_dset, new_dims);
-
-    filespace = H5Dget_space(index_dset);
-    hsize_t offset[2] = {current_dims[0], 0};
-    hsize_t slab_dims[2] = {n_new_rows, 14};
-    H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, NULL, slab_dims, NULL);
-
-    hsize_t mem_dims[2] = {n_new_rows, 14};
-    hid_t memspace = H5Screate_simple(2, mem_dims, NULL);
-    H5Dwrite(index_dset, H5T_NATIVE_UINT64, memspace, filespace, H5P_DEFAULT, index_buffer.data());
-    H5Sclose(memspace);
-    H5Sclose(filespace);
+    // Commit ordering (crash-safe): write the payloads (paths, data_raw_*) FIRST
+    // and advance /index LAST. A reader discovers rows only through /index, so a
+    // crash before the index write leaves only harmless unindexed payload,
+    // whereas the old index-first order could leave a dangling index row pointing
+    // past the materialised data_raw_* extent (a corrupt read). The final
+    // H5Fflush below remains the cross-process SWMR commit barrier.
+    hid_t filespace, memspace;
 
     // --- Flush Paths Buffer ---
     if (!paths_buffer.empty()) {
@@ -857,6 +843,30 @@ void PanzerDB::flush() {
         H5Dwrite(data_dset_c128, complex_tid, memspace, filespace, H5P_DEFAULT, data_buffer_c128.data());
         disk_size_c128 = new_data_dims[0];
         H5Tclose(complex_tid);
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    // --- Flush Index Buffer (LAST — this is the commit marker) ---
+    // Written after every payload so a crash can only leave unindexed slack in
+    // data_raw_*, never an index row that points past the written data.
+    {
+        hsize_t n_new_rows = index_buffer.size() / 14;
+        hsize_t current_dims[2];
+        filespace = H5Dget_space(index_dset);
+        H5Sget_simple_extent_dims(filespace, current_dims, NULL);
+
+        hsize_t new_dims[2] = {current_dims[0] + n_new_rows, 14};
+        H5Dset_extent(index_dset, new_dims);
+
+        filespace = H5Dget_space(index_dset);
+        hsize_t offset[2] = {current_dims[0], 0};
+        hsize_t slab_dims[2] = {n_new_rows, 14};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, NULL, slab_dims, NULL);
+
+        hsize_t mem_dims[2] = {n_new_rows, 14};
+        memspace = H5Screate_simple(2, mem_dims, NULL);
+        H5Dwrite(index_dset, H5T_NATIVE_UINT64, memspace, filespace, H5P_DEFAULT, index_buffer.data());
         H5Sclose(memspace);
         H5Sclose(filespace);
     }
@@ -1278,8 +1288,49 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         return full.substr(0, end);
     };
 
+    // --- Crash-safe guardrail: snapshot data_raw_* extents -----------------
+    // Materialised on-disk extents of the four data_raw_* datasets at the
+    // moment of this read. A DATA row whose (offset + count) exceeds its
+    // dataset's extent is dangling (the old index-first ordering could produce
+    // one if a crash interrupted flush()); we skip it rather than serving a
+    // corrupt read.
+    auto dset_extent = [](hid_t dset_id) -> uint64_t {
+        if (dset_id < 0) return 0;
+        hid_t space = H5Dget_space(dset_id);
+        if (space < 0) return 0;
+        hsize_t ext[1] = {0};
+        H5Sget_simple_extent_dims(space, ext, nullptr);
+        H5Sclose(space);
+        return ext[0];
+    };
+    const uint64_t ext_f64  = dset_extent(data_dset_f64);
+    const uint64_t ext_i32  = dset_extent(data_dset_i32);
+    const uint64_t ext_c128 = dset_extent(data_dset_c128);
+    const uint64_t ext_str  = dset_extent(data_dset_str);
+    // -----------------------------------------------------------------------
+
     for (uint64_t i = 0; i < read_count; ++i) {
         const uint64_t* row = &idx[i * 14];
+
+        // --- Crash-safe guardrail (per row, before emplace) -----------------
+        // A DATA row (kind 0) whose payload extends past the materialised
+        // data_raw_* extent is dangling: only a torn pre-change crash could
+        // produce it. Skip it. AoS meta rows (kind 2/3) and empty-data rows
+        // (is_empty) are not backed by data_raw_*, so the check only applies
+        // to kind 0 data.
+        {
+            const uint64_t leaf_kind = row[11] & 0xFULL;
+            if (leaf_kind == 0) {
+                const DataType dtype = static_cast<DataType>(row[11] >> 4);
+                uint64_t extent = 0;
+                if      (dtype == DataType::FLOAT64)    extent = ext_f64;
+                else if (dtype == DataType::INT32)      extent = ext_i32;
+                else if (dtype == DataType::COMPLEX128) extent = ext_c128;
+                else if (dtype == DataType::STRING)     extent = ext_str;
+                if (row[9] + row[10] > extent) continue;   // dangling → skip
+            }
+        }
+        // -------------------------------------------------------------------
 
         // OPTIMIZATION: build in place to avoid copying 'leaf' and its 'shape' vector
         cached_leaves.emplace_back();
