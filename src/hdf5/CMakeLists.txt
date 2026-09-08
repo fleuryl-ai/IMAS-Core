@@ -96,7 +96,8 @@ al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
 al_add_hdf5_test(test_engine_append_complex)
 
 # --- SWMR: fixed-width data_raw_str boundary + writer/reader smoke --------
-# `test_swmr_string_fixed_width` uses std::thread (pthreads on Linux).
+# `test_swmr_string_fixed_width` forks a separate reader process (a real shared-FS
+# writer/reader pair) and still uses std::this_thread::sleep_for for pacing.
 find_package(Threads REQUIRED)
 al_add_hdf5_test(test_engine_write_read_string_512)
 al_add_hdf5_test(test_swmr_string_fixed_width)
