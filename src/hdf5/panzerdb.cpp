@@ -3333,3 +3333,39 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
     // If the path is not found or is not a dynamic AoS.
     return false;
 }
+
+// Reports whether a data signal (leaf) varies over time (see header for the
+// criterion).  The two sub-cases (dynamic-AoS ancestor / own time axis) mirror
+// exactly the reader's own "add one time dimension" decision, cf. readDataByIndex
+// (panzerdb.cpp:2384) and isTimeInLeaf (panzerdb.cpp:2227-2238).
+bool PanzerDB::isDynamicSignal(const std::string& signal_path) const
+{
+    // Ensure the index (and its lookup caches) is loaded in memory.
+    const auto& leaves = getLeaves();
+
+    // Case 1: signal lives under a dynamic Array of Structures — the time axis
+    // is supplied by the AoS iteration.  A dynamic-AoS root is any prefix of the
+    // leaf path (top-level, or nested under a static-AoS instance index).
+    for (const auto& root : cached_dynamic_aos_roots) {
+        if (signal_path.size() >= root.size() &&
+            signal_path.compare(0, root.size(), root) == 0 &&
+            (signal_path.size() == root.size() || signal_path[root.size()] == '/')) {
+            return true;
+        }
+    }
+
+    // Case 2: no dynamic AoS — but the leaf owns its own time axis.
+    auto it = leaf_lookup.find(std::string_view(signal_path));
+    if (it == leaf_lookup.end() || it->second.empty()) return false;
+
+    // Iterative form: several leaf rows at the same path (one per time step).
+    if (it->second.size() > 1) return true;
+
+    // Bulk form: a single data row whose stored count exceeds one spatial slice.
+    const Leaf& leaf = leaves[it->second.front()];
+    if ((leaf.flags & 0xF) != 0) return false;   // not a data leaf (e.g. an AoS meta-node)
+    uint64_t slice_volume = 1;
+    for (auto s : leaf.shape) if (s > 0) slice_volume *= s;
+    if (slice_volume == 0) slice_volume = 1;     // scalar: empty shape
+    return leaf.count > slice_volume;
+}

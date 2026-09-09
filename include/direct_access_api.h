@@ -207,6 +207,11 @@ TensorView read_tensor(
 std::pair<std::vector<NodeInfo>, std::map<std::string, NodeType>>
 list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show_metadata);
 
+// True if the signal (data leaf) at `signal_path` varies over time — either because
+// it lives under a dynamic Array of Structures, or because it owns its own time axis.
+// False if the signal is static or the path is not found.
+bool isDynamicSignal(const std::string& ids_name, const std::string& signal_path);
+
 
 } // namespace direct_access
 } // namespace imas

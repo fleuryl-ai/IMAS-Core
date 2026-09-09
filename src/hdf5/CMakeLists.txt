@@ -125,6 +125,9 @@ al_add_hdf5_test(test_al_flux_loop_deep_data_getslice)
 # dynamic-AoS behaviour
 al_add_hdf5_test(test_al_dynamic_aos_gap)
 al_add_hdf5_test(test_al_dynamic_aos_nested_only_getshape)
+# signal dynamism detection (under dynamic AoS OR own time axis, cf.
+# PanzerDB::isDynamicSignal; tests/hdf5_backend/test_al_is_dynamic_signal.cpp)
+al_add_hdf5_test(test_al_is_dynamic_signal)
 al_add_hdf5_test(test_al_dynamic_aos_string_slice)
 al_add_hdf5_test(test_al_dynamic_aos_string_inhom_slice)
 al_add_hdf5_test(test_al_nested_dynamic_timebase)

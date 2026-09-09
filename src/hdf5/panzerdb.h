@@ -715,6 +715,19 @@ public:
      bool isDynamicAOS(const std::string& aos_path) const;
 
     /**
+     * @brief Reports whether a data signal (leaf) varies over time.
+     * @details A signal is *dynamic* when it lives under a dynamic Array of Structures
+     *          (the time axis comes from the AoS iteration), or — with no dynamic AoS —
+     *          when it owns its own time axis, i.e. it stores more than one spatial slice
+     *          (`count > ∏shape`) or appears as several rows at the same path.
+     *          This mirrors the reader's own rule, which adds one implicit time dimension
+     *          whenever `count > ∏shape` (cf. readDataByIndex / isTimeInLeaf).
+     * @param signal_path Full instance path of the data leaf (e.g. "flux", "profiles_1d/0/ion/sig").
+     * @return True if the signal is dynamic, false if it is static or the path is not found.
+     */
+    bool isDynamicSignal(const std::string& signal_path) const;
+
+    /**
      * @brief Checks whether a time index falls within the time steps stored in a leaf.
      * @param leaf       The index leaf under test (must be a data leaf).
      * @param time_index The time index to test.
