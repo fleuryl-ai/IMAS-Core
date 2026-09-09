@@ -485,5 +485,11 @@ TensorView read_tensor(const std::string& ids_name, const std::string& path_temp
     return read_tensor(ids_name, path_template);
 }
 
+// Reports whether a signal varies over time (see PanzerDB::isDynamicSignal).
+bool isDynamicSignal(const std::string& ids_name, const std::string& signal_path) {
+    PanzerDB db(ids_name, PanzerDB::OpenMode::READ);
+    return db.isDynamicSignal(signal_path);
+}
+
 } // namespace direct_access
 } // namespace imas
