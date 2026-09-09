@@ -140,6 +140,9 @@ al_add_hdf5_test(test_al_dynamic_aos_string_slice)
 al_add_hdf5_test(test_al_dynamic_aos_string_inhom_slice)
 al_add_hdf5_test(test_al_nested_dynamic_timebase)
 al_add_hdf5_test(test_al_nested_static_aos)
+# nested static AoS whose size varies across a dynamic time-slice (a "gap"):
+# the x-point node disappears between two slices (mirrors hdf5bug.py).
+al_add_hdf5_test(test_al_equilibrium_xpoint_gap)
 al_add_hdf5_test(test_al_nested_aos_listofstrings)
 al_add_hdf5_test(test_al_static_aos_dynamic_signal_slice)
 al_add_hdf5_test(test_al_timeslice_nested_x_point)
