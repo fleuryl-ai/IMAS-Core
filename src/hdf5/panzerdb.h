@@ -91,7 +91,7 @@ struct ChunkingConfig {
     size_t data_chunk_f64 = 131072;           // 1 MB per chunk (131k doubles)
     size_t data_chunk_i32 = 262144;           // 1 MB per chunk (262k int32)
     size_t data_chunk_c128 = 65536;           // 1 MB per chunk (65k complex)
-    size_t data_chunk_str = 8192;             // 8k strings per chunk
+    size_t data_chunk_str = 128;             // 128 strings per chunk (~64 KB for fixed 512B elements)
     
     // Path chunking
     size_t path_chunk_entries = 8192;         // 8k paths per chunk

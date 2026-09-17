@@ -206,7 +206,7 @@ void PanzerDB::init(OpenMode mode) {
         H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
         H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
         data_dset_str = createOptimizedDataset("data_raw_str", str_type_fixed,
-                                                chunk_config.data_chunk_str, false, dapl);
+                                                chunk_config.data_chunk_str, true, dapl);
         H5Tclose(str_type_fixed);
         
         // Complex dataset
@@ -420,7 +420,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.data_chunk_f64 = 65536;       // 512 KB par chunk
         chunk_config.data_chunk_i32 = 131072;      // 512 KB par chunk
         chunk_config.data_chunk_c128 = 32768;      // 512 KB par chunk (16 bytes/elem)
-        chunk_config.data_chunk_str = 8192;        // ~64-128 KB (pointeurs)
+        chunk_config.data_chunk_str = 128;         // 128 x 512B = 64 KB per chunk (fixed-width)
         chunk_config.path_chunk_entries = 4096;    // ~1 MB (256 bytes/entry)
         chunk_config.enable_compression = true;
         chunk_config.compression_level = 1;        // light compression
@@ -431,7 +431,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.data_chunk_f64 = 32768;       // Plus petits data chunks
         chunk_config.data_chunk_i32 = 65536;
         chunk_config.data_chunk_c128 = 16384;      // 256 KB
-        chunk_config.data_chunk_str = 4096;
+        chunk_config.data_chunk_str = 64;          // 64 x 512B = 32 KB per chunk (fixed-width)
         chunk_config.path_chunk_entries = 4096;
         chunk_config.enable_compression = true;
         chunk_config.compression_level = 1;
@@ -442,7 +442,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.data_chunk_f64 = 524288;      // 4 MB par chunk
         chunk_config.data_chunk_i32 = 1048576;     // 4 MB par chunk
         chunk_config.data_chunk_c128 = 262144;     // 4 MB par chunk
-        chunk_config.data_chunk_str = 65536;
+        chunk_config.data_chunk_str = 1024;        // 1024 x 512B = 512 KB per chunk (fixed-width)
         chunk_config.path_chunk_entries = 16384;   // ~4 MB
         chunk_config.enable_compression = true;
         chunk_config.compression_level = 1;        // light compression (speed)
@@ -453,7 +453,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.data_chunk_f64 = 8192;        // 64 KB par chunk
         chunk_config.data_chunk_i32 = 16384;       // 64 KB par chunk
         chunk_config.data_chunk_c128 = 4096;       // 64 KB par chunk
-        chunk_config.data_chunk_str = 1024;
+        chunk_config.data_chunk_str = 64;          // 64 x 512B = 32 KB per chunk (fixed-width)
         chunk_config.path_chunk_entries = 1024;    // ~256 KB
         chunk_config.enable_compression = false;   // Pas de compression
         
@@ -463,7 +463,7 @@ void PanzerDB::configureChunking(const std::string& usage_hint) {
         chunk_config.data_chunk_f64 = 131072;
         chunk_config.data_chunk_i32 = 262144;
         chunk_config.data_chunk_c128 = 65536;
-        chunk_config.data_chunk_str = 8192;
+        chunk_config.data_chunk_str = 128;         // 128 x 512B = 64 KB per chunk (fixed-width)
         chunk_config.path_chunk_entries = 4096;
         chunk_config.enable_compression = true;
         chunk_config.compression_level = 1;
