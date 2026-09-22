@@ -977,7 +977,12 @@ public:
 
         size_t total_elements = 0;
         for (const auto* leaf : sorted_leaves) {
-            total_elements += leaf->count;
+            if (static_cast<uint64_t>(leaf->flags >> 4) ==
+                static_cast<uint64_t>(PanzerDB::DataType::STRING_CHUNKED)) {
+                total_elements += 1;  // one logical scalar (its `count` slots are its chunks)
+            } else {
+                total_elements += leaf->count;
+            }
         }
 
         DEBUG_PRINT("Total elements to read (after filtering by time index): " << total_elements);
@@ -995,7 +1000,9 @@ public:
         // A scalar leaf is one with count=1 (for strings) or an empty shape (for numerics).
         PanzerDB::DataType first_leaf_type = static_cast<PanzerDB::DataType>(first_leaf->flags >> 4);
         bool is_numeric_scalar_leaf = (first_leaf_type != PanzerDB::DataType::STRING && first_leaf->shape.empty());
-        bool is_string_scalar_leaf = (first_leaf_type == PanzerDB::DataType::STRING && first_leaf->count == 1);
+        bool is_string_scalar_leaf =
+            (first_leaf_type == PanzerDB::DataType::STRING && first_leaf->count == 1) ||
+            (first_leaf_type == PanzerDB::DataType::STRING_CHUNKED); // multi-slot scalar
 
         if ((is_numeric_scalar_leaf || is_string_scalar_leaf) && total_elements > 1) {
              bool all_static = true;
@@ -1018,6 +1025,7 @@ public:
             case PanzerDB::DataType::FLOAT64: actual_datatype = alconst::double_data; break;
             case PanzerDB::DataType::INT32: actual_datatype = alconst::integer_data; break;
             case PanzerDB::DataType::STRING: actual_datatype = alconst::char_data; break;
+            case PanzerDB::DataType::STRING_CHUNKED: actual_datatype = alconst::char_data; break;
             case PanzerDB::DataType::COMPLEX128: actual_datatype = alconst::complex_data; break;
             default:
                 DEBUG_PRINT("Unknown data type in leaf flags: " << (first_leaf->flags >> 4));
@@ -1031,12 +1039,25 @@ public:
         DEBUG_PRINT("Actual data type determined from leaf flags: " << actual_datatype);
         if (actual_datatype == alconst::char_data) {
              DEBUG_PRINT("Processing string data...");
+             auto is_chunked = [](const PanzerDB::Leaf* leaf) {
+                 return static_cast<uint64_t>(leaf->flags >> 4) ==
+                        static_cast<uint64_t>(PanzerDB::DataType::STRING_CHUNKED);
+             };
              std::vector<std::string> temp_buffer;
              temp_buffer.reserve(total_elements);
              for (const auto* leaf : sorted_leaves) {
-                 std::vector<std::string> leaf_strings(leaf->count);
-                 panzer_db_ptr->readTensor(*leaf, leaf_strings.data());
-                 temp_buffer.insert(temp_buffer.end(), leaf_strings.begin(), leaf_strings.end());
+                 if (is_chunked(leaf)) {
+                     // One logical scalar spread over `count` slots -> read all, join.
+                     std::vector<std::string> parts(leaf->count);
+                     panzer_db_ptr->readTensor(*leaf, parts.data());
+                     std::string joined;
+                     for (const auto& p : parts) joined += p;
+                     temp_buffer.push_back(std::move(joined));
+                 } else {
+                     std::vector<std::string> leaf_strings(leaf->count);
+                     panzer_db_ptr->readTensor(*leaf, leaf_strings.data());
+                     temp_buffer.insert(temp_buffer.end(), leaf_strings.begin(), leaf_strings.end());
+                 }
              }
  
              size_t max_str_len = 0;

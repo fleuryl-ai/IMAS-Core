@@ -1323,10 +1323,11 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             if (leaf_kind == 0) {
                 const DataType dtype = static_cast<DataType>(row[11] >> 4);
                 uint64_t extent = 0;
-                if      (dtype == DataType::FLOAT64)    extent = ext_f64;
-                else if (dtype == DataType::INT32)      extent = ext_i32;
-                else if (dtype == DataType::COMPLEX128) extent = ext_c128;
-                else if (dtype == DataType::STRING)     extent = ext_str;
+                if      (dtype == DataType::FLOAT64)      extent = ext_f64;
+                else if (dtype == DataType::INT32)        extent = ext_i32;
+                else if (dtype == DataType::COMPLEX128)   extent = ext_c128;
+                else if (dtype == DataType::STRING)       extent = ext_str;
+                else if (dtype == DataType::STRING_CHUNKED) extent = ext_str; // same column, k slots
                 if (row[9] + row[10] > extent) continue;   // dangling → skip
             }
         }
@@ -1446,8 +1447,12 @@ template void PanzerDB::readTensor<std::complex<double>>(const Leaf& leaf, std::
 template<>
 void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const {
     if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
-    if (static_cast<DataType>(leaf.flags >> 4) != DataType::STRING) {
-        throw ALBackendException("Mismatched data type for readTensor<std::string>", LOG);
+    {
+        const uint64_t dt = static_cast<uint64_t>(leaf.flags >> 4);
+        if (dt != static_cast<uint64_t>(DataType::STRING) &&
+            dt != static_cast<uint64_t>(DataType::STRING_CHUNKED)) {
+            throw ALBackendException("Mismatched data type for readTensor<std::string>", LOG);
+        }
     }
 
     // Check validity and attempt recovery if needed
@@ -1670,22 +1675,25 @@ void PanzerDB::writeData<char>(const std::string& name,
     
     uint64_t offset = disk_size_str + data_buffer_str.size();
 
-    // ✅ Construct std::string from raw buffer
+    // ✅ Construct std::string from raw buffer (scalar string).
+    // A scalar longer than one fixed 512B slot (STRING_MAX_LEN-1) is split across
+    // `k` slots tagged STRING_CHUNKED instead of throwing — SWMR-safe, no vlen.
     size_t str_length = shape.empty() ? count : shape[0];
-    if (str_length > STRING_MAX_LEN - 1) {
-        throw ALBackendException(
-            "writeStrings: string of " + std::to_string(str_length) +
-            " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
-            std::to_string(STRING_MAX_LEN - 1) + " bytes", LOG);
+    const size_t max_slot = STRING_MAX_LEN - 1;
+    size_t n_chunks = str_length ? (str_length - 1) / max_slot + 1 : 1;
+    for (size_t c = 0; c < n_chunks; ++c) {
+        size_t off = c * max_slot;
+        data_buffer_str.emplace_back(data + off,
+                                     std::min(max_slot, str_length - off));
     }
-    data_buffer_str.emplace_back(data, str_length);  // std::string(ptr, length)
 
-    uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
+    DataType dtype = (n_chunks > 1) ? DataType::STRING_CHUNKED : DataType::STRING;
+    uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
     const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
                                                     : array_stack.back().container_row_id;
     const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
-    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, 1, flags, parent_row, inst);
-    //                                                                    ↑ count = 1 (single string)
+    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, n_chunks, flags, parent_row, inst);
+    //                                                                    ↑ count = n_chunks (1 short / k chunked)
 }
 
 template<>
@@ -1913,6 +1921,8 @@ void PanzerDB::writeDataSlices(const std::string& name,
 
     // ✅ DIFFERENCE: count_per_slice for strings
     size_t count_per_slice = base_shape.empty() ? 1 : base_shape[0];
+    const bool scalar = (count_per_slice == 1);
+    const size_t max_slot = STRING_MAX_LEN - 1;
 
     // Enclosing AoS is constant across the loop: one parent anchor for all slices.
     const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
@@ -1921,21 +1931,42 @@ void PanzerDB::writeDataSlices(const std::string& name,
 
     for (size_t i = 0; i < n_slices; ++i) {
         const char* const* slice_data = data + (i * count_per_slice);
-        for (size_t j = 0; j < count_per_slice; ++j) {
-            size_t slen = std::strlen(slice_data[j]);
-            if (slen > STRING_MAX_LEN - 1) {
-                throw ALBackendException(
-                    "writeStrings: string of " + std::to_string(slen) +
-                    " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
-                    std::to_string(STRING_MAX_LEN - 1) + " bytes", LOG);
+        if (scalar) {
+            // One scalar string may exceed the 512B slot width. Split it across
+            // `k` fixed-width slots (STRING_CHUNKED) rather than throwing; the reader
+            // concatenates them back. SWMR-safe, no variable-length type.
+            const size_t slen = std::strlen(slice_data[0]);
+            const size_t n_chunks = slen ? (slen - 1) / max_slot + 1 : 1;
+            const uint64_t first_slot = data_buffer_str.size();
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t off = c * max_slot;
+                data_buffer_str.emplace_back(slice_data[0] + off,
+                                             std::min(max_slot, slen - off));
             }
-            data_buffer_str.emplace_back(slice_data[j]);
-        }
+            DataType dtype = (n_chunks > 1) ? DataType::STRING_CHUNKED
+                                           : DataType::STRING;
+            append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
+                             disk_size_str + first_slot, n_chunks,
+                             (static_cast<uint64_t>(dtype) << 4), parent_row, inst);
+        } else {
+            // A list: each element must still fit one slot (scalars-only chunking
+            // scope). Long list elements are still rejected, as before.
+            for (size_t j = 0; j < count_per_slice; ++j) {
+                size_t slen = std::strlen(slice_data[j]);
+                if (slen > max_slot) {
+                    throw ALBackendException(
+                        "writeStrings (list element): string of " + std::to_string(slen) +
+                        " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
+                        std::to_string(max_slot) + " bytes", LOG);
+                }
+                data_buffer_str.emplace_back(slice_data[j]);
+            }
 
-        uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
-        append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
-                        start_offset + (i * count_per_slice), count_per_slice, flags,
-                        parent_row, inst);
+            uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
+            append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
+                            start_offset + (i * count_per_slice), count_per_slice, flags,
+                            parent_row, inst);
+        }
     }
     
     last_level_had_write = true;
@@ -2719,14 +2750,21 @@ int PanzerDB::readStringDataByIndex(
         size_t start_idx = local_step * element_size;
         
         bool is_scalar = target_leaf->shape.empty();
+        const bool chunked =
+            (static_cast<DataType>(target_leaf->flags >> 4) == DataType::STRING_CHUNKED);
 
         if (is_scalar) {
-            const std::string& s = scratch_str[start_idx];
-            *data_out = (char*)malloc(s.length() + 1);
-            strcpy(*data_out, s.c_str());
-            
+            // A STRING_CHUNKED scalar spans `count` fixed slots; concatenate them
+            // into one logical string. A short scalar has count==1 -> unchanged.
+            const size_t span = chunked ? (size_t)target_leaf->count : 1u;
+            const size_t base = chunked ? 0u : (size_t)start_idx;
+            std::string joined;
+            for (size_t i = 0; i < span; ++i) joined += scratch_str[base + i];
+            *data_out = (char*)malloc(joined.size() + 1);
+            strcpy(*data_out, joined.c_str());
+
             *ndim_out = 1;
-            shape_out[0] = s.length();
+            shape_out[0] = joined.size();
         } else {
             size_t max_len = 0;
             for(size_t i=0; i<element_size; ++i) {
@@ -3300,7 +3338,15 @@ std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& ins
         if (leaf.path.rfind(prefix, 0) == 0) {
             std::string key = std::string(leaf.path.substr(prefix.length()));
             std::string value;
-            readTensor<std::string>(leaf, &value);
+            if (static_cast<uint64_t>(leaf.flags >> 4) ==
+                static_cast<uint64_t>(DataType::STRING_CHUNKED)) {
+                // Scalar string split across `count` slots -> read all, concatenate.
+                std::vector<std::string> parts(leaf.count);
+                readTensor<std::string>(leaf, parts.data());
+                for (const auto& p : parts) value += p;
+            } else {
+                readTensor<std::string>(leaf, &value);
+            }
             metadata[key] = value;
         }
     }
@@ -3391,6 +3437,8 @@ void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
                  return imas::direct_access::DataType::COMPLEX_DOUBLE;
              case PanzerDB::DataType::STRING:
                  return imas::direct_access::DataType::STRING;
+             case PanzerDB::DataType::STRING_CHUNKED:
+                 return imas::direct_access::DataType::STRING; // scalar, read-joined
              case PanzerDB::DataType::LIST_OF_STRINGS:
                  return imas::direct_access::DataType::LIST_OF_STRINGS;
              default:

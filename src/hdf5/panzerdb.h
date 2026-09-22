@@ -436,8 +436,12 @@ public:
         FLOAT64 = 0,
         INT32 = 1,
         COMPLEX128 = 2,
-        STRING = 3,
+        STRING = 3,         // scalar string fit in ONE 512B slot (count == 1)
         LIST_OF_STRINGS = 4,
+        STRING_CHUNKED = 5, // scalar string stored across `count` >= 2 slots,
+                            // each <= STRING_MAX_LEN-1 bytes; reader concatenates.
+                            // Swallowed a previously-overflowing scalar without
+                            // using a variable-length (vlen) type -> stays SWMR-safe.
         UNKNOWN = 99
     };
 

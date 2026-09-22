@@ -15,6 +15,7 @@ DataType convert_panzer_type_to_api(PanzerDB::DataType pz_type) {
         case PanzerDB::DataType::INT32: return DataType::INT32;
         case PanzerDB::DataType::COMPLEX128: return DataType::COMPLEX_DOUBLE;
         case PanzerDB::DataType::STRING: return DataType::STRING;
+        case PanzerDB::DataType::STRING_CHUNKED: return DataType::STRING; // scalar, read-joined
         default: return DataType::UNKNOWN;
     }
 }
