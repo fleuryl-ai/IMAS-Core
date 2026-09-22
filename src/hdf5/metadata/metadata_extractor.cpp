@@ -31,7 +31,12 @@ void MetadataExtractor::traverse_nodes(pugi::xml_node node, std::map<std::string
         std::string name = child.name();
         if (name == "field") {
             std::string data_type = child.attribute("data_type").value();
-            if (data_type.rfind("FLT_", 0) == 0 || data_type.rfind("STR_", 0) == 0 || data_type.rfind("CPX_", 0) == 0) {
+            // IMAS scalar leaf kinds get their @doc/@type/@units... replayed as metadata.
+            // Containers (structure / struct_array) carry no scalar value; logical and
+            // undefined are out of scope here. INT_* (e.g. ids_properties/homogeneous_time)
+            // were previously dropped here, silently losing nodes like @data_type/@type.
+            if (data_type.rfind("INT_", 0) == 0 || data_type.rfind("FLT_", 0) == 0 ||
+                data_type.rfind("STR_", 0) == 0 || data_type.rfind("CPX_", 0) == 0) {
                 std::string path = child.attribute("path").value();
                 for (pugi::xml_attribute attr = child.first_attribute(); attr; attr = attr.next_attribute()) {
                     std::string attr_name = attr.name();

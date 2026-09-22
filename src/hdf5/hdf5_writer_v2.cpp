@@ -58,6 +58,7 @@ void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid
   
   if (write_mode == GLOBAL_OP) {
     panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::WRITE, true, false);
+    metadata_by_path.clear();   // fresh per put(); only (re)populate from this IDS's XML
     const char* imas_prefix = std::getenv("IMAS_PREFIX");
     if (imas_prefix) {
         std::string xml_path = std::string(imas_prefix) + "/include/IDSDef.xml";
@@ -274,16 +275,20 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
 
   // Only write metadata for actual data nodes, not for other metadata attributes.
   if (!is_metadata) {
-    // Convert the instance path (e.g., "flux_loop/0/field") to a schema path ("flux_loop/field").
-    // The schema path is used to find all associated metadata attributes.
-    std::string schema_path = PanzerDB::stripIndices(dataset_name_copy);
+    // Resolve this node's schema path in the AL/XML namespace ("/"-separated): strip any
+    // array indices from the ORIGINAL name (dataset_name), e.g. "electrons/0/density" ->
+    // "electrons/density". metadata_by_path is keyed by these "/" schema paths (built from
+    // the IDSDef.xml "path" attributes in setWriteStrategy), so the key must stay "/".
+    std::string schema_path = PanzerDB::stripIndices(dataset_name);
 
-    // Retrieve this node's @keys directly (indexed by schema path in setWriteStrategy).
-    // One O(log) lookup + a small inner map, instead of the previous O(M) scan per node.
     auto it = metadata_by_path.find(schema_path);
     if (it != metadata_by_path.end()) {
+        // PanzerDB names datasets with "&" as the separator (see e.g. "ids_properties&
+        // homogeneous_time"), so convert "/" -> "&" before handing the key to the engine.
+        std::string pzd_schema = schema_path;
+        std::replace(pzd_schema.begin(), pzd_schema.end(), '/', '&');
         for (const auto& attr : it->second) {
-            panzer_db_ptr->writeMetadata(schema_path + "@" + attr.first, attr.second);
+            panzer_db_ptr->writeMetadata(pzd_schema + "@" + attr.first, attr.second);
         }
     }
   }

@@ -188,6 +188,8 @@ al_add_hdf5_test(test_al_resampling_user_vector)
 
 # metadata
 al_add_hdf5_test(test_al_metadata_strategies)
+# XML-driven (@IMAS_PREFIX) metadata extraction: INT_* leaves + multi-level path lookup
+al_add_hdf5_test(test_al_metadata_extract_inttype)
 
 # --------------------------------------------------------------------------
 # Direct-access API
