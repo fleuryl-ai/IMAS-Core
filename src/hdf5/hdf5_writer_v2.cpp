@@ -62,7 +62,20 @@ void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid
     if (imas_prefix) {
         std::string xml_path = std::string(imas_prefix) + "/include/IDSDef.xml";
         MetadataExtractor extractor(xml_path);
-        metadata_map = extractor.extract_metadata(ctx->getDataobjectName());
+        const std::map<std::string, std::string> flat =
+            extractor.extract_metadata(ctx->getDataobjectName());
+        // Group the flat "path@attr" -> value entries by the node's schema path, so
+        // write_ND_Data() can retrieve a node's @keys with a single O(log) find()
+        // (previously each node scanned every entry: O(N*M) string scans + allocs).
+        for (const auto& kv : flat) {
+            size_t at = kv.first.find('@');
+            if (at == std::string::npos) {
+                continue;
+            }
+            std::string schema_path = kv.first.substr(0, at);   // e.g. "flux_loop/field"
+            std::string attr_name   = kv.first.substr(at + 1);  // e.g. "units"
+            metadata_by_path[schema_path][attr_name] = kv.second;
+        }
     }
   } else if (write_mode == SLICE_OP) {
       DEBUG_PRINT("Write mode is SLICE_OP");
@@ -265,20 +278,12 @@ void HDF5Writer_v2::write_ND_Data(Context *ctx, const std::string &dataset_name,
     // The schema path is used to find all associated metadata attributes.
     std::string schema_path = PanzerDB::stripIndices(dataset_name_copy);
 
-    // Search the full metadata map for attributes related to this specific schema path.
-    for (const auto& meta_entry : metadata_map) {
-        const std::string& full_meta_path = meta_entry.first;  // e.g., "flux_loop/field@units"
-        const std::string& meta_value = meta_entry.second;     // e.g., "T"
-
-        size_t at_pos = full_meta_path.find('@');
-        if (at_pos != std::string::npos) {
-            // Extract the base path from the metadata key.
-            std::string meta_base_path = full_meta_path.substr(0, at_pos);
-
-            // If the metadata's base path matches the current data's schema path, write it.
-            if (meta_base_path == schema_path) {
-                panzer_db_ptr->writeMetadata(full_meta_path, meta_value);
-            }
+    // Retrieve this node's @keys directly (indexed by schema path in setWriteStrategy).
+    // One O(log) lookup + a small inner map, instead of the previous O(M) scan per node.
+    auto it = metadata_by_path.find(schema_path);
+    if (it != metadata_by_path.end()) {
+        for (const auto& attr : it->second) {
+            panzer_db_ptr->writeMetadata(schema_path + "@" + attr.first, attr.second);
         }
     }
   }

@@ -32,7 +32,11 @@ private:
    std::unique_ptr<PanzerDB> panzer_db_ptr;     // The storage engine for the current write session.
    ArraystructContext *getDynamicAOS(Context *ctx);
    std::unordered_set<ArraystructContext*> initialized_aos;  // AoS contexts opened via beginWriteArraystructAction (closed in endAction).
-   std::map<std::string, std::string> metadata_map;          // Schema metadata extracted from IDSDef.xml, replayed as @key attributes.
+   // Schema metadata extracted from IDSDef.xml and replayed as @key attributes.
+   // Indexed by the data node's schema path so a write finds its @keys with one
+   // O(log) map lookup and a tiny inner map, instead of scanning every entry
+   // (outer key = schema path e.g. "flux_loop/field"; inner key = attr e.g. "units").
+   std::map<std::string, std::map<std::string, std::string>> metadata_by_path;
 
 public:
    HDF5Writer_v2(std::pair<int,int> backend_version_);
