@@ -986,18 +986,6 @@ template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_
 int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const {
     if (leaves.empty()) return 0;
 
-    // 1. Check monotonicity of offsets to determine if we can use Hyperslab Union
-    // HDF5 returns data in increasing coordinate order. If our leaves are sorted by time
-    // but their offsets are not monotonic (e.g. data written out of order), 
-    // a single read would scramble the time steps.
-    bool monotonic = true;
-    for (size_t i = 0; i < leaves.size() - 1; ++i) {
-        if (leaves[i]->offset >= leaves[i+1]->offset) {
-            monotonic = false;
-            break;
-        }
-    }
-
     hid_t dset_id = -1;
     hid_t mem_type = -1;
     size_t element_size = 0;
@@ -1027,64 +1015,51 @@ int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buff
             return -1; // Not supported for union read (e.g. strings)
     }
 
-    if (monotonic) {
-        // OPTIMIZATION: Hyperslab Union
-        hid_t file_space = H5Dget_space(dset_id);
-        H5Sselect_none(file_space);
-
-        // OPTIMIZATION: Merge contiguous leaves to reduce hyperslab selections
-        hsize_t total_elements = leaves[0]->count;
-        hsize_t current_off = leaves[0]->offset;
-        hsize_t current_cnt = leaves[0]->count;
-
-        for (size_t i = 1; i < leaves.size(); ++i) {
-            total_elements += leaves[i]->count;
-            
-            if (leaves[i]->offset == current_off + current_cnt) {
-                // Contiguous: extend current block
-                current_cnt += leaves[i]->count;
-            } else {
-                // Gap: select current block and start new one
-                H5Sselect_hyperslab(file_space, H5S_SELECT_OR, &current_off, NULL, &current_cnt, NULL);
-                current_off = leaves[i]->offset;
-                current_cnt = leaves[i]->count;
-            }
+    {
+        // Single fast path: ONE H5Dread over the union range [lo, hi), then scatter
+        // the result into `buffer` in the original leaf order (time order, as
+        // sorted by the caller).
+        //
+        // Replaces two previous strategies that both degraded on large dynamic
+        // signals ("reading a 10^5-slice file never returns" hang):
+        //   - Hyperslab-OR per disjoint block: O(blocks^2) via repeated
+        //     H5Sselect_hyperslab(OR) — each OR walks the growing selection.
+        //   - Sequential H5Dread per leaf (non-monotone fallback): O(n) separate
+        //     HDF5 round-trips.
+        // A single contiguous [lo,hi) read is O(range), which is what a dynamic
+        // signal's data actually occupies — the fastest correct option.
+        hsize_t lo = (hsize_t)(~0ULL);
+        hsize_t hi = 0;
+        for (const auto* leaf : leaves) {
+            lo = std::min(lo, (hsize_t)leaf->offset);
+            hi = std::max(hi, (hsize_t)(leaf->offset + leaf->count));
         }
-        // Select the last block
-        H5Sselect_hyperslab(file_space, H5S_SELECT_OR, &current_off, NULL, &current_cnt, NULL);
+        const hsize_t range = hi - lo;
 
-        hsize_t mem_dims[1] = {total_elements};
-        hid_t mem_space = H5Screate_simple(1, mem_dims, NULL);
-
-        herr_t status = H5Dread(dset_id, mem_type, mem_space, file_space, H5P_DEFAULT, buffer);
-        
+        std::vector<char> tmp((size_t)range * element_size);
+        hid_t file_space = H5Dget_space(dset_id);
+        hsize_t off = lo, sel = range;
+        if (H5Sselect_hyperslab(file_space, H5S_SELECT_SET, &off, NULL, &sel, NULL) < 0) {
+            H5Sclose(file_space);
+            if (need_close_type) H5Tclose(mem_type);
+            return -1;
+        }
+        hsize_t mdims[1] = { range };
+        hid_t mem_space = H5Screate_simple(1, mdims, NULL);
+        herr_t status = H5Dread(dset_id, mem_type, mem_space, file_space, H5P_DEFAULT, tmp.data());
         H5Sclose(mem_space);
         H5Sclose(file_space);
         if (need_close_type) H5Tclose(mem_type);
+        if (status < 0) return -1;
 
-        return (status >= 0) ? 0 : -1;
-    } else {
-        // Fallback: Sequential reads to preserve order
-        // This happens if data was written non-chronologically
-        char* ptr = static_cast<char*>(buffer);
+        // Scatter into `buffer` in the caller's leaf order (preserve time order).
+        char* dst = static_cast<char*>(buffer);
         for (const auto* leaf : leaves) {
-            hsize_t off = leaf->offset;
-            hsize_t cnt = leaf->count;
-            
-            hid_t fspace = H5Dget_space(dset_id);
-            H5Sselect_hyperslab(fspace, H5S_SELECT_SET, &off, NULL, &cnt, NULL);
-            
-            hsize_t mdims[1] = {cnt};
-            hid_t mspace = H5Screate_simple(1, mdims, NULL);
-            
-            H5Dread(dset_id, mem_type, mspace, fspace, H5P_DEFAULT, ptr);
-            
-            H5Sclose(mspace);
-            H5Sclose(fspace);
-            
-            ptr += cnt * element_size;
+            const size_t cnt = leaf->count;
+            memcpy(dst, tmp.data() + (size_t)(leaf->offset - lo) * element_size,
+                   cnt * element_size);
+            dst += cnt * element_size;
         }
-        if (need_close_type) H5Tclose(mem_type);
         return 0;
     }
 }
