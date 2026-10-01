@@ -119,6 +119,25 @@ int main() {
         expect("s_1000", e1000);
         expect("s_1298", e1298);
 
+        // readStringBulk: ONE H5Dread over a [lo,hi) slot range must return the
+        // same slots as per-leaf readTensor (the fast path used to cut the N
+        // per-leaf round-trips in IReadStrategy). Verify on a chunked scalar.
+        {
+            const PanzerDB::Leaf* l1000 = find_leaf(leaves, "s_1000");
+            assert(l1000 && l1000->count == 2);
+            uint64_t lo = l1000->offset, hi = l1000->offset + l1000->count;
+            std::vector<std::string> bulk = db.readStringBulk(lo, hi);
+            assert(bulk.size() == l1000->count);
+            std::string joined;
+            for (auto& s : bulk) joined += s;
+            assert(joined == e1000);
+            // Also compare against the per-leaf readTensor path.
+            std::vector<std::string> perleaf(l1000->count);
+            db.readTensor(*l1000, perleaf.data());
+            for (size_t i = 0; i < perleaf.size(); ++i) assert(bulk[i] == perleaf[i]);
+            std::cout << "  [OK] readStringBulk matches per-leaf read over the same range\n";
+        }
+
         // List of short strings — count == number of elements.
         const PanzerDB::Leaf* l = find_leaf(leaves, "s_list", 0);
         assert(l && "missing s_list");

@@ -1043,20 +1043,28 @@ public:
                  return static_cast<uint64_t>(leaf->flags >> 4) ==
                         static_cast<uint64_t>(PanzerDB::DataType::STRING_CHUNKED);
              };
+             // BULK READER: fetch the whole union range of slots in ONE H5Dread
+             // (instead of one tiny H5Dread per leaf — that was O(N) on 10^5-slice
+             // files and the "reading never returns" hang). Then scatter locally:
+             //   - a STRING_CHUNKED scalar : its `count` slots joined into one string
+             //   - a plain (string) leaf   : its `count` slots, one per element
+             uint64_t lo = UINT64_MAX, hi = 0;
+             for (const auto* leaf : sorted_leaves) {
+                 lo = std::min(lo, leaf->offset);
+                 hi = std::max(hi, leaf->offset + leaf->count);
+             }
+             auto slots = panzer_db_ptr->readStringBulk(lo, hi);  // one H5Dread
+
              std::vector<std::string> temp_buffer;
              temp_buffer.reserve(total_elements);
              for (const auto* leaf : sorted_leaves) {
+                 const uint64_t base = leaf->offset - lo;
                  if (is_chunked(leaf)) {
-                     // One logical scalar spread over `count` slots -> read all, join.
-                     std::vector<std::string> parts(leaf->count);
-                     panzer_db_ptr->readTensor(*leaf, parts.data());
                      std::string joined;
-                     for (const auto& p : parts) joined += p;
+                     for (uint64_t i = 0; i < leaf->count; ++i) joined += slots[base + i];
                      temp_buffer.push_back(std::move(joined));
                  } else {
-                     std::vector<std::string> leaf_strings(leaf->count);
-                     panzer_db_ptr->readTensor(*leaf, leaf_strings.data());
-                     temp_buffer.insert(temp_buffer.end(), leaf_strings.begin(), leaf_strings.end());
+                     for (uint64_t i = 0; i < leaf->count; ++i) temp_buffer.push_back(std::move(slots[base + i]));
                  }
              }
  

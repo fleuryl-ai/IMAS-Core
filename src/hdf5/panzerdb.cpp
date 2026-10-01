@@ -1503,6 +1503,42 @@ void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer
 
 template void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const;
 
+//==========================================================================
+// Bulk string read: one H5Dread covering [lo, hi) of data_raw_str slots
+//==========================================================================
+
+std::vector<std::string> PanzerDB::readStringBulk(uint64_t lo, uint64_t hi) const {
+    if (data_dset_str < 0) throw ALBackendException("data_raw_str not open", LOG);
+    const uint64_t n = (hi > lo) ? (hi - lo) : 0;
+    std::vector<std::string> out(n);
+    if (n == 0) return out;
+    // data_raw_str elements are fixed STRING_MAX_LEN-char slots. Read `n` whole
+    // slots with the exact element type (NOT a flat char stream — that would
+    // drop all but the first byte of each slot), then trim each at its NUL.
+    const hsize_t count = (hsize_t)n, offset = (hsize_t)lo;
+    hid_t space = H5Dget_space(data_dset_str);
+    if (space < 0)  throw ALBackendException("H5Dget_space failed (string bulk)", LOG);
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &offset, NULL, &count, NULL) < 0) {
+        H5Sclose(space); throw ALBackendException("H5Sselect_hyperslab failed (string bulk)", LOG);
+    }
+    hid_t memspace = H5Screate_simple(1, &count, NULL);
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, STRING_MAX_LEN);
+    H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+    H5Tset_cset(str_type, H5T_CSET_UTF8);
+    std::vector<char> raw(n * STRING_MAX_LEN, 0);
+    if (H5Dread(data_dset_str, str_type, memspace, space, H5P_DEFAULT, raw.data()) < 0) {
+        H5Tclose(str_type); H5Sclose(memspace); H5Sclose(space);
+        throw ALBackendException("H5Dread failed (string bulk)", LOG);
+    }
+    H5Tclose(str_type); H5Sclose(memspace); H5Sclose(space);
+    for (uint64_t i = 0; i < n; ++i) {
+        const char* slot = raw.data() + (size_t)i * STRING_MAX_LEN;
+        out[i] = std::string(slot, strnlen(slot, STRING_MAX_LEN));
+    }
+    return out;
+}
+
 // Private helper function to avoid duplication
 template<typename T>
 void PanzerDB::writeDataImpl(const std::string& name,

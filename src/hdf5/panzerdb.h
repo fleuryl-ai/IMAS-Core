@@ -785,6 +785,22 @@ public:
     template<typename T>
     void readTensor(const Leaf& leaf, T* out_buffer) const;
 
+    /**
+     * @brief Bulk reads `hi-lo` slots of `data_raw_str` with a **single** H5Dread,
+     *        returning them dataset-order, each trimmed at its NUL terminator.
+     *
+     * Fast path for IReadStrategy's whole-dataset string read: instead of one
+     * tiny H5Dread per time-slice leaf (~N HDF5/AFS round-trips on large files),
+     * the caller computes the union range of all the leaves it needs, pulls it
+     * in one shot, and scatters locally. Numeric types already have this via
+     * the bulk readLeavesUnion() (union of hyperslabs in one H5Dread).
+     *
+     * @param lo First slot to read (inclusive), in data_raw_str's units.
+     * @param hi One-past-the-last slot. hi-lo slots are read; the result has
+     *           exactly hi-lo entries.
+     */
+    std::vector<std::string> readStringBulk(uint64_t lo, uint64_t hi) const;
+
      /**
      * @brief Reads a single time slice of data directly into an output buffer.
      * This is a highly optimized read that uses an HDF5 hyperslab to avoid intermediate copies.
