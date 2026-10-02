@@ -227,7 +227,23 @@ void PanzerDB::init(OpenMode mode) {
         // M1: /parent_paths is no longer materialised; parent_path is reconstructed
         // on read from (parent_id, kind, full path).  See getLeaves().
         parent_paths_dset = H5I_INVALID_HID;
-        
+
+        // Span-table dataset (u64, 1-D, unlimited, chunked): 4 u64s per entry
+        // (row_id, element_idx, slot_offset, slot_span). Only written for list
+        // elements exceeding STRING_MAX_LEN-1; empty dataset is fine.
+        {
+            hsize_t max[1]   = {H5S_UNLIMITED};
+            hsize_t init[1]  = {0};
+            hsize_t chunk[1] = {4096};   // 4096 u64 = 32 kB per chunk
+            hid_t sp  = H5Screate_simple(1, init, max);
+            hid_t pl  = H5Pcreate(H5P_DATASET_CREATE);
+            H5Pset_chunk(pl, 1, chunk);
+            list_spans_dset = H5Dcreate2(file_id, "list_spans", H5T_STD_U64LE, sp,
+                                          H5P_DEFAULT, pl, H5P_DEFAULT);
+            H5Pclose(pl);
+            H5Sclose(sp);
+        }
+
         // Optimized buffers
         index_buffer.reserve(chunk_config.index_chunk_rows * 14);
         data_buffer_f64.reserve(chunk_config.data_chunk_f64);
@@ -260,8 +276,9 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", dapl);
         // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
         parent_paths_dset = H5I_INVALID_HID;
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", dapl);
         leaves_cache_valid = false;
-        
+
         // NOUVEAU: Lire la configuration de chunking du fichier existant
         readChunkingConfig();
         updateDiskSizes();
@@ -281,13 +298,14 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) paths_dset = H5Dopen2(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", H5P_DEFAULT);
         // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
         parent_paths_dset = H5I_INVALID_HID;
         leaves_cache_valid = false;
-        
+
         // NOUVEAU: Lire la configuration de chunking
         readChunkingConfig();
-        
+
         // NOUVEAU: Configurer le cache HDF5 pour lectures optimales
         configureReadCache();
 
@@ -852,6 +870,11 @@ void PanzerDB::flush() {
         H5Sclose(filespace);
     }
 
+    // --- Flush Span Table (before index, after data payloads) ---
+    // Same SWMR safety order as the data buffers: span entries must be visible
+    // before the index rows that reference them.
+    flushListSpans();
+
     // --- Flush Index Buffer (LAST — this is the commit marker) ---
     // Written after every payload so a crash can only leave unindexed slack in
     // data_raw_*, never an index row that points past the written data.
@@ -897,10 +920,72 @@ void PanzerDB::flush() {
 
 }
 
+// ── Span-table helpers ─────────────────────────────────────────────────────────
+
+void PanzerDB::appendListSpan(uint64_t row_id, uint64_t element_idx,
+                               uint64_t slot_offset, uint64_t slot_span) {
+    list_spans_buffer.push_back(row_id);
+    list_spans_buffer.push_back(element_idx);
+    list_spans_buffer.push_back(slot_offset);
+    list_spans_buffer.push_back(slot_span);
+}
+
+void PanzerDB::flushListSpans() {
+    if (list_spans_buffer.empty() || list_spans_dset < 0) return;
+
+    hsize_t n_new = list_spans_buffer.size();
+    hsize_t current_dims[1] = {0};
+    hid_t space = H5Dget_space(list_spans_dset);
+    H5Sget_simple_extent_dims(space, current_dims, nullptr);
+    H5Sclose(space);
+
+    hsize_t new_dims[1] = {current_dims[0] + n_new};
+    H5Dset_extent(list_spans_dset, new_dims);
+
+    space = H5Dget_space(list_spans_dset);
+    hsize_t offset[1] = {current_dims[0]};
+    H5Sselect_hyperslab(space, H5S_SELECT_SET, offset, nullptr, &n_new, nullptr);
+    hid_t memspace = H5Screate_simple(1, &n_new, nullptr);
+    H5Dwrite(list_spans_dset, H5T_NATIVE_UINT64, memspace, space, H5P_DEFAULT, list_spans_buffer.data());
+    H5Sclose(memspace);
+    H5Sclose(space);
+
+    list_spans_buffer.clear();
+}
+
+void PanzerDB::loadListSpans() const {
+    if (list_spans_loaded) return;
+    list_spans_loaded = true;   // set early: safe against self-referential calls
+    if (list_spans_dset < 0) return;   // dataset absent → no span data
+
+    hsize_t dims[1] = {0};
+    hid_t space = H5Dget_space(list_spans_dset);
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+
+    hsize_t n = dims[0];
+    if (n == 0) return;
+
+    std::vector<uint64_t> raw(n);
+    H5Dread(list_spans_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data());
+
+    for (size_t i = 0; i + 3 < n; i += 4) {
+        cached_list_spans[raw[i]].push_back(
+            { raw[i + 1], raw[i + 2], raw[i + 3] });
+    }
+    // Ensure stable ordering by element_idx (writer writes them in order, but be safe)
+    for (auto& [rid, v] : cached_list_spans) {
+        std::sort(v.begin(), v.end(), [] (const SpanEntry& a, const SpanEntry& b) {
+            return a.element_idx < b.element_idx;
+        });
+    }
+}
+
 void PanzerDB::close() {
     if (file_id < 0) return;
 
     flush();
+    if (list_spans_dset >= 0) H5Dclose(list_spans_dset);
     if (index_dset >= 0) H5Dclose(index_dset);
     if (data_dset_f64 >= 0) H5Dclose(data_dset_f64);
     if (data_dset_i32 >= 0) H5Dclose(data_dset_i32);
@@ -1333,6 +1418,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         leaf.count        = row[10];
         leaf.flags        = row[11];
         leaf.is_empty     = (row[11] == 1);
+        leaf.row_id       = (uint64_t)i;   // absolute position in /index, used for span-table lookup
 
         // Shape
         uint64_t ndim = row[1];
@@ -1978,23 +2064,42 @@ void PanzerDB::writeDataSlices(const std::string& name,
                              disk_size_str + first_slot, n_chunks,
                              (static_cast<uint64_t>(dtype) << 4), parent_row, inst);
         } else {
-            // A list: each element must still fit one slot (scalars-only chunking
-            // scope). Long list elements are still rejected, as before.
+            // A list: elements may exceed one 512B slot (IMAS: any-length strings).
+            // If an element > max_slot, chunk it across consecutive slots and record
+            // per-element positions in the span table. If all fit, compact behavior
+            // (one slot per element, no span entries) — identical to the old layout.
+            bool any_spanned = false;
+            std::vector<size_t> chunk_counts(count_per_slice);
             for (size_t j = 0; j < count_per_slice; ++j) {
                 size_t slen = std::strlen(slice_data[j]);
-                if (slen > max_slot) {
-                    throw ALBackendException(
-                        "writeStrings (list element): string of " + std::to_string(slen) +
-                        " bytes exceeds fixed column width STRING_MAX_LEN-1 = " +
-                        std::to_string(max_slot) + " bytes", LOG);
-                }
-                data_buffer_str.emplace_back(slice_data[j]);
+                chunk_counts[j] = slen ? (slen - 1) / max_slot + 1 : 1;
+                if (chunk_counts[j] > 1) any_spanned = true;
             }
 
+            // Row id assigned by the next append_index_row call.
+            uint64_t my_row_id = next_row_id;
+            // Absolute position in data_raw_str for the first slot of this slice.
+            uint64_t first_slot_abs = disk_size_str + (uint64_t)data_buffer_str.size();
+            uint64_t cum_slot = 0;
+
+            for (size_t j = 0; j < count_per_slice; ++j) {
+                const char* el = slice_data[j];
+                size_t slen = std::strlen(el);
+                size_t n = chunk_counts[j];
+                for (size_t c = 0; c < n; ++c) {
+                    size_t offc = c * max_slot;
+                    data_buffer_str.emplace_back(el + offc, std::min((size_t)max_slot, slen - offc));
+                }
+                if (any_spanned) {
+                    appendListSpan(my_row_id, j, cum_slot, (uint64_t)n);
+                }
+                cum_slot += n;
+            }
+
+            uint64_t leaf_physic_count = cum_slot;   // total 512B slots for this leaf
             uint64_t flags = (static_cast<uint64_t>(DataType::STRING) << 4);
             append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
-                            start_offset + (i * count_per_slice), count_per_slice, flags,
-                            parent_row, inst);
+                             first_slot_abs, leaf_physic_count, flags, parent_row, inst);
         }
     }
     
@@ -2795,6 +2900,46 @@ int PanzerDB::readStringDataByIndex(
             *ndim_out = 1;
             shape_out[0] = joined.size();
         } else {
+            // ── Spanned list path (IMAS: elements > 512B chunked across multiple slots) ──
+            std::vector<SpanEntry> spans;
+            if (isListSpanned(target_leaf->row_id)) {
+                const auto& ref = getListSpans(target_leaf->row_id);
+                spans = ref;
+            }
+
+            if (!spans.empty()) {
+                // `scratch_str` holds leaf.count physical slots (one per 512B slot).
+                // Each span entry gives: slot_offset (relative) + slot_span (how many slots).
+                size_t max_len = 0;
+                for (const auto& se : spans) {
+                    size_t len = 0;
+                    for (size_t k = 0; k < se.slot_span; ++k)
+                        len += scratch_str[se.slot_offset + k].length();
+                    if (len > max_len) max_len = len;
+                }
+                max_len += 1;
+
+                size_t n_logical = (size_t)spans.size();
+                size_t total_bytes = n_logical * max_len;
+                *data_out  = (char*)malloc(total_bytes);
+                memset(*data_out, 0, total_bytes);
+
+                size_t slot_cursor = 0;   // redundant with se.slot_offset but kept for clarity
+                for (size_t i = 0; i < n_logical; ++i) {
+                    const auto& se = spans[i];
+                    std::string joined;
+                    for (size_t k = 0; k < se.slot_span; ++k)
+                        joined += scratch_str[se.slot_offset + k];
+                    strncpy(*data_out + (i * max_len), joined.c_str(), max_len - 1);
+                }
+
+                *ndim_out = 2;
+                shape_out[0] = n_logical;
+                shape_out[1] = max_len;
+                return 0;
+            }
+
+            // ── Compact list path (all elements <= 512B, one slot each) — existing code ──
             size_t max_len = 0;
             for(size_t i=0; i<element_size; ++i) {
                 size_t len = scratch_str[start_idx + i].length();

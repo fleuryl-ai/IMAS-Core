@@ -198,6 +198,18 @@ public:
         uint64_t count = 0;             // Number of stored elements (slice_volume * n_time_steps).
         uint64_t flags = 0;             // low 4 bits: node kind; upper bits: DataType. See struct doc.
         bool is_empty = false;          // Convenience flag mirroring (flags & 0xF) == 1.
+        uint64_t row_id = 0;            // Position in /index (= getLeaves() vector index). Used for span-table lookup.
+    };
+
+    /**
+     * @brief One entry in the span table for a list element whose length exceeds
+     *        a single STRING_MAX_LEN-1 slot and is therefore chunked across
+     *        slot_span consecutive 512B slots in data_raw_str.
+     */
+    struct SpanEntry {
+        uint64_t element_idx;   // 0-based position in the logical list.
+        uint64_t slot_offset;   // Offset (in 512B slots) from leaf.offset to this element's first slot.
+        uint64_t slot_span;     // Number of 512B slots this element occupies (1 = compact, >1 = chunked).
     };
 
 private:
@@ -212,6 +224,11 @@ private:
     mutable hid_t data_dset_i32 = -1; // int64_t
     mutable hid_t data_dset_c128 = -1; // complex
     mutable hid_t data_dset_str = -1; // string
+    // Span-table dataset (only for list elements > STRING_MAX_LEN-1; empty if all compact)
+    hid_t list_spans_dset = -1;
+    std::vector<uint64_t> list_spans_buffer;   // 4 u64s per entry (row_id, element_idx, slot_offset, slot_span)
+    mutable std::unordered_map<uint64_t, std::vector<SpanEntry>> cached_list_spans;
+    mutable bool list_spans_loaded = false;
 
     // Cache for dataset sizes to avoid H5Dget_space calls
     hsize_t disk_size_f64 = 0;
@@ -832,6 +849,32 @@ public:
      */
     int readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const;
 
+    // ── Span-table API (IMAS compliance: list elements > STRING_MAX_LEN-1) ─────
+
+    /**
+     * @brief True if leaf.row_id has span-table entries (at least one list element
+     *        exceeded one 512B slot and is stored across multiple slots).
+     *        For compact lists (dataset absent or row not in table) returns false.
+     */
+    bool isListSpanned(uint64_t row_id) const {
+        if (!list_spans_loaded) loadListSpans();
+        return cached_list_spans.count(row_id) > 0;
+    }
+
+    /**
+     * @brief Returns the per-element span entries for a spanned list leaf.
+     * @param row_id  The leaf's /index row (see Leaf::row_id).
+     * @return One SpanEntry per logical element, in element_idx order.
+     *         Empty vector if the leaf is not spanned (compact list or table absent).
+     */
+    const std::vector<SpanEntry>& getListSpans(uint64_t row_id) const {
+        if (!list_spans_loaded) loadListSpans();
+        auto it = cached_list_spans.find(row_id);
+        if (it != cached_list_spans.end()) return it->second;
+        static const std::vector<SpanEntry> empty;
+        return empty;
+    }
+
      /**
      * @brief Reads a single scalar value by its full path.
      * @tparam T The scalar type.
@@ -989,6 +1032,12 @@ private:
         auto it = file_time_base.find(full_path);
         return it != file_time_base.end() && it->second > 0;
     }
+
+    // ── Span-table private helpers ────────────────────────────────────────────
+    void appendListSpan(uint64_t row_id, uint64_t element_idx,
+                        uint64_t slot_offset, uint64_t slot_span);
+    void flushListSpans();
+    void loadListSpans() const;
 
     /**
      * @brief Common initialization path shared by both constructors.

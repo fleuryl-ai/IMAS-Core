@@ -103,6 +103,9 @@ al_add_hdf5_test(test_engine_append_complex)
 # writer/reader pair) and still uses std::this_thread::sleep_for for pacing.
 find_package(Threads REQUIRED)
 al_add_hdf5_test(test_engine_write_read_string_512)
+# Span-table (Option B): list elements > 511B chunked across 512B slots,
+# recorded in the /list_spans dataset; backward-compatible with compact lists.
+al_add_hdf5_test(test_engine_write_read_list_spanned)
 al_add_hdf5_test(test_swmr_string_fixed_width)
 # Crash-safe commit ordering: reader guardrail against a dangling index row
 # (offset past the materialised data_raw_* extent — see PanzerDB::getLeaves).

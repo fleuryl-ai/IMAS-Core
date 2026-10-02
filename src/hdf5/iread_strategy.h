@@ -1084,11 +1084,25 @@ public:
              temp_buffer.reserve(total_elements);
              for (const auto* leaf : sorted_leaves) {
                  const uint64_t base = leaf->offset - lo;
-                 if (is_chunked(leaf)) {
+
+                 // Spanned list (IMAS: element > 512B chunked across slots)
+                 if (panzer_db_ptr->isListSpanned(leaf->row_id)) {
+                     const auto& spans = panzer_db_ptr->getListSpans(leaf->row_id);
+                     for (const auto& se : spans) {
+                         std::string joined;
+                         for (uint64_t k = 0; k < se.slot_span; ++k)
+                             joined += slots[base + se.slot_offset + k];
+                         temp_buffer.push_back(std::move(joined));
+                     }
+                 }
+                 // STRING_CHUNKED scalar (concatenate leaf->count slots into one string)
+                 else if (is_chunked(leaf)) {
                      std::string joined;
                      for (uint64_t i = 0; i < leaf->count; ++i) joined += slots[base + i];
                      temp_buffer.push_back(std::move(joined));
-                 } else {
+                 }
+                 // Compact list (one slot per element)
+                 else {
                      for (uint64_t i = 0; i < leaf->count; ++i) temp_buffer.push_back(std::move(slots[base + i]));
                  }
              }
@@ -1113,15 +1127,17 @@ public:
                  *data = (char*)malloc(size[0] + 1);
                  memcpy(*data, temp_buffer[0].c_str(), size[0] + 1);
              } else {
+                 // `temp_buffer.size()` = logical element count (correct for spanned lists).
+                 size_t n_logical = (size_t)temp_buffer.size();
                  DEBUG_PRINT("Detected list of strings. Returning as 2D char array with max string length: " << max_str_len);
                  *dim = 2;
-                 size[0] = (int)total_elements;
+                 size[0] = (int)n_logical;
                  size[1] = (int)max_str_len;
-                 
-                 size_t buffer_bytes = total_elements * max_str_len;
+
+                 size_t buffer_bytes = n_logical * max_str_len;
                  char* char_buffer = (char*)malloc(buffer_bytes);
                  std::memset(char_buffer, 0, buffer_bytes);
-                 for (size_t i = 0; i < total_elements; ++i) {
+                 for (size_t i = 0; i < n_logical; ++i) {
                      if (!temp_buffer[i].empty()) strncpy(char_buffer + (i * max_str_len), temp_buffer[i].c_str(), max_str_len);
                  }
                  *data = char_buffer;
