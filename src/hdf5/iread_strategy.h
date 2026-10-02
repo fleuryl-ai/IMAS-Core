@@ -49,6 +49,21 @@ protected:
      */
     std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> path_cache;
 
+    /**
+     * @brief Index by dataset NAME (last path segment) -> leaves.
+     *
+     * Used by the linear-scan fallbacks: the old code did an O(N) full scan of
+     * `getLeaves()` per dataset read because the exact `path_cache` lookups miss
+     * when the AL reconstructs a per-element index (e.g. "profiles_1d/5/..." vs
+     * stored "profiles_1d/..."). The predicate "leaf.path == name OR (ends with
+     * name preceded by '/')" is EXACTLY "last segment == name" (since `name` has
+     * no '/', having had '/' replaced by '&'), so keying on the last segment
+     * returns the identical candidate set at O(1) — the same leaf.path data that
+     * `path_cache` references, so the string_view keys stay valid for the
+     * PanzerDB lifetime.
+     */
+    std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> name_index;
+
      /**
      * @brief Cache for context paths to avoid rebuilding the parent path on every read call.
      * Key: Pointer to context.
@@ -290,19 +305,30 @@ public:
      */
     void build_path_index() {
         path_cache.clear();
+        name_index.clear();
         if (!panzer_db_ptr) return;
 
         const auto& leaves = panzer_db_ptr->getLeaves();
-        
+
         // Pre-reserve to avoid reallocations
         path_cache.reserve(leaves.size());
+        name_index.reserve(leaves.size() / 16 + 16);
 
         for (const auto& leaf : leaves) {
             // Store the pointer to the leaf in the map
             path_cache[leaf.path].push_back(&leaf);
+
+            // Also index by the last path segment (dataset name). `leaf.path` has no
+            // '/' in its last segment's key because dataset names use '&' (see
+            // clean_ds_name), so "last segment == name" is the exact fallback predicate.
+            const std::string_view p = leaf.path;
+            const auto slash = p.rfind('/');
+            const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
+            name_index[key].push_back(&leaf);
         }
-        
-        DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths.");
+
+        DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths, "
+                  << name_index.size() << " dataset names.");
     }
 
     void build_aos_schema_index() {
@@ -424,22 +450,25 @@ public:
         }
     }
 
-    // --- PASS 2: Fallback (Linear Search) ---
-    DEBUG_PRINT("[WARN] Optimized search failed. Falling back to linear scan for: " << clean_ds_name);
-    const auto& leaves = panzer_db_ptr->getLeaves();
-    for (const auto& leaf : leaves) {
-        if (target_time != -1 && leaf.time_index != static_cast<uint64_t>(target_time)) continue;
-        
-        // ✅ FIX: Enforce context prefix constraint
-        if (!context_prefix.empty()) {
-            if (leaf.path.size() < context_prefix.size() || leaf.path.compare(0, context_prefix.size(), context_prefix) != 0) {
-                continue;
-            }
-        }
+    // --- PASS 2: Fallback (indexed by dataset name) ---
+    // The old O(N) full scan of getLeaves() is EXACTLY equivalent to looking up
+    // the last path segment (the dataset name) in name_index and re-applying the
+    // same time / prefix filters, because clean_ds_name has no '/' (it has had
+    // '/' replaced by '&'), so "last segment == name" == the old suffix predicate.
+    DEBUG_PRINT("[WARN] Optimized search failed. Falling back to name_index for: " << clean_ds_name);
+    auto it_name = name_index.find(clean_ds_name);
+    if (it_name != name_index.end()) {
+        for (const auto* leaf : it_name->second) {
+            if (target_time != -1 && leaf->time_index != static_cast<uint64_t>(target_time)) continue;
 
-        if (leaf.path == clean_ds_name) return &leaf;
-        if (leaf.path.size() > clean_ds_name.size() && leaf.path.compare(leaf.path.size() - clean_ds_name.size(), clean_ds_name.size(), clean_ds_name) == 0) {
-            if (leaf.path[leaf.path.size() - clean_ds_name.size() - 1] == '/') return &leaf;
+            // ✅ FIX: Enforce context prefix constraint
+            if (!context_prefix.empty()) {
+                if (leaf->path.size() < context_prefix.size() || leaf->path.compare(0, context_prefix.size(), context_prefix) != 0) {
+                    continue;
+                }
+            }
+
+            return leaf;
         }
     }
 
@@ -935,32 +964,28 @@ public:
         }
 
         if (!found || sorted_leaves.empty()) {
-            // Fallback: Linear search for dynamic signals read from a parent
-            // (e.g., read "profiles_1d/signal" from the root)
-            // Note: This case is rare if contexts are used correctly.
-            
-            // ✅ FIX: FALLBACK LINEAR SEARCH IS NECESSARY!
-            const auto& leaves = panzer_db_ptr->getLeaves();
-            for (const auto& leaf : leaves) {
-                if (target_time_index != -1 && leaf.time_index != static_cast<uint64_t>(target_time_index)) continue;
-                
-                // Check if path ends with dataset name
-                if (leaf.path == clean_ds_name || 
-                    (leaf.path.size() > clean_ds_name.size() && 
-                     leaf.path.compare(leaf.path.size() - clean_ds_name.size(), clean_ds_name.size(), clean_ds_name) == 0 &&
-                     leaf.path[leaf.path.size() - clean_ds_name.size() - 1] == '/')) {
-                    
+            // Fallback: dynamic signals read from a parent (e.g. read "profiles_1d/signal"
+            // from the root). The old O(N) full scan of getLeaves() is EXACTLY equivalent
+            // to looking up the last path segment (the dataset name) in name_index and
+            // re-applying the same filters: "leaf.path == name OR (ends with name preceded
+            // by '/')" == "last segment == name", because clean_ds_name has no '/' (it has
+            // had '/' replaced by '&'). Same candidate set, O(1) instead of O(N).
+            auto it_name = name_index.find(clean_ds_name);
+            if (it_name != name_index.end()) {
+                for (const auto* leaf : it_name->second) {
+                    if (target_time_index != -1 && leaf->time_index != static_cast<uint64_t>(target_time_index)) continue;
+
                     // Check if path starts with context prefix (if any)
                     if (!context_prefix.empty()) {
-                        if (leaf.path.compare(0, context_prefix.size(), context_prefix) == 0) {
-                            sorted_leaves.push_back(&leaf);
+                        if (leaf->path.compare(0, context_prefix.size(), context_prefix) == 0) {
+                            sorted_leaves.push_back(leaf);
                         }
                     } else {
-                        sorted_leaves.push_back(&leaf);
+                        sorted_leaves.push_back(leaf);
                     }
                 }
             }
-            
+
             if (sorted_leaves.empty()) {
                 DEBUG_PRINT("Leaf not found for: " << specific_path << " or generic variant (after fallback)");
                 return 0;
