@@ -93,6 +93,9 @@ al_add_hdf5_test(test_engine_group_constructor)
 al_add_hdf5_test(test_engine_write_read_dynamic_aos)
 al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
 al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
+# Bulk timebase + per-slice signal: fresh signal must land at 0..N-1, not shift
+# onto the timebase's last written index (see hasFileData gating in panzerdb.cpp).
+al_add_hdf5_test(test_engine_write_bulk_time_slice_signal)
 al_add_hdf5_test(test_engine_append_complex)
 
 # --- SWMR: fixed-width data_raw_str boundary + writer/reader smoke --------

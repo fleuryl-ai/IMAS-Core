@@ -227,6 +227,14 @@ private:
     void updateDiskSizes();
 
     std::unordered_map<std::string, uint64_t> aos_time_counters;
+    // Snapshot of aos_time_counters taken AFTER restoreTimeContext() (i.e. the
+    // values derived from data already in the file, before this session's writes).
+    // Used by the writer to distinguish a FRESH signal (created this session) from a
+    // CONTINUING one (already has slices in the file): only a continuing signal can
+    // be "lagging" its timebase and legitimately needs the time_next-1 catch-up anchor.
+    // Empty on a fresh WRITE file (restoreTimeContext is not called), so every signal
+    // there is treated as fresh.
+    std::unordered_map<std::string, uint64_t> file_time_base;
     std::string dynamic_level;
     std::vector<std::string> current_path;
     std::string path_prefix;
@@ -969,6 +977,18 @@ private:
      *        including gap alignment on the enclosing time base.
      */
     void restoreTimeContext();
+
+    /**
+     * @brief True if this signal path already has slices in the file (a "continuing"
+     *        signal) — i.e. its file-derived time base (see restoreTimeContext) is
+     *        non-zero. A freshly-created signal returns false. Used by the writer to
+     *        decide whether the timebase catch-up anchor should apply: only a
+     *        continuing signal can be "lagging" its timebase.
+     */
+    bool hasFileData(const std::string& full_path) const {
+        auto it = file_time_base.find(full_path);
+        return it != file_time_base.end() && it->second > 0;
+    }
 
     /**
      * @brief Common initialization path shared by both constructors.

@@ -703,6 +703,11 @@ void PanzerDB::restoreTimeContext() {
             }
         }
     }
+
+    // Snapshot the file-derived counters (before this session writes anything) so
+    // the writer can tell a FRESH signal from a CONTINUING one when deciding
+    // whether the timebase catch-up anchor (time_next - n_slices) should apply.
+    file_time_base = aos_time_counters;
 }
 
 PanzerDB::~PanzerDB() { close(); }
@@ -1764,7 +1769,14 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
         
         // FIX: If signal is lagging (gap) relative to AoS timebase, align it.
         // Assume timebase has already been written for this slice (standard case).
-        if (!dynamic_aos_timebase.empty()) {
+        //
+        // Only a CONTINUING signal (already has data in the file, see hasFileData) can
+        // "lag" its timebase. A FRESH signal written after a bulk (whole-array)
+        // timebase write has no gap to catch up to; forcing it to (time_next -
+        // n_slices) would shift its slices out of the timebase's valid 0..N-1 range.
+        // So the catch-up anchor is skipped for fresh signals, keeping their own
+        // contiguous position (base_time above).
+        if (hasFileData(full_path) && !dynamic_aos_timebase.empty()) {
              std::string time_path = dynamic_aos_path + "/" + dynamic_aos_timebase;
              if (aos_time_counters.find(time_path) != aos_time_counters.end()) {
                  uint64_t time_next = aos_time_counters[time_path];
@@ -1773,7 +1785,7 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
                  }
              }
         }
-    } 
+    }
     // ✅ CASE 2: Standalone dynamic data (no dynamic AOS parent)
     else {
         // Use full data path as time key
@@ -1792,8 +1804,11 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
         // skipping the signal for a time step would compress the signal's timeline
         // (its next write landing on the next slice) instead of leaving a resolvable
         // gap aligned to the master timebase. max() preserves chunked writes.
-        // Guarded by timebase so it never fires for the timebase write itself.
-        if (!timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+        // Guarded by timebase so it never fires for the timebase write itself, and
+        // by hasFileData so it only applies to a CONTINUING signal (see CASE 1): a
+        // fresh signal is kept at its own contiguous position instead of being
+        // shifted onto the timebase's last written index.
+        if (hasFileData(full_path) && !timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
             uint64_t time_next = aos_time_counters[timebase];
             if (time_next >= n_slices) {
                 base_time = std::max(base_time, time_next - n_slices);
@@ -1900,8 +1915,10 @@ void PanzerDB::writeDataSlices(const std::string& name,
         uint64_t signal_next_time = aos_time_counters[full_path];
         base_time = std::max((uint64_t)dynamic_aos_current_iteration, signal_next_time);
         
-        // FIX: Alignment with timebase in case of gap (like numerics)
-        if (!dynamic_aos_timebase.empty()) {
+        // FIX: Alignment with timebase in case of gap (like numerics). Only a
+        // CONTINUING string signal (see hasFileData) can lag its timebase; a fresh
+        // one written after a bulk timebase write is kept at its own position.
+        if (hasFileData(full_path) && !dynamic_aos_timebase.empty()) {
              std::string time_path = dynamic_aos_path + "/" + dynamic_aos_timebase;
              if (aos_time_counters.find(time_path) != aos_time_counters.end()) {
                  uint64_t time_next = aos_time_counters[time_path];
@@ -1920,7 +1937,8 @@ void PanzerDB::writeDataSlices(const std::string& name,
         // FIX (gaps, homogeneous_time=1): same timebase anchoring as the numeric
         // writeDataSlicesImpl CASE 2, so a skipped string slice leaves a
         // resolvable gap aligned to the master timebase instead of compressing.
-        if (!timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+        // Gated by hasFileData (continuing signal only) as in numeric CASE 2.
+        if (hasFileData(full_path) && !timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
             uint64_t time_next = aos_time_counters[timebase];
             if (time_next >= n_slices) {
                 base_time = std::max(base_time, time_next - n_slices);
