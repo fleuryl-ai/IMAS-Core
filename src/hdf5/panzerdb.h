@@ -884,19 +884,24 @@ public:
      */
     template<typename T>
     T readScalar(const std::string& path, int *status) const {
-        for (const auto& leaf : getLeaves()) {
-            if (leaf.path == path) {
-                if (!leaf.shape.empty() || leaf.count != 1) {
-                    throw ALBackendException("Leaf at path '" + path + "' is not a scalar.", LOG);
-                }
-                T value;
-                readTensor(leaf, &value);
-                *status = 0;
-                return value;
-            }
+        // O(N) scan of getLeaves() per scalar read: on 10^5-leaf files this dominated
+        // the read path because getHomogeneousTime() calls it for every node read.
+        // leaf_lookup (built by getLeaves()) keys paths -> leaf indices: one hash
+        // lookup + one tiny H5Dread instead of the full scan.
+        const auto& leaves = getLeaves(); // Ensures the lookup tables are built.
+        const auto it = leaf_lookup.find(path);
+        if (it == leaf_lookup.end() || it->second.empty()) {
+            *status = -1;
+            return static_cast<T>(-1);
         }
-        *status = -1;
-        return static_cast<T>(-1);
+        const Leaf& leaf = cached_leaves[it->second.front()]; // First row at that path, as the old scan.
+        if (!leaf.shape.empty() || leaf.count != 1) {
+            throw ALBackendException("Leaf at path '" + path + "' is not a scalar.", LOG);
+        }
+        T value;
+        readTensor(leaf, &value);
+        *status = 0;
+        return value;
     }
 
     /**

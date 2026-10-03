@@ -15,6 +15,9 @@
 #include <set>
 #include <map>
 
+// Sentinel for the cached ids_properties&homogeneous_time flag (valid values: -1, 0, 1)
+constexpr int HOMOG_TIME_UNRESOLVED = -2;
+
 // Forward declarations
 class Context;
 
@@ -173,6 +176,9 @@ protected:
     std::shared_ptr<ReadIndex> read_index_ptr;
 
     std::unordered_map<std::string, std::vector<double>> time_values_cache;
+
+    // Cached ids_properties&homogeneous_time flag for the read session (see getHomogeneousTime())
+    mutable int homogeneous_time_cache = HOMOG_TIME_UNRESOLVED;
     
     // Cache for path sanitization (Context + Path -> Sanitized Path)
     mutable std::map<std::pair<Context*, std::string>, std::string> sanitized_path_cache;
@@ -231,14 +237,19 @@ public:
     /**
      * @brief Retrieves the homogeneous time status from ids_properties.
      * @return 1 if homogeneous, 0 otherwise (or -1 on error/default).
+     * @note Cached for the whole read session: the flag cannot change while
+     *        the engine is open in READ mode, and this getter was called on
+     *        every read_ND_Data / beginReadArraystructAction.
      */
     int getHomogeneousTime() {
+        if (homogeneous_time_cache != HOMOG_TIME_UNRESOLVED) return homogeneous_time_cache;
         if (!panzer_db_ptr) return -1;
         int homogeneous_time = 1;
         int status = -1;
         int temp = panzer_db_ptr->readScalar<int32_t>("ids_properties&homogeneous_time", &status);
         if (status == 0)
            homogeneous_time = temp;
+        homogeneous_time_cache = homogeneous_time;
         return homogeneous_time;
     }
 
