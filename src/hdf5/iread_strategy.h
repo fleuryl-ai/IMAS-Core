@@ -820,27 +820,36 @@ public:
         }
 
         try {
+            // RAII buffers: on any throw (readTensor, HDF5 errors) the block is
+            // freed automatically; on success ownership is handed to the caller
+            // via release() (same malloc'd block, caller keeps free()-ing it).
             if (datatype == alconst::double_data) {
-                *data = malloc(leaf->count * sizeof(double));
-                panzer_db_ptr->readTensor<double>(*leaf, static_cast<double*>(*data));
+                auto buf = std::make_unique<double[]>(leaf->count);
+                panzer_db_ptr->readTensor<double>(*leaf, buf.get());
+                *data = static_cast<void*>(buf.release());
             } else if (datatype == alconst::integer_data) {
-                *data = malloc(leaf->count * sizeof(int32_t));
-                panzer_db_ptr->readTensor<int32_t>(*leaf, static_cast<int32_t*>(*data));
+                auto buf = std::make_unique<int32_t[]>(leaf->count);
+                panzer_db_ptr->readTensor<int32_t>(*leaf, buf.get());
+                *data = static_cast<void*>(buf.release());
             } else if (datatype == alconst::complex_data) {
-                *data = malloc(leaf->count * sizeof(std::complex<double>));
-                panzer_db_ptr->readTensor<std::complex<double>>(*leaf, static_cast<std::complex<double>*>(*data));
+                auto buf = std::make_unique<std::complex<double>[]>(leaf->count);
+                panzer_db_ptr->readTensor<std::complex<double>>(*leaf, buf.get());
+                *data = static_cast<void*>(buf.release());
             } else if (datatype == alconst::char_data) {
                 if (leaf->shape.size() <= 1) { // 1D list or Scalar
                     std::vector<std::string> str_list(leaf->count);
                     panzer_db_ptr->readTensor<std::string>(*leaf, str_list.data());
-                    
-                    *data = malloc(leaf->count * sizeof(char*));
-                    char** out_ptr = static_cast<char**>(*data);
+
+                    // Array of char*: the array block is RAII-owned, the elements
+                    // keep the historical per-string malloc (AL frees them one by one).
+                    auto out_arr = std::make_unique<char*[]>(leaf->count);
+                    char** out_ptr = out_arr.get();
                     for (size_t i = 0; i < leaf->count; ++i) {
                          size_t len = str_list[i].size() + 1;
                          out_ptr[i] = (char*)malloc(len);
                          std::memcpy(out_ptr[i], str_list[i].c_str(), len);
                     }
+                    *data = static_cast<void*>(out_arr.release());
                 } else {
                     throw ALBackendException("HDF5Reader_v2: Multidimensional strings not supported", LOG);
                 }
@@ -1170,13 +1179,14 @@ public:
 
              bool return_as_scalar = (is_scalar_leaf && total_elements == 1);
 
-             if (return_as_scalar) {
+            if (return_as_scalar) {
                 DEBUG_PRINT("Detected scalar string leaf. Returning as single string.");
                  *dim = 1;
                  size[0] = (int)temp_buffer[0].size(); // Length excluding null
-                 *data = (char*)malloc(size[0] + 1);
-                 memcpy(*data, temp_buffer[0].c_str(), size[0] + 1);
-             } else {
+                 auto buf = std::make_unique<char[]>(size[0] + 1);
+                 std::memcpy(buf.get(), temp_buffer[0].c_str(), size[0] + 1);
+                 *data = static_cast<void*>(buf.release());
+            } else {
                  // `temp_buffer.size()` = logical element count (correct for spanned lists).
                  size_t n_logical = (size_t)temp_buffer.size();
                  DEBUG_PRINT("Detected list of strings. Returning as 2D char array with max string length: " << max_str_len);
@@ -1185,12 +1195,13 @@ public:
                  size[1] = (int)max_str_len;
 
                  size_t buffer_bytes = n_logical * max_str_len;
-                 char* char_buffer = (char*)malloc(buffer_bytes);
+                 auto buf = std::make_unique<char[]>(buffer_bytes);
+                 char* char_buffer = buf.get();
                  std::memset(char_buffer, 0, buffer_bytes);
                  for (size_t i = 0; i < n_logical; ++i) {
                      if (!temp_buffer[i].empty()) strncpy(char_buffer + (i * max_str_len), temp_buffer[i].c_str(), max_str_len);
                  }
-                 *data = char_buffer;
+                 *data = static_cast<void*>(buf.release());
              }
  
              *datatype = actual_datatype; // Return the type that was read
@@ -1225,19 +1236,29 @@ public:
             }
         }
 
-        // Allocation
-        if (actual_datatype == alconst::double_data) *data = malloc(total_elements * sizeof(double));
-        else if (actual_datatype == alconst::integer_data) *data = malloc(total_elements * sizeof(int32_t));
-        else if (actual_datatype == alconst::complex_data) *data = malloc(total_elements * sizeof(std::complex<double>));
+        // Allocation (RAII: a throw inside readLeavesUnion used to leak the raw
+        // buffer; ownership is only handed over on success via release()).
+        std::unique_ptr<double[]> buf_d;
+        std::unique_ptr<int32_t[]> buf_i;
+        std::unique_ptr<std::complex<double>[]> buf_c;
+        void* raw = nullptr;
+        if (actual_datatype == alconst::double_data) { buf_d = std::make_unique<double[]>(total_elements); raw = buf_d.get(); }
+        else if (actual_datatype == alconst::integer_data) { buf_i = std::make_unique<int32_t[]>(total_elements); raw = buf_i.get(); }
+        else if (actual_datatype == alconst::complex_data) { buf_c = std::make_unique<std::complex<double>[]>(total_elements); raw = buf_c.get(); }
         else return 0;
+        *data = raw;
 
         // OPTIMIZATION: Grouped read (Hyperslab Union)
         int res = panzer_db_ptr->readLeavesUnion(sorted_leaves, *data, actual_type_enum); 
         if (res < 0) {
-            free(*data);
+            // buf_d/buf_i/buf_c freed by RAII here
             *data = nullptr;
             return 0;
         }
+
+        if (buf_d) *data = buf_d.release();
+        else if (buf_i) *data = buf_i.release();
+        else if (buf_c) *data = buf_c.release();
 
         *datatype = actual_datatype; // Return the type that was read
         
