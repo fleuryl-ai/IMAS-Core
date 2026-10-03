@@ -3,8 +3,8 @@
 #include <complex>
 
 
-SliceReadStrategy::SliceReadStrategy(hid_t loc_id)
-    : IReadStrategy(loc_id) {}
+SliceReadStrategy::SliceReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std::shared_ptr<ReadIndex> read_index)
+    : IReadStrategy(std::move(panzer_db), std::move(read_index)) {}
 
 void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
     OperationContext* opCtx = ctx->getOperationContext();
@@ -71,7 +71,8 @@ void SliceReadStrategy::endAction(Context *ctx) {
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
         // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
     } else if (ctx->getType() == CTX_OPERATION_TYPE) {
-        if (panzer_db_ptr) panzer_db_ptr->close(); // If panzer_db_ptr is not null
+        // Nothing to close: the shared engine is flushed/closed by RAII when the
+        // read session is reset (HDF5Reader_v2) or at its destruction.
     }
   else{
   }

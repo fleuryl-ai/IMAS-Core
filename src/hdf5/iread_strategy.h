@@ -29,19 +29,23 @@ class Context;
 #endif
 
 /**
- * @class IReadStrategy
- * @brief Abstract base class defining the strategy for reading data from HDF5 via PanzerDB.
- * 
- * This class provides the common infrastructure for different reading strategies
- * (Global, Slice, TimeRange) used by the HDF5 backend.
+ * @class ReadIndex
+ * @brief Read-only index (path/name -> leaves) shared by the strategies over one PanzerDB.
+ *
+ * The three read strategies (Global, Slice, TimeRange) used by HDF5Reader_v2
+ * observe the same file, so they must NOT each open their own PanzerDB and
+ * rebuild their own path index (that was 3x the /index load + 3x the cache
+ * memory on 10^5-slice files). This class holds the engine-wide indexes once,
+ * owned by the reader and shared by every strategy created in the session.
+ *
+ * The string_view keys and the Leaf pointers reference PanzerDB's internal
+ * path/leaf storage, so the ReadIndex keeps the PanzerDB alive through a
+ * shared_ptr: it stays valid exactly as long as the ReadIndex lives.
  */
-class IReadStrategy {
+class ReadIndex {
+    std::shared_ptr<PanzerDB> panzer_db_ptr; // Keeps the indexed engine alive.
 
-protected:
-     // =================================================================================
-    //                                  Members
-    // =================================================================================
-
+public:
     /**
      * @brief Cache for fast access path -> leaves.
      * Key: Full path (string view).
@@ -64,6 +68,91 @@ protected:
      */
     std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> name_index;
 
+    std::set<std::string> schema_aos_paths; // Cache for "schema" AoS paths (without indices)
+
+    /**
+     * @brief Constructor. Builds every index from the engine's leaf cache.
+     * @param panzer_db The read-only engine to index (READ mode).
+     */
+    ReadIndex(std::shared_ptr<PanzerDB> panzer_db) : panzer_db_ptr(std::move(panzer_db)) {
+        build_path_index();
+        build_aos_schema_index();
+    }
+
+    /**
+     * @brief Builds an in-memory index of paths to leaves for fast lookup.
+     */
+    void build_path_index() {
+        path_cache.clear();
+        name_index.clear();
+        if (!panzer_db_ptr) return;
+
+        const auto& leaves = panzer_db_ptr->getLeaves();
+
+        // Pre-reserve to avoid reallocations
+        path_cache.reserve(leaves.size());
+        name_index.reserve(leaves.size() / 16 + 16);
+
+        for (const auto& leaf : leaves) {
+            // Store the pointer to the leaf in the map
+            path_cache[leaf.path].push_back(&leaf);
+
+            // Also index by the last path segment (dataset name). `leaf.path` has no
+            // '/' in its last segment's key because dataset names use '&' (see
+            // clean_ds_name), so "last segment == name" is the exact fallback predicate.
+            const std::string_view p = leaf.path;
+            const auto slash = p.rfind('/');
+            const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
+            name_index[key].push_back(&leaf);
+        }
+
+        DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths, "
+                  << name_index.size() << " dataset names.");
+    }
+
+    void build_aos_schema_index() {
+        schema_aos_paths.clear();
+        if (!panzer_db_ptr) return;
+        
+        const auto& leaves = panzer_db_ptr->getLeaves();
+        for (const auto& leaf : leaves) {
+            if (leaf.flags != 2 && leaf.flags != 3) continue; // Keep only AoS (Static=2, Dynamic=3)
+            std::string root(leaf.path);
+            // Convert "A/0/B/0/C" -> "A/B/C"
+            std::string schema_path;
+            std::stringstream ss(root);
+            std::string segment;
+            while (std::getline(ss, segment, '/')) {
+                // If the segment is numeric, ignore it (it's an index)
+                if (segment.empty() || std::all_of(segment.begin(), segment.end(), ::isdigit)) {
+                    continue;
+                }
+                if (!schema_path.empty()) schema_path += "/";
+                schema_path += segment;
+            }
+            schema_aos_paths.insert(schema_path);
+        }
+    }
+};
+
+/**
+ * @class IReadStrategy
+ * @brief Abstract base class defining the strategy for reading data from HDF5 via PanzerDB.
+ * 
+ * This class provides the common infrastructure for different reading strategies
+ * (Global, Slice, TimeRange) used by the HDF5 backend.
+ *
+ * @note The PanzerDB engine and the path indexes are NOT owned here: one shared
+ *       pair per read session is injected by HDF5Reader_v2 (see ReadIndex),
+ *       so a session loads the /index once whatever the range modes used.
+ */
+class IReadStrategy {
+
+protected:
+     // =================================================================================
+    //                                  Members
+    // =================================================================================
+
      /**
      * @brief Cache for context paths to avoid rebuilding the parent path on every read call.
      * Key: Pointer to context.
@@ -72,15 +161,21 @@ protected:
     mutable std::unordered_map<Context*, std::string> context_path_cache;
 
      /**
-     * @brief Pointer to the PanzerDB instance handling low-level HDF5 operations.
+     * @brief Pointer to the PanzerDB instance handling low-level HDF5 operations
+     *        (shared with the other strategies of the read session).
      */
-    std::unique_ptr<PanzerDB> panzer_db_ptr;
+    std::shared_ptr<PanzerDB> panzer_db_ptr;
+
+    /**
+     * @brief Shared engine-wide index (path/name -> leaves), shared with the
+     *        other strategies of the read session.
+     */
+    std::shared_ptr<ReadIndex> read_index_ptr;
 
     std::unordered_map<std::string, std::vector<double>> time_values_cache;
     
     // Cache for path sanitization (Context + Path -> Sanitized Path)
     mutable std::map<std::pair<Context*, std::string>, std::string> sanitized_path_cache;
-    mutable std::set<std::string> schema_aos_paths; // Cache for "schema" AoS paths (without indices)
 
 public:
     // =================================================================================
@@ -88,14 +183,12 @@ public:
     // =================================================================================
 
     /**
-     * @brief Constructor. Initializes PanzerDB in READ mode and builds the path index.
-     * @param loc_id HDF5 location ID (group or file).
+     * @brief Constructor. Adopts the session's read-only engine and its shared index.
+     * @param panzer_db   The shared PanzerDB opened in READ mode for the session.
+     * @param read_index  The shared ReadIndex built once over that engine.
      */
-    IReadStrategy(hid_t loc_id) {
-        panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::READ);
-        build_path_index(); // Build the index right after PanzerDB initialization
-        build_aos_schema_index();
-    } 
+    IReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std::shared_ptr<ReadIndex> read_index)
+        : panzer_db_ptr(std::move(panzer_db)), read_index_ptr(std::move(read_index)) {}
 
     virtual ~IReadStrategy() = default;
     
@@ -239,9 +332,9 @@ public:
     // 1. Attempt direct access (Optimization if the timebase is stored in a single block under the AoS)
     //    We look for "AoS_Path/time".
     std::string direct_tb_path = timed_aos_path + "/" + timebase_basename;
-    auto it_cache = path_cache.find(direct_tb_path);
+    auto it_cache = read_index_ptr->path_cache.find(direct_tb_path);
     
-    if (it_cache != path_cache.end() && !it_cache->second.empty()) {
+    if (it_cache != read_index_ptr->path_cache.end() && !it_cache->second.empty()) {
         // Homogeneous case found in cache!
         for (const auto* leaf : it_cache->second) {
             if (!leaf->is_empty) {
@@ -259,8 +352,8 @@ public:
                 // Note: timebase_name_str is already relative to the AoS (e.g., "time" or "nested/time")
                 std::string slice_tb_path = timed_aos_path + "/" + std::to_string(i) + "/" + timebase_name_str;
                 
-                auto it = path_cache.find(slice_tb_path);
-                if (it != path_cache.end()) {
+                auto it = read_index_ptr->path_cache.find(slice_tb_path);
+                if (it != read_index_ptr->path_cache.end()) {
                     for (const auto* leaf : it->second) {
                         if (!leaf->is_empty) {
                             time_leaves_map[leaf->time_index] = leaf;
@@ -298,62 +391,8 @@ public:
 
     // =================================================================================
     //                            Path & Indexing
+    //                            (indexes live in the shared ReadIndex)
     // =================================================================================
-
-    /**
-     * @brief Builds an in-memory index of paths to leaves for fast lookup.
-     */
-    void build_path_index() {
-        path_cache.clear();
-        name_index.clear();
-        if (!panzer_db_ptr) return;
-
-        const auto& leaves = panzer_db_ptr->getLeaves();
-
-        // Pre-reserve to avoid reallocations
-        path_cache.reserve(leaves.size());
-        name_index.reserve(leaves.size() / 16 + 16);
-
-        for (const auto& leaf : leaves) {
-            // Store the pointer to the leaf in the map
-            path_cache[leaf.path].push_back(&leaf);
-
-            // Also index by the last path segment (dataset name). `leaf.path` has no
-            // '/' in its last segment's key because dataset names use '&' (see
-            // clean_ds_name), so "last segment == name" is the exact fallback predicate.
-            const std::string_view p = leaf.path;
-            const auto slash = p.rfind('/');
-            const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
-            name_index[key].push_back(&leaf);
-        }
-
-        DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths, "
-                  << name_index.size() << " dataset names.");
-    }
-
-    void build_aos_schema_index() {
-        schema_aos_paths.clear();
-        if (!panzer_db_ptr) return;
-        
-        const auto& leaves = panzer_db_ptr->getLeaves();
-        for (const auto& leaf : leaves) {
-            if (leaf.flags != 2 && leaf.flags != 3) continue; // Keep only AoS (Static=2, Dynamic=3)
-            std::string root(leaf.path);
-            // Convert "A/0/B/0/C" -> "A/B/C"
-            std::string schema_path;
-            std::stringstream ss(root);
-            std::string segment;
-            while (std::getline(ss, segment, '/')) {
-                // If the segment is numeric, ignore it (it's an index)
-                if (segment.empty() || std::all_of(segment.begin(), segment.end(), ::isdigit)) {
-                    continue;
-                }
-                if (!schema_path.empty()) schema_path += "/";
-                schema_path += segment;
-            }
-            schema_aos_paths.insert(schema_path);
-        }
-    }
 
     /**
      * @brief Finds a specific leaf in the PanzerDB index for a given context and dataset.
@@ -439,8 +478,8 @@ public:
     }
 
     // --- OPTIMIZED PASS 1: Search via Hash Map (O(1)) ---
-    auto it = path_cache.find(strict_target_path);
-    if (it != path_cache.end()) {
+    auto it = read_index_ptr->path_cache.find(strict_target_path);
+    if (it != read_index_ptr->path_cache.end()) {
         const std::vector<const PanzerDB::Leaf*>& candidates = it->second;
         for (const auto* leaf : candidates) {
             DEBUG_PRINT("  -> Candidate from cache: " << leaf->path << " (time_index: " << leaf->time_index << ")");
@@ -456,8 +495,8 @@ public:
     // same time / prefix filters, because clean_ds_name has no '/' (it has had
     // '/' replaced by '&'), so "last segment == name" == the old suffix predicate.
     DEBUG_PRINT("[WARN] Optimized search failed. Falling back to name_index for: " << clean_ds_name);
-    auto it_name = name_index.find(clean_ds_name);
-    if (it_name != name_index.end()) {
+    auto it_name = read_index_ptr->name_index.find(clean_ds_name);
+    if (it_name != read_index_ptr->name_index.end()) {
         for (const auto* leaf : it_name->second) {
             if (target_time != -1 && leaf->time_index != static_cast<uint64_t>(target_time)) continue;
 
@@ -915,8 +954,8 @@ public:
         std::vector<const PanzerDB::Leaf*> sorted_leaves;
         bool found = false;
 
-        auto it = path_cache.find(specific_path);
-        if (it != path_cache.end() && !it->second.empty()) {
+        auto it = read_index_ptr->path_cache.find(specific_path);
+        if (it != read_index_ptr->path_cache.end() && !it->second.empty()) {
             DEBUG_PRINT("Found specific path: " << specific_path);
             // FIX: Always filter by time index if in a dynamic context,
             // even for a specific path. This handles cases where multiple time
@@ -946,8 +985,8 @@ public:
             ss_generic << clean_ds_name;
             std::string generic_path = ss_generic.str();
             
-            it = path_cache.find(generic_path);
-            if (it != path_cache.end() && !it->second.empty()) {
+            it = read_index_ptr->path_cache.find(generic_path);
+            if (it != read_index_ptr->path_cache.end() && !it->second.empty()) {
                 DEBUG_PRINT("Found generic path: " << generic_path);
                 // Filter by time index if we are in a dynamic context
                 if (target_time_index != -1) {
@@ -970,8 +1009,8 @@ public:
             // re-applying the same filters: "leaf.path == name OR (ends with name preceded
             // by '/')" == "last segment == name", because clean_ds_name has no '/' (it has
             // had '/' replaced by '&'). Same candidate set, O(1) instead of O(N).
-            auto it_name = name_index.find(clean_ds_name);
-            if (it_name != name_index.end()) {
+            auto it_name = read_index_ptr->name_index.find(clean_ds_name);
+            if (it_name != read_index_ptr->name_index.end()) {
                 for (const auto* leaf : it_name->second) {
                     if (target_time_index != -1 && leaf->time_index != static_cast<uint64_t>(target_time_index)) continue;
 

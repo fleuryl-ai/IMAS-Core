@@ -11,10 +11,11 @@
 class GlobalReadStrategy : public IReadStrategy {
 public:
     /**
-     * @brief Opens the PanzerDB handle in READ mode at the given location.
-     * @param loc_id HDF5 location (group or file) holding the PanzerDB root.
+     * @brief Adopts the session's shared read-only engine and shared index.
+     * @param panzer_db  The shared PanzerDB opened in READ mode for the session.
+     * @param read_index The shared ReadIndex built once over that engine.
      */
-    GlobalReadStrategy(hid_t loc_id);
+    GlobalReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std::shared_ptr<ReadIndex> read_index);
     void beginReadArraystructAction(ArraystructContext * ctx, int *size) override;
     void endAction(Context * ctx) override;
     /**

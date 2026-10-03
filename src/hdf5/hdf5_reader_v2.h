@@ -27,18 +27,25 @@
  *  - TIMERANGE_OP-> TimeRangeReadStrategy
  *
  * The active strategy is chosen lazily (and cached) by prepare_strategy()
- * before every read entry point.
+ * before every read entry point. A single PanzerDB engine + one shared path
+ * index (ReadIndex) are opened ONCE per session/group and adopted by every
+ * strategy, so the /index is loaded once whatever the range modes used.
  */
 class HDF5Reader_v2 : public HDF5Reader {
 
   private:
 
     void read_homogeneous_time(int* homogenenous_time, hid_t gid);   // Read ids_properties&homogeneous_time, if present.
-    void build_path_index();                                          // Build the path -> leaves index used by the strategies.
     void select_strategy(OperationContext *ctx, hid_t gid);          // Pick + activate the strategy for the range mode.
     void prepare_strategy(Context *ctx);                              // Resolve gid + strategy for the given context.
 
-    std::unique_ptr<IReadStrategy> global_strategy;   // Lazily created, shared across the session.
+    // One shared read engine + shared path index per session (per opened group):
+    // the three strategies below adopt them instead of each opening its own.
+    std::shared_ptr<PanzerDB> session_db;         // Read-only engine for the current session.
+    std::shared_ptr<ReadIndex> session_index;     // Index (path/name -> leaves) built once over session_db.
+    hid_t session_gid = -1;                        // Group id the session engine was opened on.
+
+    std::unique_ptr<IReadStrategy> global_strategy;   // Lazily created, sharing session_db + session_index.
     std::unique_ptr<IReadStrategy> slice_strategy;
     std::unique_ptr<IReadStrategy> timerange_strategy;
 

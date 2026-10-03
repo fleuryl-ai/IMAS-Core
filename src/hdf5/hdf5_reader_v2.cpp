@@ -38,7 +38,12 @@ void HDF5Reader_v2::closePulse(DataEntryContext *ctx, int mode, hid_t *file_id, 
 void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::unordered_map<std::string, hid_t> &opened_IDS_files, std::string &files_directory, std::string &relative_file_path)
 {
     HDF5Reader::open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path);
-    
+
+    // New read session: drop the previous session's engine/index (their
+    // destructors flush + close the HDF5 handles they own).
+    session_gid = -1;
+    session_db.reset();
+    session_index.reset();
     global_strategy.reset();
     slice_strategy.reset();
     timerange_strategy.reset();
@@ -68,18 +73,34 @@ void HDF5Reader_v2::endAction(Context *ctx)
 }
 
 void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
+    // One shared engine + index per group: built on the first read that needs it,
+    // adopted by every strategy of the session (3x /index load -> 1x).
+    if (gid != session_gid) {
+        session_gid = gid;
+        session_db.reset();
+        session_index.reset();
+        global_strategy.reset();
+        slice_strategy.reset();
+        timerange_strategy.reset();
+        read_strategy = nullptr;
+    }
+    if (!session_db) {
+        session_db = std::make_shared<PanzerDB>(gid, PanzerDB::OpenMode::READ);
+        session_index = std::make_shared<ReadIndex>(session_db);
+    }
+
     if (ctx->getRangemode() == GLOBAL_OP) {
-        if (!global_strategy) global_strategy = std::make_unique<GlobalReadStrategy>(gid);
+        if (!global_strategy) global_strategy = std::make_unique<GlobalReadStrategy>(session_db, session_index);
         read_strategy = global_strategy.get();
     } 
     else if (ctx->getRangemode() == SLICE_OP) {
-        if (!slice_strategy) slice_strategy = std::make_unique<SliceReadStrategy>(gid);
+        if (!slice_strategy) slice_strategy = std::make_unique<SliceReadStrategy>(session_db, session_index);
         read_strategy = slice_strategy.get();
     }
     else if (ctx->getRangemode() == TIMERANGE_OP) {
-        if (!timerange_strategy) timerange_strategy = std::make_unique<TimeRangeReadStrategy>(gid);
+        if (!timerange_strategy) timerange_strategy = std::make_unique<TimeRangeReadStrategy>(session_db, session_index);
         read_strategy = timerange_strategy.get();
-     }
+    }
     else {
         throw ALBackendException("Unknown operation context range mode", LOG);
     }
