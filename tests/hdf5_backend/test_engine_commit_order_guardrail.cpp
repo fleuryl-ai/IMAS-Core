@@ -41,7 +41,10 @@ static void inject_dangling_row(const std::string& path) {
     H5Sget_simple_extent_dims(iids, idims, NULL);
     H5Sclose(iids);
     hsize_t irows = idims[0];
-    hsize_t new_index_dims[2] = {irows + 1, 14};
+    // Layout-aware: 12 columns for current files, 14 for legacy ones.
+    const hsize_t ncols = idims[1];
+    assert((ncols == 12 || ncols == 14) && "inject: known /index layout");
+    hsize_t new_index_dims[2] = {irows + 1, ncols};
     H5Dset_extent(index_dset, new_index_dims);
 
     // --- /paths: keep count consistent, add a dummy path -------------------
@@ -65,22 +68,24 @@ static void inject_dangling_row(const std::string& path) {
     H5Sclose(pms); H5Sclose(ploc); H5Tclose(ptype);
 
     // --- fabricate the dangling index row ----------------------------------
-    // Layout: {type, ndim, shape[6], time_idx, offset, count, flags, parent_id,
-    // index_value}. flags = 0  =>  kind 0 (data), dtype FLOAT64. The offset is
-    // intentionally far past the data_raw_f64 extent.
+    // Layout: current 12-column files use {ndim, shape[6], time_idx, offset,
+    // count, flags, parent_id}; legacy 14-column files keep a leading "type"
+    // and trailing "index_value" column. flags = 0 => kind 0 (data), FLOAT64.
+    // The offset is intentionally far past the data_raw_f64 extent.
     uint64_t row[14] = {0};
-    row[0]  = 0;                       // type (unused; dtype encoded in flags)
-    row[1]  = 0;                       // ndim
-    row[8]  = 0;                       // time_idx
-    row[9]  = 999999;                  // offset -> far past data extent
-    row[10] = 4;                       // count
-    row[11] = 0;                       // flags  -> kind 0 (data), dtype FLOAT64
-    row[12] = PANZER_NO_PARENT_ROW;    // parent (root)
-    row[13] = 0;                       // instance
+    const bool legacy = (ncols == 14);
+    const unsigned off_c    = legacy ? 9  : 8;
+    const unsigned cnt_c    = legacy ? 10 : 9;
+    const unsigned flags_c  = legacy ? 11 : 10;
+    const unsigned parent_c = legacy ? 12 : 11;
+    row[off_c]    = 999999;                  // offset -> far past data extent
+    row[cnt_c]    = 4;                       // count
+    row[flags_c]  = 0;                       // flags  -> kind 0 (data), dtype FLOAT64
+    row[parent_c] = PANZER_NO_PARENT_ROW;    // parent (root)
 
     hid_t iloc = H5Dget_space(index_dset);
     hsize_t ioff[2] = {irows, 0};
-    hsize_t icnt[2] = {1, 14};
+    hsize_t icnt[2] = {1, ncols};
     H5Sselect_hyperslab(iloc, H5S_SELECT_SET, ioff, NULL, icnt, NULL);
     hid_t ims = H5Screate_simple(2, icnt, NULL);
     H5Dwrite(index_dset, H5T_NATIVE_UINT64, ims, iloc, H5P_DEFAULT, row);

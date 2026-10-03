@@ -170,9 +170,9 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
         
         // OPTIMIZATION: Create index dataset with optimal chunking
-        hsize_t dims[2] = {0, 14};
-        hsize_t maxdims[2] = {H5S_UNLIMITED, 14};
-        hsize_t chunk[2] = {chunk_config.index_chunk_rows, 14};
+        hsize_t dims[2] = {0, PANZER_INDEX_COLUMNS};
+        hsize_t maxdims[2] = {H5S_UNLIMITED, PANZER_INDEX_COLUMNS};
+        hsize_t chunk[2] = {chunk_config.index_chunk_rows, PANZER_INDEX_COLUMNS};
         
         hid_t space = H5Screate_simple(2, dims, maxdims);
         hid_t plist = H5Pcreate(H5P_DATASET_CREATE);
@@ -245,7 +245,7 @@ void PanzerDB::init(OpenMode mode) {
         }
 
         // Optimized buffers
-        index_buffer.reserve(chunk_config.index_chunk_rows * 14);
+        index_buffer.reserve(chunk_config.index_chunk_rows * PANZER_INDEX_COLUMNS);
         data_buffer_f64.reserve(chunk_config.data_chunk_f64);
         data_buffer_i32.reserve(chunk_config.data_chunk_i32);
         data_buffer_str.reserve(chunk_config.data_chunk_str);
@@ -268,6 +268,9 @@ void PanzerDB::init(OpenMode mode) {
             H5Sget_simple_extent_dims(ispace, idims, nullptr);
             H5Sclose(ispace);
             next_row_id = idims[0];
+            // Appended rows must reuse the file's layout (legacy 14-col files
+            // keep it; new 12-col files continue with 12).
+            if (idims[1] > 0) index_cols = idims[1];
         }
         if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) data_dset_f64 = H5Dopen2(file_id, "data_raw_f64", dapl);
         if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) data_dset_i32 = H5Dopen2(file_id, "data_raw_i32", dapl);
@@ -284,7 +287,7 @@ void PanzerDB::init(OpenMode mode) {
         updateDiskSizes();
         
         // Optimized buffers
-        index_buffer.reserve(chunk_config.index_chunk_rows * 14);
+        index_buffer.reserve(chunk_config.index_chunk_rows * index_cols);
         data_buffer_f64.reserve(chunk_config.data_chunk_f64);
         data_buffer_i32.reserve(chunk_config.data_chunk_i32);
         data_buffer_str.reserve(chunk_config.data_chunk_str);
@@ -879,20 +882,20 @@ void PanzerDB::flush() {
     // Written after every payload so a crash can only leave unindexed slack in
     // data_raw_*, never an index row that points past the written data.
     {
-        hsize_t n_new_rows = index_buffer.size() / 14;
+        hsize_t n_new_rows = index_buffer.size() / index_cols;
         hsize_t current_dims[2];
         filespace = H5Dget_space(index_dset);
         H5Sget_simple_extent_dims(filespace, current_dims, NULL);
 
-        hsize_t new_dims[2] = {current_dims[0] + n_new_rows, 14};
+        hsize_t new_dims[2] = {current_dims[0] + n_new_rows, (hsize_t)index_cols};
         H5Dset_extent(index_dset, new_dims);
 
         filespace = H5Dget_space(index_dset);
         hsize_t offset[2] = {current_dims[0], 0};
-        hsize_t slab_dims[2] = {n_new_rows, 14};
+        hsize_t slab_dims[2] = {n_new_rows, (hsize_t)index_cols};
         H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, NULL, slab_dims, NULL);
 
-        hsize_t mem_dims[2] = {n_new_rows, 14};
+        hsize_t mem_dims[2] = {n_new_rows, (hsize_t)index_cols};
         memspace = H5Screate_simple(2, mem_dims, NULL);
         H5Dwrite(index_dset, H5T_NATIVE_UINT64, memspace, filespace, H5P_DEFAULT, index_buffer.data());
         H5Sclose(memspace);
@@ -1286,6 +1289,18 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     H5Sclose(space);
     uint64_t n_rows = dims[0];
 
+    // Column count actually used by the file: 12 for current files, 14 for legacy
+    // ones (which carry the never-read "type" + "index_value" columns).
+    const uint64_t ncols = (dims[1] > 0) ? dims[1] : PANZER_INDEX_COLUMNS;
+    const bool legacy_layout = (ncols != PANZER_INDEX_COLUMNS);
+    const unsigned ndim_c   = legacy_layout ? 1  : 0;
+    const unsigned shape_c  = legacy_layout ? 2  : 1;
+    const unsigned time_c   = legacy_layout ? 8  : 7;
+    const unsigned off_c    = legacy_layout ? 9  : 8;
+    const unsigned cnt_c    = legacy_layout ? 10 : 9;
+    const unsigned flags_c  = legacy_layout ? 11 : 10;
+    const unsigned parent_c = legacy_layout ? 12 : 11;
+
     if (n_rows == 0) {
         max_time_at_dynamic_root.clear();
         leaves_cache_valid = true; // Cache is now valid (but empty).
@@ -1299,7 +1314,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     cached_parent_paths_blocks.clear();
 
     // 2. Read index and paths (full reload)
-    std::vector<uint64_t> idx(read_count * 14);
+    std::vector<uint64_t> idx(read_count * ncols);
     H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
 
     cached_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
@@ -1342,8 +1357,8 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     //   - full_path minus  1 segment (last name)             for a data leaf (kind 0/1)
     //   - full_path minus  2 segments (instance + name)      for an AoS meta (kind 2/3)
     auto parent_path_of = [&](uint64_t i) -> std::string {
-        if (idx[i * 14 + 12] == PANZER_NO_PARENT_ROW) return std::string();
-        const uint64_t leaf_kind = idx[i * 14 + 11] & 0xFULL;
+        if (idx[i * ncols + parent_c] == PANZER_NO_PARENT_ROW) return std::string();
+        const uint64_t leaf_kind = idx[i * ncols + flags_c] & 0xFULL;
         const std::string full(static_cast<const char*>(paths_data.data() + i * PATH_MAX_LEN));
         const size_t n_strip = (leaf_kind == 2 || leaf_kind == 3) ? 2 : 1;
         size_t end = full.size();
@@ -1376,7 +1391,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     // -----------------------------------------------------------------------
 
     for (uint64_t i = 0; i < read_count; ++i) {
-        const uint64_t* row = &idx[i * 14];
+        const uint64_t* row = &idx[i * ncols];
 
         // --- Crash-safe guardrail (per row, before emplace) -----------------
         // A DATA row (kind 0) whose payload extends past the materialised
@@ -1385,16 +1400,16 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         // (is_empty) are not backed by data_raw_*, so the check only applies
         // to kind 0 data.
         {
-            const uint64_t leaf_kind = row[11] & 0xFULL;
+            const uint64_t leaf_kind = row[flags_c] & 0xFULL;
             if (leaf_kind == 0) {
-                const DataType dtype = static_cast<DataType>(row[11] >> 4);
+                const DataType dtype = static_cast<DataType>(row[flags_c] >> 4);
                 uint64_t extent = 0;
                 if      (dtype == DataType::FLOAT64)      extent = ext_f64;
                 else if (dtype == DataType::INT32)        extent = ext_i32;
                 else if (dtype == DataType::COMPLEX128)   extent = ext_c128;
                 else if (dtype == DataType::STRING)       extent = ext_str;
                 else if (dtype == DataType::STRING_CHUNKED) extent = ext_str; // same column, k slots
-                if (row[9] + row[10] > extent) continue;   // dangling → skip
+                if (row[off_c] + row[cnt_c] > extent) continue;   // dangling → skip
             }
         }
         // -------------------------------------------------------------------
@@ -1414,17 +1429,17 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         pp_slot[copy_len] = '\0';
         leaf.parent_path  = std::string_view(pp_slot);
 
-        leaf.time_index   = row[8];
-        leaf.offset       = row[9];
-        leaf.count        = row[10];
-        leaf.flags        = row[11];
-        leaf.is_empty     = (row[11] == 1);
+        leaf.time_index   = row[time_c];
+        leaf.offset       = row[off_c];
+        leaf.count        = row[cnt_c];
+        leaf.flags        = row[flags_c];
+        leaf.is_empty     = (row[flags_c] == 1);
         leaf.row_id       = (uint64_t)i;   // absolute position in /index, used for span-table lookup
 
         // Shape
-        uint64_t ndim = row[1];
+        uint64_t ndim = row[ndim_c];
         leaf.shape.reserve(ndim);
-        for (uint64_t d = 0; d < ndim && d < 6; ++d) leaf.shape.push_back(row[2 + d]);
+        for (uint64_t d = 0; d < ndim && d < 6; ++d) leaf.shape.push_back(row[shape_c + d]);
         
         // Populate lookups
         leaf_lookup[leaf.path].push_back(cached_leaves.size() - 1);
@@ -2169,21 +2184,33 @@ uint64_t PanzerDB::append_index_row(const std::string& full_path,
     // optimized copy (strncpy is fast for fixed-size buffers)
     strncpy(paths_buffer.data() + current_path_size, full_path.c_str(), PATH_MAX_LEN - 1);
 
-    // build the row (layout: row[0]=type, row[12]=parent_id, row[13]=index_value)
-    uint64_t row[14] = {0};
-    row[0] = type;
-    row[1] = shape.size();
+    // build the row. Layout depends on the file's column count (index_cols):
+    //   12 (new):  ndim | shape[6] | time_index | offset | count | flags | parent_id
+    //   14 (legacy): leading "type" + trailing "index_value" column, never read back.
+    uint64_t row[PANZER_INDEX_COLUMNS + 2] = {0};
+    const bool legacy = (index_cols == 14);
+    const unsigned ndim_c   = legacy ? 1  : 0;
+    const unsigned shape_c  = legacy ? 2  : 1;
+    const unsigned time_c   = legacy ? 8  : 7;
+    const unsigned off_c    = legacy ? 9  : 8;
+    const unsigned cnt_c    = legacy ? 10 : 9;
+    const unsigned flags_c  = legacy ? 11 : 10;
+    const unsigned parent_c = legacy ? 12 : 11;
+    row[ndim_c] = shape.size();
     for (size_t i = 0; i < shape.size() && i < 6; ++i) {
-        row[2+i] = shape[i];
+        row[shape_c + i] = shape[i];
     }
-    row[8] = time_idx;
-    row[9] = offset;
-    row[10] = count;
-    row[11] = flags;
-    row[12] = parent_id;     // enclosing AoS meta-node row id (PANZER_NO_PARENT_ROW for root)
-    row[13] = index_value;   // instance index within that parent AoS
+    row[time_c] = time_idx;
+    row[off_c] = offset;
+    row[cnt_c] = count;
+    row[flags_c] = flags;
+    row[parent_c] = parent_id;   // enclosing AoS meta-node row id (PANZER_NO_PARENT_ROW for root)
+    // M1: the legacy "type" and "index_value" columns are no longer stored
+    // (the data type lives in flags >> 4, the instance index is in the path).
+    (void)type;
+    (void)index_value;
 
-    index_buffer.insert(index_buffer.end(), row, row + 14);
+    index_buffer.insert(index_buffer.end(), row, row + index_cols);
     return assigned_row_id;
 }
 
@@ -3440,15 +3467,16 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
     std::vector<double> full_signal;
     full_signal.resize(total_elements);
 
-    // 5. Reading and assembly (Concatenation)
-    size_t current_offset = 0;
-    
-    for (const auto* leaf : target_leaves) {
-        // Read directly into correct portion of final vector
-        // leaf->count is number of elements in this write "slice"
-        readTensor(*leaf, full_signal.data() + current_offset);
-        
-        current_offset += leaf->count;
+    // 5. Reading and assembly (Concatenation).
+    // Batched like the other multi-leaf reads: one hyperslab union over the
+    // time-sorted leaves instead of one H5Dread per APPEND chunk.
+    if (readLeavesUnion(target_leaves, full_signal.data(), DataType::FLOAT64) < 0) {
+        // Fallback: sequential per-leaf read (non-monotonic offsets).
+        size_t current_offset = 0;
+        for (const auto* leaf : target_leaves) {
+            readTensor(*leaf, full_signal.data() + current_offset);
+            current_offset += leaf->count;
+        }
     }
 
     return full_signal;

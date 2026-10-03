@@ -135,6 +135,13 @@ struct ArrayLevel {
 // Sentinel for the parent_id column of a root row (no enclosing AoS meta node).
 inline constexpr uint64_t PANZER_NO_PARENT_ROW = 0xFFFFFFFFFFFFFFFFULL;
 
+// Number of columns of the central /index table (v2 current layout):
+//   0 ndim | 1..6 shape[6] | 7 time_index | 8 offset | 9 count | 10 flags | 11 parent_id
+// Legacy files may still carry 14 columns (leading "type" and trailing
+// "index_value" columns, never read back); getLeaves() detects the stride
+// from the dataset extent and maps both layouts.
+inline constexpr uint64_t PANZER_INDEX_COLUMNS = 12;
+
 /**
  * @struct PathComponents
  * @brief Parsed components of an instance path inside a (possibly dynamic) AoS.
@@ -266,8 +273,14 @@ private:
     // a later READ observes (parent-first ordering).
     uint64_t next_row_id = 0;
 
+    // Column count of the /index table in effect for this file: legacy files
+    // still carry the 14-column layout (never-read "type" + "index_value" columns)
+    // and must be appended to with the same layout; new files use the 12-column
+    // one (PANZER_INDEX_COLUMNS). init() reads the real extent in APPEND mode.
+    uint64_t index_cols = PANZER_INDEX_COLUMNS;
+
     // RAM Buffers (only what is necessary)
-    std::vector<uint64_t> index_buffer;   // 14 columns: name_id, ndim, shape[6], time_index, offset, count, flags, parent_id, index_value
+    std::vector<uint64_t> index_buffer;   // PANZER_INDEX_COLUMNS columns/row (see constant)
     std::vector<double> data_buffer_f64;
     std::vector<int32_t> data_buffer_i32;
     std::vector<std::complex<double>> data_buffer_c128;
