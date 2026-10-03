@@ -1272,6 +1272,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     cached_leaves.clear();
     leaf_lookup.clear();
     parent_lookup.clear();
+    metadata_by_schema.clear();
     max_time_at_dynamic_root.clear();
 
     // 1. Read size of /index
@@ -1428,6 +1429,13 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         // Populate lookups
         leaf_lookup[leaf.path].push_back(cached_leaves.size() - 1);
         parent_lookup[leaf.parent_path].push_back(cached_leaves.size() - 1);
+
+        // Metadata rows are "@key" leaves: index them by their schema path (the
+        // text before '@') so readMetadata() is a hash lookup, not an O(N) scan.
+        const auto at_pos = leaf.path.find('@');
+        if (at_pos != std::string_view::npos && !leaf.is_empty) {
+            metadata_by_schema[leaf.path.substr(0, at_pos)].push_back(cached_leaves.size() - 1);
+        }
         
         if (leaf.flags == 3) {
             cached_dynamic_aos_roots.emplace_back(leaf.path);
@@ -3503,14 +3511,13 @@ std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& ins
         return metadata; // Already processed, return empty (or cached if we stored it)
     }
 
-    // 3. Scan for metadata leaves (schema_path + "@key")
-    std::string prefix = schema_path + "@";
-    const auto& leaves = getLeaves();
-    
-    for (const auto& leaf : leaves) {
-        // Check if leaf path starts with prefix
-        if (leaf.path.rfind(prefix, 0) == 0) {
-            std::string key = std::string(leaf.path.substr(prefix.length()));
+    // 3. Resolve this schema's @key leaves from the index built in getLeaves()
+    //    (was an O(N) scan of the whole index with a prefix test per read_ND_Data call).
+    const auto it_meta = metadata_by_schema.find(schema_path);
+    if (it_meta != metadata_by_schema.end()) {
+        for (size_t leaf_idx : it_meta->second) {
+            const Leaf& leaf = cached_leaves[leaf_idx];
+            std::string key(leaf.path.substr(schema_path.size() + 1));
             std::string value;
             if (static_cast<uint64_t>(leaf.flags >> 4) ==
                 static_cast<uint64_t>(DataType::STRING_CHUNKED)) {

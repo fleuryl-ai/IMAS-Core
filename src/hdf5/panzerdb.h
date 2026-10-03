@@ -355,6 +355,13 @@ private:
     mutable std::vector<double> scratch_f64;
     mutable std::vector<std::string> scratch_str;
 
+    // Metadata leaves (paths holding a "@key" suffix) keyed by their schema path:
+    // built in getLeaves() so readMetadata() resolves a node's @keys with one
+    // hash lookup instead of scanning every leaf of the file.
+    // Values are indices into cached_leaves (Leaf* would dangle during the build
+    // loop, the vector still grows there).
+    mutable std::unordered_map<std::string_view, std::vector<size_t>> metadata_by_schema;
+
     std::unordered_set<std::string> written_metadata_schema_paths;
 
     /**
