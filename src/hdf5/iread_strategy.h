@@ -536,6 +536,7 @@ public:
      * @brief Constructs the path string for an ArraystructContext.
      * @param ctx The array structure context.
      * @param include_self_index Whether to include the index of the current context in the path.
+     * @param override_timed_index When set (>= 0), the index to use for timed (dynamic) levels.
      * @return The constructed path string.
      */
     std::string getPath(ArraystructContext *ctx, bool include_self_index = true, int64_t override_timed_index = -1) {

@@ -42,15 +42,49 @@ void HDF5Writer_v2::read_homogeneous_time(int *homogenenous_time, hid_t gid) {
     return;
   }
   const char *dataset_name = "ids_properties&homogeneous_time";
-  PanzerDB panzer_db(gid, PanzerDB::OpenMode::READ, true);
-   int status = -1;
-   int temp = panzer_db.readScalar<int>(dataset_name, &status);
-   if (status == 0) {
-       *homogenenous_time = temp;
-   } else {
-       *homogenenous_time = -1;
-   }
-   panzer_db.close();
+
+  // Direct H5Dread of the scalar. This used to build a fresh READ PanzerDB on
+  // the group — a full /index load + leaf cache + path index — just to read
+  // one int32 on every SLICE_OP (APPEND) open. The datasets live in the IDS
+  // group itself; when "index" is not a direct child, mirror PanzerDB::init's
+  // one-level descent (child group holding /index).
+  hid_t root = gid;
+  if (H5Lexists(gid, "index", H5P_DEFAULT) <= 0) {
+      H5G_info_t group_info;
+      if (H5Gget_info(gid, &group_info) >= 0) {
+          H5E_auto2_t old_func;
+          void *old_client_data;
+          H5Eget_auto2(H5E_DEFAULT, &old_func, &old_client_data);
+          H5Eset_auto2(H5E_DEFAULT, NULL, NULL);   // silence expected open failures
+          for (hsize_t i = 0; i < group_info.nlinks; ++i) {
+              char name[256];
+              if (H5Lget_name_by_idx(gid, ".", H5_INDEX_NAME, H5_ITER_INC, i, name,
+                                     sizeof(name), H5P_DEFAULT) < 0)
+                  continue;
+              hid_t child = H5Gopen2(gid, name, H5P_DEFAULT);
+              if (child >= 0) {
+                  if (H5Lexists(child, "index", H5P_DEFAULT) > 0) {
+                      root = child;
+                      break;
+                  }
+                  H5Gclose(child);
+              }
+          }
+          H5Eset_auto2(H5E_DEFAULT, old_func, old_client_data);
+      }
+  }
+
+  hid_t dataset_id = H5Dopen2(root, dataset_name, H5P_DEFAULT);
+  herr_t status = -1;
+  if (dataset_id >= 0) {
+      status = H5Dread(dataset_id, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, homogenenous_time);
+      H5Dclose(dataset_id);
+  }
+  if (status < 0)
+      *homogenenous_time = -1;
+
+  if (root != gid)
+      H5Gclose(root);   // the child group handle we opened above
 }
 
 void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id) {
