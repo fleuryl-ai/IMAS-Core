@@ -12,6 +12,7 @@
 #include <cstring>
 #include <complex>
 #include "al_defs.h"
+#include "aos_path_helpers.h"
 #include <set>
 #include <map>
 
@@ -419,40 +420,7 @@ public:
     // --- Path reconstruction WITH the FULL parent path ---
     std::vector<std::string> path_segments;
     std::vector<int> indices;
-    Context* curr = ctx;
-    
-    // ✅ FIX: Go up to OperationContext to capture the full path
-    while (curr != nullptr) {
-        if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
-            std::string full_path = arr->getPath();  // Ex: "core_sources/source"
-            
-            std::string node_name;
-            Context* parent = arr->getParent();
-            if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-                std::string parent_path = parent_arr->getPath();
-                if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                    node_name = full_path.substr(parent_path.size() + 1);
-                } else {
-                    node_name = full_path;
-                }
-            } else {
-                node_name = full_path;
-            }
-            std::replace(node_name.begin(), node_name.end(), '/', '&');
-            
-            path_segments.insert(path_segments.begin(), node_name);
-            indices.insert(indices.begin(), arr->getIndex());
-            curr = arr->getParent();
-        }
-        else if (curr->getType() == CTX_OPERATION_TYPE) {
-            curr = nullptr;
-        }
-        else {
-            curr = nullptr;
-        }
-    }
+    collectAosChain(ctx, path_segments, indices);
 
     std::string clean_ds_name(dataset_name);
     std::replace(clean_ds_name.begin(), clean_ds_name.end(), '/', '&');
@@ -543,40 +511,16 @@ public:
     if (!ctx) return "";
 
     std::vector<std::pair<std::string, int>> segments;
-    Context* current_ctx = ctx;
-
-    while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
-        
-        // 1. Get full path (e.g. "static_aos/dynamic_aos")
-        std::string full_path = arr_ctx->getPath();
-        std::string node_name;
-        
-        // 2. Extract local node name relative to parent
-        Context* parent = arr_ctx->getParent();
-        if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-            std::string parent_path = parent_arr->getPath();
-            if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                node_name = full_path.substr(parent_path.size() + 1); // +1 for '/'
-            } else {
-                node_name = full_path; // Should not happen
-            }
-        } else {
-            node_name = full_path;
+    {
+        std::vector<std::string> node_names;
+        std::vector<int> raw_indices;
+        std::vector<bool> timed_flags;
+        collectAosChain(ctx, node_names, raw_indices, &timed_flags);
+        for (size_t i = 0; i < node_names.size(); ++i) {
+            const int index_to_use = (override_timed_index != -1 && timed_flags[i])
+                                     ? static_cast<int>(override_timed_index) : raw_indices[i];
+            segments.push_back({node_names[i], index_to_use});
         }
-        
-        std::replace(node_name.begin(), node_name.end(), '/', '&');
-        
-        int index_to_use = arr_ctx->getIndex();
-        // If an override is provided AND the current context is dynamic, use it.
-        if (override_timed_index != -1 && arr_ctx->getTimed()) {
-            index_to_use = override_timed_index;
-        }
-
-        segments.insert(segments.begin(), {node_name, index_to_use});
-        
-        current_ctx = arr_ctx->getParent();
     }
 
     std::stringstream path_stream;
@@ -609,35 +553,12 @@ public:
      * @return std::string The full path, e.g., "A/0/B/0/data".
      */
    std::string buildFullPath(Context* ctx, const std::string& dataset_name) {
-       std::vector<std::pair<std::string, int>> segments;
-       Context* current_ctx = ctx;
-
-       // Go up the context hierarchy to collect AoS names and indices.
-       while (current_ctx != nullptr && current_ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
-           ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(current_ctx);
-           
-           std::string full_path = arr_ctx->getPath();
-           std::string node_name;
-           
-           Context* parent = arr_ctx->getParent();
-           if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-               ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-               std::string parent_path = parent_arr->getPath();
-               if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                   node_name = full_path.substr(parent_path.size() + 1);
-               } else {
-                   node_name = full_path;
-               }
-           } else {
-               node_name = full_path;
-           }
-           
-           std::replace(node_name.begin(), node_name.end(), '/', '&');
-           
-           segments.insert(segments.begin(), {node_name, arr_ctx->getIndex()});
-           
-           current_ctx = arr_ctx->getParent();
-       }
+    std::vector<std::string> node_names;
+    std::vector<int> raw_indices;
+    collectAosChain(ctx, node_names, raw_indices);
+    std::vector<std::pair<std::string, int>> segments;
+    for (size_t i = 0; i < node_names.size(); ++i)
+        segments.push_back({node_names[i], raw_indices[i]});
 
        std::stringstream path_stream;
        for (const auto& segment : segments) {
@@ -908,45 +829,13 @@ public:
         std::vector<std::string> path_segments;
         std::vector<int> indices;
         std::vector<bool> is_dynamic_level;
+        collectAosChain(ctx, path_segments, indices, &is_dynamic_level);
+
         int64_t target_time_index = -1;
-        Context* curr = ctx;
-        
-    
-        while (curr != nullptr) {
-            // Potential crash here if curr is invalid
-            if (curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                ArraystructContext* arr = static_cast<ArraystructContext*>(curr);
-                std::string full_path = arr->getPath(); 
-                std::string node_name;
-                
-                Context* parent = arr->getParent();
-                if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                    ArraystructContext* parent_arr = static_cast<ArraystructContext*>(parent);
-                    std::string parent_path = parent_arr->getPath();
-                    if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                        node_name = full_path.substr(parent_path.size() + 1);
-                    } else {
-                        node_name = full_path;
-                    }
-                } else {
-                    node_name = full_path;
-                }
-                
-                std::replace(node_name.begin(), node_name.end(), '/', '&');
-                
-                path_segments.insert(path_segments.begin(), node_name);
-                
-                if (arr->getTimed()) {
-                    target_time_index = arr->getIndex();
-                    is_dynamic_level.insert(is_dynamic_level.begin(), true);
-                } else {
-                    is_dynamic_level.insert(is_dynamic_level.begin(), false);
-                }
-                indices.insert(indices.begin(), arr->getIndex());
-                curr = arr->getParent();
-            }
-            else {
-                curr = nullptr;
+        for (size_t i = 0; i < path_segments.size(); ++i) {
+            if (is_dynamic_level[i]) {
+                target_time_index = indices[i];
+                break;
             }
         }
 

@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "hdf5_utils.h"
+#include "aos_path_helpers.h"
 
 
 #ifdef DEBUG_HDF5_WRITER_V2
@@ -85,38 +86,6 @@ void HDF5Writer_v2::read_homogeneous_time(int *homogenenous_time, hid_t gid) {
 
   if (root != gid)
       H5Gclose(root);   // the child group handle we opened above
-}
-
-namespace {
-    // The local name of an AoS level relative to its parent: the AL gives full
-    // paths, PanzerDB levels carry one name each; nested names ("constraints/x_point")
-    // become a single level with '&'. This block was copy-pasted ~5 times across the
-    // backend (see to_improve.md point 4); it now has exactly one definition here
-    // (the read side keeps its own helpers in iread_strategy.h).
-    std::string localAosName(const Context* arr_ctx) {
-        ArraystructContext* arr = static_cast<ArraystructContext*>(const_cast<Context*>(arr_ctx));
-        std::string full_path = arr->getPath();
-        ArraystructContext* parent = arr->getParent();
-        if (parent && parent->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            const std::string parent_path = parent->getPath();
-            if (full_path.size() > parent_path.size() && full_path.rfind(parent_path + "/", 0) == 0) {
-                full_path = full_path.substr(parent_path.size() + 1);
-            }
-        }
-        std::replace(full_path.begin(), full_path.end(), '/', '&');
-        return full_path;
-    }
-
-    // (names, indices) of the open AoS chain, root first.
-    void collectAosChain(const Context* curr,
-                         std::vector<std::string>& names, std::vector<int>& indices) {
-        while (curr != nullptr && curr->getType() == CTX_ARRAYSTRUCT_TYPE) {
-            ArraystructContext* arr = static_cast<ArraystructContext*>(const_cast<Context*>(curr));
-            names.insert(names.begin(), localAosName(arr));
-            indices.insert(indices.begin(), arr->getIndex());
-            curr = arr->getParent();
-        }
-    }
 }
 
 void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid_t loc_id) {
