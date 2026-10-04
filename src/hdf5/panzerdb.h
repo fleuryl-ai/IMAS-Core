@@ -502,6 +502,27 @@ public:
     };
 
     /**
+     * @brief Returns the data type stored in a leaf's `flags` field.
+     */
+    static DataType leafDataType(const Leaf& leaf) {
+        return static_cast<DataType>(leaf.flags >> 4);
+    }
+
+    /**
+     * @brief True for leaves storing a scalar string (compact or chunked).
+     *
+     * The shape is the authoritative distinction between a scalar string and a
+     * list of strings: scalar nodes have an empty shape, list nodes have rank 1.
+     */
+    static bool isStringScalarLeaf(const Leaf& leaf) {
+        const DataType dt = leafDataType(leaf);
+        return leaf.shape.empty() &&
+               (dt == DataType::STRING ||
+                dt == DataType::LIST_OF_STRINGS ||
+                dt == DataType::STRING_CHUNKED);
+    }
+
+    /**
      * @brief Constructs a PanzerDB instance to manage an HDF5 file.
      * @param filename The path to the HDF5 file.
      * @param mode The mode in which to open the file (WRITE, READ, APPEND).

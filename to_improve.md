@@ -69,9 +69,29 @@ linearly (`panzerdb.h:885-900`).
   timebase, the AL always hands one slice of `size[0]` strings (dim=2 is the
   [count,max_len] buffer layout) and both old branches did the same call.
 
-**Still open (read side):** the slice promotion of time-dependent scalars and the
-`ends_with("time")` timebase-name detection encode AL conventions/ambiguities;
-making them explicit needs the extra index metadata above.
+**Resolution (read side, conservative pass):**
+- Added `IReadStrategy` helpers (`nearestTimedContext`, `cleanFlatPath`,
+  `lastFlatSegment`, `collectTimebaseSchemaPaths`, `isTimebaseDataset`,
+  `shouldPromoteTimeScalarOnSlice`) so the old ad-hoc heuristics have named rules.
+- `TimeRangeReadStrategy::read_ND_Data` no longer uses `ends_with(dataset_name, "time")`.
+  It first matches the requested dataset against the explicit timebase path from
+  the AL `timebasename` argument or the nearest timed AoS context
+  (`getTimebasePath()`), and only falls back to an exact final segment `time`
+  for legacy paths that do not expose a timebase path. Fields such as
+  `time_step` or `lifetime` are therefore no longer swallowed as timebases.
+- `SliceReadStrategy::beginReadArraystructAction` now uses the timed context's
+  declared timebase (`getTimebasePath()`) instead of hardcoding `/time`.
+  `test_read_node_roles` adds a dynamic AoS whose timebase is named `clock`.
+- Slice promotion of time-dependent scalars is now expressed by
+  `shouldPromoteTimeScalarOnSlice()` rather than an inline ambiguous block.
+- Scalar-vs-list shape handling is centralized through `PanzerDB::isStringScalarLeaf`;
+  the leaf shape remains authoritative (scalar: empty shape; list: rank 1), but
+  the read code no longer re-inlines that rule.
+
+**Still open (read side):** fully file-level role persistence (`@timebasepath`,
+`@shape_role`, or an index role column/bit) is still useful for files read without
+enough AL context and for making the scalar/list contract independent of legacy
+shape inference.
 
 ## 4. Path reconstruction duplicated ~6 times
 

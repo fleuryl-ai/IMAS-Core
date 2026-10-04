@@ -687,19 +687,131 @@ public:
      * @param ctx The context to check.
      * @return True if timed, false otherwise.
      */
-    bool isTimedContext(Context *ctx) {
+    ArraystructContext* nearestTimedContext(Context *ctx) {
         if (!ctx || ctx->getType() != CTX_ARRAYSTRUCT_TYPE) {
-            return false;
+            return nullptr;
         }
 
         ArraystructContext* arr_ctx = static_cast<ArraystructContext*>(ctx);
         while (arr_ctx != nullptr) {
             if (arr_ctx->getTimed()) {
-                return true;
+                return arr_ctx;
             }
             arr_ctx = arr_ctx->getParent();
         }
-        return false;
+        return nullptr;
+    }
+
+    bool isTimedContext(Context *ctx) {
+        return nearestTimedContext(ctx) != nullptr;
+    }
+
+    // =================================================================================
+    //                  Explicit read-side node-role helpers (to_improve.md #3)
+    // =================================================================================
+
+    /**
+     * @brief Strips leading '/' and flattens the remaining separators to '&'.
+     *
+     * This mirrors the dataset-name normalisation done before the read strategies
+     * are called, but can also be applied safely to timebase paths coming from
+     * the AL context.
+     */
+    static std::string cleanFlatPath(std::string_view path) {
+        std::string clean(path);
+        if (!clean.empty() && clean.front() == '/') clean.erase(0, 1);
+        std::replace(clean.begin(), clean.end(), '/', '&');
+        return clean;
+    }
+
+    static std::string lastFlatSegment(std::string_view path) {
+        const auto sep = path.find_last_of("/&");
+        return (sep == std::string_view::npos)
+                   ? std::string(path)
+                   : std::string(path.substr(sep + 1));
+    }
+
+    /**
+     * @brief Schema-level candidate paths for the timebase associated with a read.
+     *
+     * Two sources are considered explicitly, in contrast to the old suffix rule:
+     *  - the `timebasename` argument supplied by the AL for this read;
+     *  - the nearest timed AoS context's declared `getTimebasePath()`.
+     *
+     * The returned paths are stripped of AoS instance indices so that an instance
+     * path (`A/0/time`) and the generic storage path (`A/time`) compare equal.
+     */
+    std::vector<std::string> collectTimebaseSchemaPaths(Context* ctx,
+                                                        std::string_view timebasename) {
+        std::vector<std::string> out;
+
+        const auto add_schema = [&](std::string path) {
+            path = PanzerDB::stripIndices(path);
+            if (!path.empty()) out.push_back(std::move(path));
+        };
+
+        if (!timebasename.empty()) {
+            std::string tb = cleanFlatPath(timebasename);
+            if (!tb.empty()) {
+                add_schema(buildFullPath(ctx, tb));
+                add_schema(tb);
+            }
+        }
+
+        if (ArraystructContext* timed = nearestTimedContext(ctx)) {
+            std::string tb = timed->getTimebasePath();
+            if (tb.empty()) tb = "time";
+            tb = cleanFlatPath(sanitize_path(timed, tb));
+
+            std::string generic = getPath(timed, false);
+            if (!generic.empty()) generic += "/";
+            generic += tb;
+            add_schema(generic);
+            add_schema(buildFullPath(timed, tb));
+        }
+
+        return out;
+    }
+
+    /**
+     * @brief True when `dataset_name` denotes the timebase itself.
+     *
+     * The old rule was `ends_with(dataset_name, "time")`, which swallowed fields
+     * such as `time_step` or `lifetime`. This version first uses the explicit
+     * timebase path from the AL call/context and only falls back to an exact
+     * basename "time" for legacy paths that do not expose a timebase path.
+     */
+    bool isTimebaseDataset(Context* ctx,
+                           std::string_view dataset_name,
+                           std::string_view timebasename,
+                           int homogeneous_time) {
+        const std::string clean_ds = cleanFlatPath(dataset_name);
+        if (homogeneous_time == 1 && clean_ds == "time") return true;
+
+        const std::string ds_schema = PanzerDB::stripIndices(buildFullPath(ctx, clean_ds));
+        for (const auto& tb_schema : collectTimebaseSchemaPaths(ctx, timebasename)) {
+            if (tb_schema == ds_schema) return true;
+        }
+
+        // Conservative legacy fallback: the dataset itself is a node whose final
+        // storage segment is exactly "time". It no longer matches any name merely
+        // ending with "time".
+        return lastFlatSegment(clean_ds) == "time";
+    }
+
+    /**
+     * @brief Explicit rule for slice promotion of a time-dependent scalar.
+     *
+     * Root/static-AoS scalar signals get a slice dimension of size 1; scalar
+     * signals belonging to a dynamic AoS are already positioned by the dynamic
+     * slice and remain scalars.
+     */
+    bool shouldPromoteTimeScalarOnSlice(Context* ctx,
+                                        std::string_view timebasename,
+                                        int datatype) {
+        const bool inside_dynamic_aos = isTimedContext(ctx);
+        const bool time_dependent = inside_dynamic_aos || !timebasename.empty();
+        return time_dependent && !inside_dynamic_aos && datatype != alconst::char_data;
     }
 
     
@@ -1044,11 +1156,10 @@ public:
              for (const auto& s : temp_buffer) if (s.size() > max_str_len) max_str_len = s.size();
              max_str_len += 1; // Null terminator
 
-             // Heuristic: Scalar vs List (Corrected)
-             // Use the shape of the first leaf to determine if it was written as a scalar or an array.
-             // Scalar string: shape is empty (rank 0).
-             // List of strings: shape has rank 1.
-             bool is_scalar_leaf = (first_leaf->shape.empty());
+             // Scalar vs list contract (to_improve.md point 3): the leaf shape is
+             // the authoritative shape role. A scalar string has an empty shape;
+             // a list of strings has rank 1, even when it contains one element.
+             const bool is_scalar_leaf = PanzerDB::isStringScalarLeaf(*first_leaf);
              DEBUG_PRINT("Is scalar leaf: " << is_scalar_leaf);
 
              bool return_as_scalar = (is_scalar_leaf && total_elements == 1);

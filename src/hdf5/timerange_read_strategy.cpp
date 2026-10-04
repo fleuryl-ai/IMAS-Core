@@ -87,8 +87,12 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
         opctx = static_cast<OperationContext*>(ctx);
     }
 
-    bool is_homogeneous_time_basis_dataset = (dataset_name == "time" || dataset_name == "/time");
-    bool is_time_dataset = ends_with(dataset_name, "time"); 
+    const int homogeneous_time = getHomogeneousTime();
+    const std::string clean_dataset_name = cleanFlatPath(dataset_name);
+    bool is_homogeneous_time_basis_dataset =
+        (homogeneous_time == 1 && clean_dataset_name == "time");
+    bool is_time_dataset = isTimebaseDataset(
+        ctx, dataset_name, timebasename, homogeneous_time);
     //bool is_time_basis_dataset = is_homogeneous_time_basis_dataset || is_time_dataset;
     bool is_inhomogeneous_time_basis_dataset = is_time_dataset && !is_homogeneous_time_basis_dataset;
     bool resampling = opctx->time_range.dtime.size() >= 1;
@@ -458,14 +462,6 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
         } 
             
     return 0; 
-}
-
-bool TimeRangeReadStrategy::ends_with(const std::string &str, const std::string &suffix)
-{
-    int pos = str.size() - suffix.size();
-    if (pos >= 0)
-        return str.compare(pos, suffix.size(), suffix) == 0;
-    return false;
 }
 
 std::vector<int> TimeRangeReadStrategy::getIndices(Context *ctx, int *dynamic_index) {

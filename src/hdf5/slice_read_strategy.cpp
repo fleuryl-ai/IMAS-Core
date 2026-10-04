@@ -10,30 +10,20 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
     refresh_index_if_needed();
     OperationContext* opCtx = ctx->getOperationContext();
 
-    // Find the closest dynamic parent to identify the correct time base
-    ArraystructContext* timed_parent = nullptr;
-    Context* p = ctx;
-    while(p && p->getType() == CTX_ARRAYSTRUCT_TYPE) {
-        ArraystructContext* arr_p = static_cast<ArraystructContext*>(p);
-        if (arr_p->getTimed()) {
-            timed_parent = arr_p;
-            break;
-        }
-        p = arr_p->getParent();
-    }
+    // Find the closest dynamic parent to identify the correct time base.
+    ArraystructContext* timed_parent = nearestTimedContext(ctx);
 
     int64_t slice_idx = -1;
     if (timed_parent) {
-        int homogeneous_time = getHomogeneousTime();
-        std::string timebase_path;
-        if (homogeneous_time == 1) {
-            timebase_path = "time";
-        } else {
-            timebase_path = getPath(timed_parent, false);
-            if (!timebase_path.empty()) timebase_path += "/";
-            //timebase_path += timed_parent->getTimebasePath();
-            timebase_path += "time";
-        }
+        std::string timebase_name = timed_parent->getTimebasePath();
+        if (timebase_name.empty()) timebase_name = "time";
+
+        timebase_name = cleanFlatPath(sanitize_path(timed_parent, timebase_name));
+
+        std::string timebase_path = getPath(timed_parent, false);
+        if (!timebase_path.empty()) timebase_path += "/";
+        timebase_path += timebase_name;
+
         slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
     }
 
@@ -140,16 +130,13 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
             size[i] = (int)shape_out[i];
         }
 
-        // AL Convention: For a time-dependent N-D array (N>0), a slice should be returned as an (N+1)-D array
-        // with the last dimension of size 1. For a time-dependent scalar (N=0), the behavior is ambiguous.
-        // Heuristic: a scalar signal defined at the root or in a static AoS gets its dimension promoted when
-        // sliced, but a scalar signal defined inside a dynamic AoS remains a scalar when sliced.
-        bool is_dynamic = !timebasename.empty() || isTimedContext(ctx);
-        if (is_dynamic && *datatype != alconst::char_data) {
-            if (!isTimedContext(ctx)) {
-                 size[*dim] = 1;
-                 (*dim)++;
-            }
+        // AL convention, made explicit (to_improve.md point 3): a time-dependent
+        // scalar signal outside a dynamic AoS gets a slice dimension of size 1;
+        // a scalar inside a dynamic AoS is already selected by that dynamic slice
+        // and remains a scalar.
+        if (shouldPromoteTimeScalarOnSlice(ctx, timebasename, *datatype)) {
+            size[*dim] = 1;
+            (*dim)++;
         }
         return 1;
     }

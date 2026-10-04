@@ -2945,9 +2945,9 @@ int PanzerDB::readStringDataByIndex(
         
         size_t start_idx = local_step * element_size;
         
-        bool is_scalar = target_leaf->shape.empty();
+        bool is_scalar = isStringScalarLeaf(*target_leaf);
         const bool chunked =
-            (static_cast<DataType>(target_leaf->flags >> 4) == DataType::STRING_CHUNKED);
+            (leafDataType(*target_leaf) == DataType::STRING_CHUNKED);
 
         if (is_scalar) {
             // A STRING_CHUNKED scalar spans `count` fixed slots; concatenate them

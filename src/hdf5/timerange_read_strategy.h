@@ -26,7 +26,6 @@ public:
                      int *datatype, void **data, int *dim, int *size) override;
 private:
     std::vector<double> time_basis_vector;   // The source time basis used for resampling.
-    bool ends_with(const std::string &str, const std::string &suffix);
     /**
      * @brief Maps the requested time range to the concrete time indices to read.
      * @param ctx           Current context.
