@@ -93,7 +93,7 @@ the helper's `timed` flags; `read_dataset_globally`'s `target_time_index` picks
 the outermost timed level exactly as the old deepest-first scan did (each timed
 level used to overwrite it).
 
-## 5. `sanitize_path` uses `rfind(ctxPath)`
+## 5. `sanitize_path` uses `rfind(ctxPath)` — RESOLVED
 
 `iread_strategy.h:656`: the *last* occurrence of the context path inside the
 remaining string wins; with a repeated segment name higher up the hierarchy
@@ -102,6 +102,23 @@ the two adjacent characters.
 
 **Improvement:** anchor the match (search from the tail with exact segment
 sequence, or work segment-per-segment on a parsed path).
+
+**Resolution (implemented):** the AL hands *cumulative* paths to every AoS level
+(that is what `localAosName` relies on when it strips the parent prefix), so a
+path that runs through an open context necessarily **starts** with that context's
+path. `sanitize_path` now anchors the match at the head of the string
+(`remaining.compare(0, len, ctxPath)` + the next char must be `/` or end of
+string), and the matched block plus everything below it become ONE `&`-flattened
+name. With chain `A` → `A/B` and input `A/B/A/B/time`, the old code produced
+`A/B/A&B/time` (rfind stole the second `A/B`, then the parent `A` matched the
+first one and left `B` as a stray level); it now produces `A&B/A&B&time`.
+The pure string logic moved to `aos_path_helpers.h` (`sanitizeAosPath(ctx_paths,
+path)`); `sanitize_path` keeps only the `(ctx, path)` cache and the chain walk.
+New unit test `test_path_sanitization` covers the empty/`time` special cases,
+relative paths, absolute-through-context, shallower-ancestor anchoring, no
+partial-word match, and the repeated-segment regression.
+
+Verified: full suite **75/75** pass.
 
 ## 6. Lifetime coupling between caches and PanzerDB
 

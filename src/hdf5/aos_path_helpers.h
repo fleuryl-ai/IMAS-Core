@@ -57,4 +57,69 @@ inline void collectAosChain(Context* curr,
     }
 }
 
+/**
+ * @brief Normalises a (potentially partial) path so it can be matched against
+ *        the flat leaf paths of the PanzerDB index.
+ *
+ * The AL gives CUMULATIVE paths to every AoS level ("core_sources/source"), so a
+ * path that runs through an open context necessarily STARTS with that context's
+ * path; the part behind it is the (single, '&'-flattened) name stored under that
+ * AoS. Matching that context path anywhere else in the string (the old rfind)
+ * picked the wrong occurrence whenever a segment name was repeated further down
+ * the hierarchy (to_improve.md point 5).
+ *
+ * @param ctx_paths Open AoS chain paths, deepest context first ("" entries ignored).
+ * @param path Raw path (may be empty, "/", "time", "A/B", "a/b/F/g/data", ...).
+ * @return The normalised path ("" for empty input).
+ */
+inline std::string sanitizeAosPath(const std::vector<std::string>& ctx_paths,
+                                   const std::string& path) {
+    if (path.empty()) return "";
+    if (path == "/time") return "time";
+    if (path == "time") return path;
+
+    std::string remaining = path;
+    const bool has_leading_slash = (remaining[0] == '/');
+    if (has_leading_slash) remaining.erase(0, 1);
+
+    std::vector<std::string> segments; // pushed from the end to the start
+
+    for (const std::string& ctx_path : ctx_paths) {
+        const size_t len = ctx_path.size();
+        if (len == 0) continue;
+        const bool matched = (remaining.size() == len)
+                             || (remaining.size() > len && remaining[len] == '/'
+                                 && remaining.compare(0, len, ctx_path) == 0);
+        if (!matched) continue;
+
+        std::string suffix = remaining.substr(std::min(len + 1, remaining.size()));
+        std::replace(suffix.begin(), suffix.end(), '/', '&');
+        if (!suffix.empty()) segments.push_back(suffix);
+
+        std::string level = ctx_path;
+        std::replace(level.begin(), level.end(), '/', '&');
+        segments.push_back(level);
+
+        remaining.clear();
+        break;
+    }
+
+    // Levels not covered by the open AoS chain stay distinct '/'-separated levels
+    if (!remaining.empty()) {
+        size_t pos = 0;
+        while ((pos = remaining.rfind('/')) != std::string::npos) {
+            std::string part = remaining.substr(pos + 1);
+            if (!part.empty()) segments.push_back(part);
+            remaining = remaining.substr(0, pos);
+        }
+        if (!remaining.empty()) segments.push_back(remaining);
+    }
+
+    std::string result;
+    for (size_t i = segments.size(); i-- > 0;) result += "/" + segments[i];
+
+    if (!has_leading_slash && !result.empty()) result.erase(0, 1);
+    return result;
+}
+
 #endif

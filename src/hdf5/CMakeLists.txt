@@ -211,6 +211,7 @@ al_add_hdf5_test(test_h5read_overloads)
 # Path parser
 # --------------------------------------------------------------------------
 al_add_hdf5_test(test_path_parser_syntax)
+al_add_hdf5_test(test_path_sanitization)
 
 # Ajouter les outils HDF5
 add_subdirectory(tools)

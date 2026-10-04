@@ -570,10 +570,6 @@ public:
        return path_stream.str();
    }
 
-    void replaceSlashWithAmpersand(std::string& s) {
-        std::replace(s.begin(), s.end(), '/', '&');
-    }
-
  public:
 
     /**
@@ -582,113 +578,36 @@ public:
      *
      * Handles:
      *  - leading '/' (stripped);
-     *  - '/' -> '&' translation of the context blocks (e.g. "flux_loop/channel" stays
-     *    intact);
+     *  - '/' -> '&' flattening of the matched AoS block and of what hangs below it;
+     *  - the context path is matched as a HEAD anchor (AL paths are cumulative
+     *    from the IDS root), so a repeated segment name higher up the hierarchy
+     *    cannot steal the match any more (to_improve.md point 5);
      *  - caching keyed on (ctx, input path) so repeated reads are O(1).
      * @param ctx  The context against which the path is to be interpreted.
      * @param path The raw path (may be empty, "/", "time", "A/B", etc.).
      * @return The normalized path ("" for empty input).
      */
-     std::string sanitize_path(Context* ctx, const std::string& path) {
-        // We build the full path to apply the logic
-        std::string fullPath = path;
+      std::string sanitize_path(Context* ctx, const std::string& path) {
+         // 1. Check the cache
+         auto cache_key = std::make_pair(ctx, path);
+         auto cached = sanitized_path_cache.find(cache_key);
+         if (cached != sanitized_path_cache.end()) {
+             return cached->second;
+         }
 
-        if (fullPath.empty()) return "";
-        if (fullPath == "/time") return "time";
-        if (fullPath == "time") return fullPath;
+         // 2. Collect the open AoS chain paths (deepest context first)
+         std::vector<std::string> ctx_paths;
+         Context* current = ctx;
+         while (current != nullptr && current->getType() == CTX_ARRAYSTRUCT_TYPE) {
+             ctx_paths.push_back(static_cast<ArraystructContext*>(current)->getPath());
+             current = static_cast<ArraystructContext*>(current)->getParent();
+         }
 
-        // 1. Check the cache
-        auto cache_key = std::make_pair(ctx, path);
-        if (sanitized_path_cache.count(cache_key)) {
-            return sanitized_path_cache[cache_key];
-        }
+         // 3. Pure string normalisation (shared with the tests, aos_path_helpers.h)
+         std::string result = sanitizeAosPath(ctx_paths, path);
 
-        std::vector<std::string> segments;
-        std::string remaining = fullPath;
-        
-        // Remove the initial '/' if it exists to simplify splitting
-        bool hasLeadingSlash = (fullPath[0] == '/');
-        if (hasLeadingSlash) {
-            remaining.erase(0, 1);
-        }
-
-        Context* current = ctx;
-
-        // 1. Traverse contexts from deepest (F) to highest (A)
-        while (current != nullptr) {
-            std::string ctxPath;
-            if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                ctxPath = static_cast<ArraystructContext*>(current)->getPath();
-            } else {
-                // Stop if not ArraystructContext
-                break;
-            }
-            
-            if (!ctxPath.empty()) {
-                size_t pos = remaining.rfind(ctxPath);
-                
-                if (pos != std::string::npos) {
-                    // Check boundaries to ensure we matched a full path segment
-                    bool boundaryStart = (pos == 0 || remaining[pos - 1] == '/');
-                    bool boundaryEnd = (pos + ctxPath.length() == remaining.length() || remaining[pos + ctxPath.length()] == '/');
-
-                    if (boundaryStart && boundaryEnd) {
-                        // Extract the suffix (what comes AFTER the current context, e.g., "g/data")
-                        std::string suffix = remaining.substr(pos + ctxPath.length());
-                        if (!suffix.empty()) {
-                            if (suffix[0] == '/') suffix.erase(0, 1);
-                            replaceSlashWithAmpersand(suffix);
-                            segments.push_back(suffix);
-                        }
-
-                        // Transform the context block itself (e.g., "d/e/F" -> "d&e&F")
-                        replaceSlashWithAmpersand(ctxPath);
-                        segments.push_back(ctxPath);
-
-                        // Reduce the string for the next iteration
-                        remaining = remaining.substr(0, pos);
-                        if (!remaining.empty() && remaining.back() == '/') {
-                            remaining.pop_back();
-                        }
-                    }
-                }
-            }
-            
-            if (current->getType() == CTX_ARRAYSTRUCT_TYPE) {
-                current = static_cast<ArraystructContext*>(current)->getParent();
-            } else {
-                current = nullptr;
-            }
-        }
-
-        // 2. Process what remains at the beginning of the string (e.g., "A/B/a/C" if not covered by ctx)
-        // Split by '/' as these are normally distinct levels (Arrays/Structures)
-        if (!remaining.empty()) {
-            size_t pos = 0;
-            while ((pos = remaining.rfind('/')) != std::string::npos) {
-                std::string part = remaining.substr(pos + 1);
-                if (!part.empty()) segments.push_back(part);
-                remaining = remaining.substr(0, pos);
-            }
-            if (!remaining.empty()) {
-                segments.push_back(remaining);
-            }
-        }
-
-        // 3. Reconstruct the final string
-        std::string result = "";
-        // Iterate through the vector in reverse because we pushed from end to start
-        for (int i = segments.size() - 1; i >= 0; --i) {
-            result += "/" + segments[i];
-        }
-
-        // If the original string did not have a '/', remove the first one added
-        if (!hasLeadingSlash && !result.empty()) {
-            result.erase(0, 1);
-        }
-
-        sanitized_path_cache[cache_key] = result;
-        return result;
+         sanitized_path_cache[cache_key] = result;
+         return result;
     }
 
    protected: // This method is `protected` to be accessible by derived classes
