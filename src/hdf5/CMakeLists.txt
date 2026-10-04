@@ -74,6 +74,14 @@ macro(al_add_hdf5_test test_name)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
 
+# Measurement tool for the read-parameter study (NOT registered as a test)
+add_executable(bench_read ${EXE_FLAG} ${PROJECT_SOURCE_DIR}/tests/hdf5_backend/bench_read.cpp)
+target_include_directories(bench_read PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_read PRIVATE al z dl ${HDF5_LIBRARIES})
+if(NOT WIN32 AND NOT APPLE)
+    target_link_libraries(bench_read PRIVATE stdc++fs)
+endif()
+
 # --------------------------------------------------------------------------
 # Engine tests (PanzerDB API directly)
 # --------------------------------------------------------------------------

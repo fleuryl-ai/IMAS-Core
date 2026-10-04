@@ -59,6 +59,10 @@ constexpr size_t PATH_MAX_LEN = 256;
 // A string value longer than (STRING_MAX_LEN - 1) bytes is rejected at write time.
 constexpr size_t STRING_MAX_LEN = 512;
 
+// Process-wide chunking override (see setDefaultChunkingConfig).
+ChunkingConfig PanzerDB::s_default_chunk_config;
+bool PanzerDB::s_has_default_chunk_config = false;
+
 // PanzerDB constructor modification
 PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty)
     : preserve_empty_nodes(preserve_empty)
@@ -152,12 +156,13 @@ void PanzerDB::init(OpenMode mode) {
     }
 
     configureChunking(usage_hint);
+    if (s_has_default_chunk_config) chunk_config = s_default_chunk_config;
 
      // OPTIMIZATION: Create a DAPL (Dataset Access Property List) with a large cache
     // Applies to both creation (WRITE) and opening (APPEND/READ)
     hid_t dapl = H5Pcreate(H5P_DATASET_ACCESS);
     H5Pset_chunk_cache(dapl, chunk_config.chunk_cache_nslots, 
-                       chunk_config.chunk_cache_size, 0.75);
+                       chunk_config.chunk_cache_size, chunk_config.chunk_cache_w0);
 
     if (mode == OpenMode::WRITE) {
         // Delete existing datasets
@@ -391,7 +396,7 @@ void PanzerDB::configureReadCache() {
     if (H5Pset_chunk_cache(dapl, 
                            chunk_config.chunk_cache_nslots, 
                            chunk_config.chunk_cache_size, 
-                           0.75) < 0) {
+                           chunk_config.chunk_cache_w0) < 0) {
         std::cerr << "[PanzerDB] Warning: H5Pset_chunk_cache failed." << std::endl;
         H5Pclose(dapl);
         return;
@@ -576,6 +581,22 @@ void PanzerDB::setCompressionLevel(int level) {
 
 void PanzerDB::disableCompression() {
     chunk_config.enable_compression = false;
+}
+
+void PanzerDB::setDefaultChunkingConfig(const ChunkingConfig& cfg) {
+    s_default_chunk_config = cfg;
+    s_has_default_chunk_config = true;
+}
+
+void PanzerDB::clearDefaultChunkingConfig() {
+    s_has_default_chunk_config = false;
+}
+
+void PanzerDB::setReadCache(size_t nbytes, size_t nslots, double w0) {
+    chunk_config.chunk_cache_size = nbytes;
+    chunk_config.chunk_cache_nslots = nslots;
+    chunk_config.chunk_cache_w0 = w0;
+    if (mode == OpenMode::READ) configureReadCache();
 }
 
 

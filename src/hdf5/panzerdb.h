@@ -103,6 +103,7 @@ struct ChunkingConfig {
     // Cache settings (HDF5 metadata cache)
     size_t chunk_cache_size = 64 * 1024 * 1024;     // 64 MB
     size_t chunk_cache_nslots = 10007;               // Prime number for hash
+    double chunk_cache_w0 = 0.75;                    // Eviction granularity (0..1)
 };
 
 /**
@@ -401,6 +402,10 @@ private:
                                     const std::string& aos_path) const;
 
     ChunkingConfig chunk_config;
+    // Process-wide chunking override installed by setDefaultChunkingConfig();
+    // init() prefers it over the usage-hint defaults.
+    static ChunkingConfig s_default_chunk_config;
+    static bool s_has_default_chunk_config;
 
     /**
      * @brief Applies a chunking/compression configuration preset selected by a usage hint.
@@ -757,6 +762,31 @@ public:
       * every index consumer notices through leaf_cache_generation().
       */
     void invalidateLeafCache() const { leaves_cache_valid = false; }
+
+    /**
+      * @brief Overrides the usage-hint chunking for EVERY engine created afterwards.
+      *
+      * Needed to measure storage parameters (chunk sizes, compression, read cache):
+      * the chunking of a new file is decided inside the constructor, so an instance
+      * setter would arrive too late. init() uses this config instead of the hint
+      * when one is installed.
+      * @param cfg The chunking/caching configuration to use process-wide.
+      */
+    static void setDefaultChunkingConfig(const ChunkingConfig& cfg);
+
+    /**
+      * @brief Drops the process-wide chunking override (back to the usage hints).
+      */
+    static void clearDefaultChunkingConfig();
+
+    /**
+      * @brief Re-applies the leaf/chunk cache settings on an already open engine.
+      * @param nbytes Chunk cache size in bytes.
+      * @param nslots Number of cache slots (a prime larger than the chunk count).
+      * @param w0     Cache granularity factor (0..1); 1 keeps chunks on eviction.
+      */
+    void setReadCache(size_t nbytes, size_t nslots, double w0);
+
 
      /**
       * @brief Gets the effective size of an Array of Structures.

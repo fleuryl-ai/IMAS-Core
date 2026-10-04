@@ -255,3 +255,45 @@ O(N) index walk — tens of full walks per session on 10^5-leaf files.
   still grows (`emplace_back` reallocations would dangle stored pointers — that
   is exactly what a first `Leaf*` attempt exposed, via the SEGFAULT of
   `test_direct_api_validation`).
+
+## 13. Read-parameter study on `core_profiles_3.h5` — the O(slices²) time filter dominates
+
+Instrument (`tests/hdf5_backend/bench_read.cpp`, built but NOT a ctest test):
+`--engine` (index load + full leaf re-read per-leaf / union-grouped) and
+`--global` (real GLOBAL_OP walk through `HDF5Backend`, tree rebuilt from the
+index: 244,513 `readData` calls, 83.4 MB of raw doubles, content checksummed).
+
+File: 171,165 index rows (legacy 14 columns), 9.89M doubles in `data_raw_f64`
+(79 MB raw / 36.7 MB on disk, DEFLATE 1 + SHUFFLE), chunk 65536 elements;
+28 data paths, each stored as **8,150 per-slice leaves**.
+
+Measured (median of 3, AFS, warm / cold via `posix_fadvise(DONTNEED)`):
+
+| configuration | GLOBAL read | full leaf re-read (engine) |
+|---|---|---|
+| as-is, chunk 65536 + DEFLATE 1 | 3707 ms | 374 ms (+118 ms index/paths) |
+| chunk 16384 / 262144 / 1048576 (DEFLATE 1) | 1118 / 1202 / 1112 ms | 407 / 420 / 404 ms |
+| **no compression**, chunk 65536 | 934 ms (cold 1010) | 239 ms (file 81 MB, +110 %) |
+| **no compression**, chunk 262144 | 944 ms | 243 ms |
+| read chunk cache 1 / 8 / 64 / 128 / 256 / 512 MB, slots 211…10099, w0 0…1 | no effect | 361–402 ms (noise) |
+
+Conclusions:
+- **Chunk size and the HDF5 chunk cache are NOT the lever** for this access
+  pattern (each chunk is touched once by a full read; the cost is per-call
+  overhead + filter CPU). No default was changed for them.
+- **Compression** costs ~21 % of the GLOBAL read time for 2.1x the file size
+  (deflate level 1 is already the cheapest useful setting) → keep it.
+- The dominant cost was algorithmic: for a signal stored as N per-slice leaves,
+  every element read **linearly scanned the N candidates** of its path
+  (`path_cache` / `name_index` buckets) → O(N²) per full `get()`
+  (8,150² × 28 signal scans).
+
+**Resolution (implemented):** `ReadIndex` now stores its buckets **time-ordered**
+(`std::stable_sort` by `time_index` at build time) and exposes `equal_time()`,
+used by `read_dataset_globally` (specific path, generic path, name fallback) and
+`find_leaf_for_context`: the time filter became a binary search.
+Same content (identical checksum / element counts), **3707 ms → 1105 ms
+(−70 %)** on the GLOBAL walk; full suite 76/76.
+Measurement hooks added: `PanzerDB::setDefaultChunkingConfig()`,
+`PanzerDB::setReadCache()`, and the `IMAS_HDF5_FAPL` environment override in
+`HDF5Utils::openIDSFile` (unset ⇒ `H5P_DEFAULT`, unchanged production behaviour).

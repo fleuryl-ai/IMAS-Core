@@ -12,6 +12,48 @@ using namespace boost::filesystem;
 
 #define MASTER_FILE_NAME "master.h5" 
 
+/**
+ * @brief Optional File Access Property List taken from the environment.
+ *
+ * Read-parameter research hook: IMAS_HDF5_FAPL holds ';'-separated directives
+ *   cache=<nbytes>,<nslots>,<w0> ; align=<threshold>,<alignment> ;
+ *   meta=<bytes> ; sieve=<bytes>
+ * e.g. IMAS_HDF5_FAPL="cache=268435456,10091,0.75;align=4096,4194304".
+ * Unset (production default) => H5P_DEFAULT, i.e. nothing changes.
+ * @return A new FAPL, or H5P_DEFAULT when the variable is not set.
+ */
+static hid_t fapl_from_env() {
+    const char* spec = std::getenv("IMAS_HDF5_FAPL");
+    if (!spec || !*spec) return H5P_DEFAULT;
+
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    if (fapl < 0) return H5P_DEFAULT;
+
+    std::string s(spec);
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(';', pos);
+        std::string tok = s.substr(pos, (end == std::string::npos) ? std::string::npos : end - pos);
+        pos = (end == std::string::npos) ? s.size() : end + 1;
+        if (tok.compare(0, 6, "cache=") == 0) {
+            unsigned long long nbytes = 0, nslots = 0; double w0 = 0.75;
+            if (sscanf(tok.c_str() + 6, "%llu,%llu,%lf", &nbytes, &nslots, &w0) >= 2)
+                H5Pset_cache(fapl, 0, (int)nslots, (size_t)nbytes, (double)w0);
+        } else if (tok.compare(0, 6, "align=") == 0) {
+            hsize_t thr = 0, al = 0;
+            if (sscanf(tok.c_str() + 6, "%llu,%llu", (unsigned long long*)&thr, (unsigned long long*)&al) == 2)
+                H5Pset_alignment(fapl, thr, al);
+        } else if (tok.compare(0, 5, "meta=") == 0) {
+            hsize_t mb = 0;
+            if (sscanf(tok.c_str() + 5, "%llu", (unsigned long long*)&mb) == 1) H5Pset_meta_block_size(fapl, mb);
+        } else if (tok.compare(0, 6, "sieve=") == 0) {
+            size_t sb = 0;
+            if (sscanf(tok.c_str() + 6, "%zu", &sb) == 1) H5Pset_sieve_buf_size(fapl, (int)sb);
+        }
+    }
+    return fapl;
+}
+
 
 HDF5Utils::HDF5Utils()
 {
@@ -248,10 +290,11 @@ void HDF5Utils::createIDSFile(OperationContext * ctx, std::string &IDSpulseFile,
 void HDF5Utils::openIDSFile(OperationContext * ctx, std::string &IDSpulseFile, hid_t *IDS_file_id, bool try_read_only, std::string backend_version) {
     if (!exists(IDSpulseFile.c_str()))
 	    return;
-    *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    const hid_t fapl = fapl_from_env();
+    *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDWR, fapl);
     if (*IDS_file_id < 0) {
         if(try_read_only) {
-            *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+            *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDONLY, fapl);
             if (*IDS_file_id < 0) { 
                 char error_message[200];
                 sprintf(error_message, "Unable to open external file in Read-Only mode for IDS: %s. It might indicate that the file is being currently handled by a writing concurrent process.\n", ctx->getDataobjectName().c_str());
@@ -279,6 +322,7 @@ void HDF5Utils::openIDSFile(OperationContext * ctx, std::string &IDSpulseFile, h
 	        
         }
     }
+    if (fapl != H5P_DEFAULT) H5Pclose(fapl);
 }
 
 void HDF5Utils::openMasterFile(hid_t *file_id, const std::string &filePath, bool for_deletion) { //open master file

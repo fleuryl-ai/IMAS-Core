@@ -117,6 +117,16 @@ public:
             name_index[key].push_back(&leaf);
         }
 
+        // Time-ordered buckets: reading one AoS element of a dynamic signal used
+        // to linearly scan every slice of that signal (8k slices -> 8k candidates
+        // per element read = O(slices^2) for a full get()). Sorting the buckets
+        // lets the time filter binary-search instead (to_improve.md point 13).
+        const auto by_time = [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
+            return a->time_index < b->time_index;
+        };
+        for (auto& [path, bucket] : path_cache) std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        for (auto& [name, bucket] : name_index) std::stable_sort(bucket.begin(), bucket.end(), by_time);
+
         DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths, "
                   << name_index.size() << " dataset names.");
     }
@@ -149,6 +159,21 @@ public:
     const std::vector<const PanzerDB::Leaf*>* find_path(std::string_view path) const {
         const auto it = path_cache.find(path);
         return (it == path_cache.end()) ? nullptr : &it->second;
+    }
+
+    /**
+     * @brief Range of the leaves of `bucket` holding a given time_index.
+     * Buckets are time-ordered (build_indexes), so this is a binary search
+     * instead of a linear scan over every slice of the signal.
+     */
+    using TimeRange = std::pair<std::vector<const PanzerDB::Leaf*>::const_iterator,
+                                std::vector<const PanzerDB::Leaf*>::const_iterator>;
+    static TimeRange equal_time(const std::vector<const PanzerDB::Leaf*>& bucket, uint64_t time_index) {
+        const auto lo = std::lower_bound(bucket.begin(), bucket.end(), time_index,
+                                         [](const PanzerDB::Leaf* l, uint64_t t) { return l->time_index < t; });
+        const auto hi = std::upper_bound(lo, bucket.end(), time_index,
+                                         [](uint64_t t, const PanzerDB::Leaf* l) { return t < l->time_index; });
+        return {lo, hi};
     }
 
     /**
@@ -498,9 +523,13 @@ public:
 
     // --- OPTIMIZED PASS 1: Search via Hash Map (O(1)) ---
     if (const auto* candidates = read_index_ptr->find_path(strict_target_path)) {
-        for (const auto* leaf : *candidates) {
+        const ReadIndex::TimeRange scan = (target_time == -1)
+            ? ReadIndex::TimeRange{candidates->begin(), candidates->end()}
+            : ReadIndex::equal_time(*candidates, static_cast<uint64_t>(target_time));
+        for (auto it = scan.first; it != scan.second; ++it) {
+            const auto* leaf = *it;
             DEBUG_PRINT("  -> Candidate from cache: " << leaf->path << " (time_index: " << leaf->time_index << ")");
-            if (target_time == -1 || leaf->time_index == static_cast<uint64_t>(target_time)) {
+            {
                 return leaf;
             }
         }
@@ -828,11 +857,8 @@ public:
             // even for a specific path. This handles cases where multiple time
             // slices might be associated with the same path string in the cache.
             if (target_time_index != -1) {
-                for (const auto* leaf : *specific_leaves) {
-                    if (leaf->time_index == static_cast<uint64_t>(target_time_index)) {
-                        sorted_leaves.push_back(leaf);
-                    }
-                }
+                const auto range = ReadIndex::equal_time(*specific_leaves, static_cast<uint64_t>(target_time_index));
+                sorted_leaves.assign(range.first, range.second);
             } else {
                 sorted_leaves = *specific_leaves;
             }
@@ -857,11 +883,8 @@ public:
                 DEBUG_PRINT("Found generic path: " << generic_path);
                 // Filter by time index if we are in a dynamic context
                 if (target_time_index != -1) {
-                    for (const auto* leaf : *generic_leaves) {
-                        if (leaf->time_index == static_cast<uint64_t>(target_time_index)) {
-                            sorted_leaves.push_back(leaf);
-                        }
-                    }
+                    const auto range = ReadIndex::equal_time(*generic_leaves, static_cast<uint64_t>(target_time_index));
+                    sorted_leaves.assign(range.first, range.second);
                 } else {
                     sorted_leaves = *generic_leaves;
                 }
@@ -877,8 +900,13 @@ public:
             // by '/')" == "last segment == name", because clean_ds_name has no '/' (it has
             // had '/' replaced by '&'). Same candidate set, O(1) instead of O(N).
             if (const auto* by_name = read_index_ptr->find_name(clean_ds_name)) {
-                for (const auto* leaf : *by_name) {
-                    if (target_time_index != -1 && leaf->time_index != static_cast<uint64_t>(target_time_index)) continue;
+                // Same candidate set as the old full scan, but the time filter is a
+                // binary search on the time-ordered bucket when a time is requested.
+                const ReadIndex::TimeRange range = (target_time_index == -1)
+                    ? ReadIndex::TimeRange{by_name->begin(), by_name->end()}
+                    : ReadIndex::equal_time(*by_name, static_cast<uint64_t>(target_time_index));
+                for (auto it = range.first; it != range.second; ++it) {
+                    const auto* leaf = *it;
 
                     // Check if path starts with context prefix (if any)
                     if (!context_prefix.empty()) {
