@@ -670,7 +670,9 @@ std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_ve
 void PanzerDB::restoreTimeContext() {
     if (mode != OpenMode::APPEND && mode != OpenMode::READ) return;
 
-    auto leaves = getLeaves();
+    // const& on purpose: this table is the cached index (one Leaf per /index row,
+    // each with its own shape vector); copying it per APPEND/READ open was O(N).
+    const auto& leaves = getLeaves();
     
     // 1. Initialize counters for explicit Dynamic AoS
     for (const auto& leaf : leaves) {
@@ -1272,6 +1274,10 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     }
 
     // Cache is invalid, rebuild it directly in class member.
+    // The generation is bumped HERE (not at invalidation): this is the exact point
+    // where the Leaf objects and the path text blocks die, so every consumer holding
+    // Leaf*/string_view into them sees the change and rebuilds its own caches first.
+    ++leaf_cache_gen;
     cached_leaves.clear();
     leaf_lookup.clear();
     parent_lookup.clear();

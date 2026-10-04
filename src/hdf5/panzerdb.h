@@ -187,7 +187,9 @@ public:
      * Notes:
      * - `path` / `parent_path` are zero-copy views into the internal path storage
      *   (the cached_paths_blocks). They are valid only while the leaf cache lives;
-     *   copy them out if you need to keep them longer.
+     *   copy them out if you need to keep them longer. The cache dies at the next
+     *   getLeaves() rebuild, which bumps leaf_cache_generation() so index
+     *   consumers can detect it instead of dereferencing stale views.
      * - The low 4 bits of `flags` encode the node role, the upper bits encode the
      *   stored data type (see DataType). Typical values in production:
      *   flags = 0        : normal data node (double)
@@ -351,6 +353,10 @@ private:
     // Cache for reading
     mutable std::vector<Leaf> cached_leaves;
     mutable bool leaves_cache_valid = false;
+    // Bumped by getLeaves() right where the previous cache content is destroyed:
+    // index consumers (ReadIndex) compare it to know their Leaf*/string_view
+    // caches went stale instead of dereferencing them (to_improve.md point 6).
+    mutable uint64_t leaf_cache_gen = 0;
 
     mutable std::list<std::vector<char>> cached_paths_blocks;
     mutable std::list<std::vector<char>> cached_parent_paths_blocks;
@@ -732,6 +738,25 @@ public:
     * @return A constant reference to the cached vector of leaves.
     */
     const std::vector<Leaf>& getLeaves() const;
+
+    /**
+      * @brief Version of the cached leaf table (see getLeaves()).
+      *
+      * Bumped exactly where the previous content dies (the clear() at the start of a
+      * getLeaves() rebuild), i.e. at the moment every externally held Leaf pointer or
+      * path string_view becomes dangling. Consumers that cache leaves or paths
+      (the read strategies' ReadIndex) stamp this value and compare it before
+      using their caches; a change means "rebuild your caches first" (SWMR).
+      * @return The current cache generation.
+      */
+    uint64_t leaf_cache_generation() const { return leaf_cache_gen; }
+
+    /**
+      * @brief Drops the cached leaf table so the next getLeaves() re-reads /index.
+      * The point is the SWMR refresh: refresh the file image, invalidate here, and
+      * every index consumer notices through leaf_cache_generation().
+      */
+    void invalidateLeafCache() const { leaves_cache_valid = false; }
 
      /**
       * @brief Gets the effective size of an Array of Structures.

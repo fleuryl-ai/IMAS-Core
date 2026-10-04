@@ -116,6 +116,7 @@ target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 # getAOSShape + stripIndices). Default CTest mode is `verify`; `capture`
 # regenerates the committed oracle. See tests/hdf5_backend/test_index_golden.cpp.
 al_add_hdf5_test(test_index_golden)
+al_add_hdf5_test(test_index_lifetime_guard)
 target_compile_definitions(test_index_golden PRIVATE
     PZGOLD_GOLDEN_DIR="${PROJECT_SOURCE_DIR}/tests/hdf5_backend/fixtures/goldens")
 target_include_directories(test_index_golden PRIVATE ${PROJECT_SOURCE_DIR}/include)

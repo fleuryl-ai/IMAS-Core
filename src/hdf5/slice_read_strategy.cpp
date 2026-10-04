@@ -7,6 +7,7 @@ SliceReadStrategy::SliceReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std::s
     : IReadStrategy(std::move(panzer_db), std::move(read_index)) {}
 
 void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
+    refresh_index_if_needed();
     OperationContext* opCtx = ctx->getOperationContext();
 
     // Find the closest dynamic parent to identify the correct time base
@@ -80,7 +81,8 @@ void SliceReadStrategy::endAction(Context *ctx) {
 
 int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
                                     int *datatype, void **data, int *dim, int *size) {
-    
+    refresh_index_if_needed();
+
     int homogeneous_time = getHomogeneousTime();
     
      if (timebasename.empty() && !isTimedContext(ctx)) {                              

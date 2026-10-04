@@ -120,7 +120,7 @@ partial-word match, and the repeated-segment regression.
 
 Verified: full suite **75/75** pass.
 
-## 6. Lifetime coupling between caches and PanzerDB
+## 6. Lifetime coupling between caches and PanzerDB — RESOLVED (generation-checked)
 
 `path_cache`, `name_index`, `leaf_lookup` store `const PanzerDB::Leaf*` and
 `std::string_view` pointing into PanzerDB's internal storage
@@ -131,6 +131,37 @@ future refresh of `getLeaves()` would leave dangling views in the strategies.
 **Improvement:** make the invalidation contract explicit (assert
 `leaves_cache_valid` at strategy use, or have `getLeaves()` rebuild
 the strategy caches at the same time).
+
+**Resolution (implemented, SWMR-ready):** the contract is now *checked*, and an
+index that moves is followed instead of being assumed frozen.
+- `PanzerDB::leaf_cache_generation()`: a counter bumped **exactly where the old
+  content dies** (the `cached_leaves.clear()` at the top of a `getLeaves()`
+  rebuild). Note that `flush()` only sets `leaves_cache_valid=false`: it does NOT
+  free anything, so leaves held by readers stay usable across a commit — the
+  generation deliberately does not move there.
+- `PanzerDB::invalidateLeafCache()` (public): the SWMR refresh hook — refresh the
+  file image, invalidate here, and every consumer notices through the generation.
+- `ReadIndex` stamps `built_generation` at build; `is_current()` /
+  `ensure_current()` compare it and rebuild the maps only when the engine really
+  moved (one `uint64` compare when nothing changed). `path_cache`/`name_index`
+  became private behind `find_path()` / `find_name()`, so no strategy can hold a
+  raw map iterator.
+- `IReadStrategy::refresh_index_if_needed()` is called at OPERATION ENTRY
+  (`read_ND_Data` + `beginReadArraystructAction` of the three strategies,
+  `getTimeValues`, `find_leaf_for_context`, `read_dataset_globally`). Never in the
+  middle: the `Leaf*` gathered during an operation (`time_leaves_map`,
+  `sorted_leaves`) then stay usable until that operation ends. When a rebuild did
+  happen, the values derived from the old leaves are dropped too
+  (`time_values_cache`, `homogeneous_time_cache`).
+- Dead code of the same pass removed: `schema_aos_paths` +
+  `build_aos_schema_index()` were never read anywhere (they costed an O(N)
+  `stringstream` walk per session open). Drive-by perf: `restoreTimeContext()`
+  copied the whole leaf table (`auto leaves = getLeaves()`) — now `const auto&`.
+
+Verified by `test_index_lifetime_guard`: an index built over an APPEND engine
+survives a `flush()` (same generation, old `Leaf*` still usable), then a leaf-cache
+rebuild bumps the generation, `is_current()` goes false and `ensure_current()`
+re-synchronises it (the new slice becomes visible). Full suite: **76/76** pass.
 
 ## 7. Raw memory management at the AL boundary — PARTIALLY RESOLVED (iread_strategy helpers)
 

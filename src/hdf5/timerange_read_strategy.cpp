@@ -5,6 +5,7 @@ TimeRangeReadStrategy::TimeRangeReadStrategy(std::shared_ptr<PanzerDB> panzer_db
     : IReadStrategy(std::move(panzer_db), std::move(read_index)) {}
 
 void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
+    refresh_index_if_needed();
 
     int homogeneous_time = getHomogeneousTime();
     time_basis_vector = getTimeValues(ctx, homogeneous_time);
@@ -77,6 +78,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
                                         int *datatype, void **data, int *dim, int *size) {
 
     DEBUG_PRINT("--> Entering read_ND_Data for dataset: " << dataset_name);
+    refresh_index_if_needed();
 
     OperationContext *opctx = nullptr;
     if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {

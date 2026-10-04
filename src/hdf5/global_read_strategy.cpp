@@ -24,6 +24,7 @@ GlobalReadStrategy::GlobalReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std:
 
 
 void GlobalReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
+    refresh_index_if_needed();
 
     std::string aos_path_token = getPath(ctx, false);
     DEBUG_PRINT("Preparing AOS for path: " << aos_path_token);
