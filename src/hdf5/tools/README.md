@@ -85,6 +85,19 @@ count, parent), and both the current 12-column layout and the legacy
 Unlike the other two tools, it is a plain Python script (h5py only): no C++
 API, no build step.
 
+Two derived views help with time series:
+- **`slices` column** = number of time slices of the signal. The time
+  dimension is stored *outside* the leaf shape (by design, see
+  `writeDataSlicesImpl` in `panzerdb.cpp`): in the "bulk" layout one row's
+  `count = n_slices × shape`, in the legacy "per-slice" layout the row is
+  repeated once per slice. The column reports `rows(path) × count/shape`,
+  and `-` for static data.
+- **`timebase(s)` header line** = the F64 dataset(s) named `time` in the
+  group (convention used by the AL/tests: root `time`, or `<aos-dyn>/time`).
+  Note the signal→timebase association is **not persisted** in the table:
+  the `t` column is the write's *start* time index, and the reader resolves
+  the timebase from the dictionary path.
+
 #### Usage
 ```bash
 env/bin/python3 src/hdf5/tools/panzer_index.py <fichier.h5> [options]

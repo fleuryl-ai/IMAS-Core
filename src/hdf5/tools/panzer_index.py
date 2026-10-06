@@ -105,6 +105,15 @@ def dump_group(name, group, args):
     rows = idx[:]  # ndarray (n_rows, ncols), uint64
     paths = read_paths(group, n_rows)
 
+    # Nombre de lignes par path : le layout « per-slice » (legacy) écrit UNE LIGNE
+    # PAR SLICE (la colonne t reste 0, le temps c'est l'ordre des lignes),
+    # le layout « bulk » (nouveau) met toutes les slices dans count d'une ligne.
+    # slices_total = nb_lignes(path) × (count // prod(shape)).
+    path_counts = {}
+    for i in range(n_rows):
+        if int(rows[i][cm["flags"]] & 0xF) == 0:  # data rows only
+            path_counts[paths[i]] = path_counts.get(paths[i], 0) + 1
+
     kind_counts = {}
     selected = []
     for i in range(n_rows):
@@ -132,6 +141,21 @@ def dump_group(name, group, args):
         "{}={}".format(KIND_NAMES.get(k, "k{}".format(k)), c)
         for k, c in sorted(kind_counts.items()))
     lines.append("lignes : {}   kinds : {}".format(n_rows, kinds_str if kinds_str else "-"))
+    # Timebase = dataset nommé exactement « time » (convention des tests / AL) :
+    # racine du groupe (time series standalone) ou <aos-dyn>/time (AoS dynamique).
+    # NB : l'association signal→timebase n'est PAS persistée dans la table
+    # (le « t » d'une ligne est l'index temporel de DÉBUT de la write) ;
+    # le lecteur la résout par le chemin du dictionnaire.
+    tb = []
+    for i in range(n_rows):
+        row = rows[i]
+        path = paths[i]
+        if (int(row[cm["flags"]] & 0xF) == 0
+                and int(row[cm["flags"]] >> 4) == 0  # F64
+                and (path == "time" or path.rsplit("/", 1)[-1] == "time")):
+            tb.append("{} (row {}, {} pts)".format(path, i, int(row[cm["cnt"]])))
+    if tb:
+        lines.append("timebase(s) : " + "  ".join(tb))
     extents = ["{}={}".format(d, group[d].shape[0]) for d in RAW_DATASETS if d in group]
     if "list_spans" in group:
         extents.append("list_spans={} entrées".format(group["list_spans"].shape[0] // 4))
@@ -160,12 +184,27 @@ def dump_group(name, group, args):
             parent = "-" if parent_id == NO_PARENT else str(parent_id)
         else:
             parent = "-" if parent_id == NO_PARENT else parent_path_of(path, kind) or "-"
+        # slices = nb_lignes(même path) × (count / prod(shape)) :
+        #   - layout « bulk » : 1 ligne, count = slice_size × n_slices (writeDataSlicesImpl) ;
+        #   - layout « per-slice » (legacy) : une ligne par slice, count = slice_size.
+        # La dim. temps est toujours hors du shape. Numériques seulement (les slots de
+        # chaînes ne sont pas des slices temporelles).
+        slices = "-"
+        if kind == 0 and dtype in (0, 1, 2):
+            slice_size = 1  # ndim=0 -> slice_size=1 ; un scalaire statique a toujours count=1
+            for j in range(ndim):
+                slice_size *= int(row[cm["shape"] + j])
+            cnt = int(row[cm["cnt"]])
+            if slice_size and cnt % slice_size == 0:
+                total = path_counts.get(path, 1) * (cnt // slice_size)
+                if total > 1:
+                    slices = str(total)
         table.append((
             str(i), path, KIND_NAMES.get(kind, "k{}".format(kind)), type_s,
-            str(ndim), shape, str(int(row[cm["time"]])),
+            str(ndim), shape, str(int(row[cm["time"]])), slices,
             str(int(row[cm["off"]])), str(int(row[cm["cnt"]])), parent))
 
-    headers = ("row", "path", "kind", "type", "ndim", "shape", "t", "off", "count", "parent")
+    headers = ("row", "path", "kind", "type", "ndim", "shape", "t", "slices", "off", "count", "parent")
     widths = [max(len(h), max(len(r[j]) for r in table)) for j, h in enumerate(headers)]
 
     def fmt(cells):
