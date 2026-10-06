@@ -3242,8 +3242,20 @@ int PanzerDB::readIntDataByIndex(
         if (matches.size() == 1) {
             const Leaf& leaf = *matches[0];
             this->readTensor(leaf, *data_out);
-            *ndim_out = leaf.shape.size();
+            // Bulk-written time series in ONE leaf (count = n_slices * prod(shape))
+            // re-append the time dimension: same rule as the FLOAT64
+            // readDataByIndex single-leaf branch (before, the int variant lost
+            // it, so a scalar int series read as 0D).
+            size_t slice_vol = 1;
+            for (auto s : leaf.shape) if (s > 0) slice_vol *= s;
+            if (leaf.count > slice_vol) {
+                *ndim_out = leaf.shape.size() + 1;
+                for (size_t i = 0; i + 1 < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                shape_out[*ndim_out - 1] = leaf.count / slice_vol;
+            } else {
+                *ndim_out = leaf.shape.size();
              for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+            }
             return 0;
         }
 

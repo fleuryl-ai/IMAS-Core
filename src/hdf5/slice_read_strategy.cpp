@@ -75,11 +75,11 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
 
     int homogeneous_time = getHomogeneousTime();
     
-     if (timebasename.empty() && !isTimedContext(ctx)) {                              
-        int status = read_dataset_globally(ctx, dataset_name, datatype, data, dim, size);
+     if (timebasename.empty() && !isTimedContext(ctx)) {
+        int status = read_dataset_globally(ctx, dataset_name, datatype, data, dim, size, timebasename);
         // If data is static, we read it globally and we are done.
-        return status;  
-     }                                  
+        return status;
+     }
 
     std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
 

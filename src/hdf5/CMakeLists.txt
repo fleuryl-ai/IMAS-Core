@@ -105,6 +105,9 @@ al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
 # onto the timebase's last written index (see hasFileData gating in panzerdb.cpp).
 al_add_hdf5_test(test_engine_write_bulk_time_slice_signal)
 al_add_hdf5_test(test_engine_append_complex)
+# readIntDataByIndex single-leaf branch: report the time dimension for a bulk
+# leaf (count = n_slices * shape), same rule as readDataByIndex (FLOAT64).
+al_add_hdf5_test(test_engine_readint_by_index_bulk)
 
 # --- SWMR: fixed-width data_raw_str boundary + writer/reader smoke --------
 # `test_swmr_string_fixed_width` forks a separate reader process (a real shared-FS
@@ -187,6 +190,9 @@ al_add_hdf5_test(test_al_root_1d_dynamic_append)
 
 # slice operators
 al_add_hdf5_test(test_al_slice_op_code_output)
+# Global read of a 1-slice scalar time series must stay 1D(1) (AL convention,
+# to_improve.md point 3); static scalars must remain 0D.
+al_add_hdf5_test(test_al_global_code_output_1slice)
 
 # time-range operator
 al_add_hdf5_test(test_al_timerange_basic)

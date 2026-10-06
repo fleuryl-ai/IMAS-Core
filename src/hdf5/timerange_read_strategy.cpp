@@ -152,7 +152,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
     if (dynamic_index == -1 && !is_dynamic)
     {
-        int status = read_dataset_globally(ctx, dataset_name, datatype, data, dim, size);
+        int status = read_dataset_globally(ctx, dataset_name, datatype, data, dim, size, timebasename);
         // If data is static, we read it globally and we are done.
         return status;
     }
@@ -289,7 +289,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
             int full_dim = 0;
             int full_size[6] = {0};
             
-            int status = read_dataset_globally(ctx, dataset_name, datatype, &full_data, &full_dim, full_size);
+            int status = read_dataset_globally(ctx, dataset_name, datatype, &full_data, &full_dim, full_size, timebasename);
             DEBUG_PRINT("read_dataset_globally status: " << status << ", full_dim: " << full_dim << ", full_size[0]: " << (full_dim > 0 ? full_size[0] : -1));
             if (status == 0 || full_data == nullptr) return 0;
 

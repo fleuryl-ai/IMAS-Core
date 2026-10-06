@@ -51,5 +51,5 @@ int GlobalReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, st
                                      int *datatype, void **data, int *dim, int *size) {
 
     // Use the common method defined in IReadStrategy
-    return read_dataset_globally(ctx, dataset_name, datatype, data, dim, size);
+    return read_dataset_globally(ctx, dataset_name, datatype, data, dim, size, timebasename);
 }

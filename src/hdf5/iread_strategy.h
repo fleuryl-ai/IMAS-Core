@@ -897,9 +897,13 @@ public:
      * @param data Output pointer for data buffer.
      * @param dim Output pointer for dimensions count.
      * @param size Output pointer for dimensions sizes.
+     * @param timebasename The timebase argument supplied by the AL for this read
+     *        (empty for purely static nodes); drives the rank-0 scalar
+     *        promotion rule (see the numeric section below).
      * @return 1 on success, 0 on failure.
      */
-    int read_dataset_globally(Context *ctx, std::string &dataset_name, int* datatype, void **data, int *dim, int *size) {
+    int read_dataset_globally(Context *ctx, std::string &dataset_name, int* datatype, void **data, int *dim, int *size,
+                              std::string_view timebasename = "") {
         DEBUG_PRINT("--> Entering read_dataset_globally for dataset: " << dataset_name);
 
         int type = ctx->getType();
@@ -908,6 +912,14 @@ public:
             throw ALBackendException("PanzerDB not initialized", LOG);
         }
         refresh_index_if_needed();
+
+        // `*dim` arrives holding the caller's EXPECTED dimension (the AL layer
+        // initialises retDim to the dictionary dim before calling the backend).
+        // Capture it before any branch below overwrites it: it is the only
+        // context-independent way to tell a 1-point scalar time series apart
+        // from a genuine 0D scalar on disk (both are stored as shape=[],
+        // count=1 — indistinguishable to the engine alone).
+        const int expected_dim = dim ? *dim : 0;
 
         // ✅ OPTIMIZATION: Use the context path cache
         std::string context_prefix;
@@ -1195,12 +1207,26 @@ public:
 
         // 4. NUMERICAL Processing
         if (leaf_rank == 0) {
-            // 0D signal (scalar) -> becomes 1D with time dimension
-            if (total_elements > 1) { 
-                *dim = 1; 
-                size[0] = (int)total_elements; 
-            } else { 
-                *dim = 0; 
+            // 0D signal (scalar) -> becomes 1D with the time dimension.
+            // A 1-point scalar time series is stored identically to a genuine
+            // 0D scalar (shape=[], count=1), so the engine cannot tell them
+            // apart. Disambiguate with the caller's intent: promote that
+            // single slice to 1D(1) when the node reads as time-dependent
+            // (same rule as the slice path, shouldPromoteTimeScalarOnSlice)
+            // OR the AL layer expects a 1D result (the dictionary says e.g.
+            // code/output_flag is INT_1D over time). Without this the read
+            // degrades to a 0D scalar and AL raised "expected int in 1D but
+            // got int in 0D".
+            const bool want_1d = (expected_dim == 1) ||
+                shouldPromoteTimeScalarOnSlice(ctx, timebasename, actual_datatype);
+            if (total_elements > 1) {
+                *dim = 1;
+                size[0] = (int)total_elements;
+            } else if (total_elements == 1 && want_1d) {
+                *dim = 1;
+                size[0] = 1;
+            } else {
+                *dim = 0;
                 // size[0] = 1; // Implicit for a scalar
             }
         } else {
