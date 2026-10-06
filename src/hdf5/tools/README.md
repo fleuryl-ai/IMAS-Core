@@ -74,6 +74,43 @@ imas_h5dump my_ids_file "core_profiles/profiles_1d[10]/grid/rho_tor_norm"
 
 ---
 
+### panzer_index User Guide
+
+`panzer_index` prints the **raw PanzerDB v2 index table** — the physical
+`index` (2D uint64) and `paths` datasets that `imas_h5ls`/`imas_h5dump` are
+built on. Each row is decoded (kind, data type, ndim, shape, time, offset,
+count, parent), and both the current 12-column layout and the legacy
+14-column one are supported, exactly like `PanzerDB::getLeaves()`.
+
+Unlike the other two tools, it is a plain Python script (h5py only): no C++
+API, no build step.
+
+#### Usage
+```bash
+env/bin/python3 src/hdf5/tools/panzer_index.py <fichier.h5> [options]
+```
+
+#### Options
+- `--limit N`: print only the first N selected rows
+- `--match MOTIF`: keep rows whose path contains MOTIF
+- `--kinds data,empty,aos-static,aos-dyn`: keep only these node kinds
+- `--raw`: undecoded raw columns (tab-separated), no header — handy to cross-check against `h5dump`
+- `--no-parent`: print the numeric `parent_id` instead of the resolved parent path
+
+#### Examples
+```bash
+# Full table of a small file
+env/bin/python3 src/hdf5/tools/panzer_index.py magnetics_THIN.h5
+
+# First 20 rows of a large file
+env/bin/python3 src/hdf5/tools/panzer_index.py core_profiles_3.h5 --limit 20
+
+# Only AoS meta-nodes
+env/bin/python3 src/hdf5/tools/panzer_index.py core_profiles_3.h5 --kinds aos-static,aos-dyn --limit 20
+```
+
+---
+
 ## Technical Note: Logical vs. Physical Structure
 
 `PanzerDB` stores data in a flattened HDF5 format to optimize high-performance I/O for slices. If you use the standard `h5ls` on an IMAS file, you will see a large list of numbered datasets. 
