@@ -91,6 +91,8 @@ Then use IMAS-Core from your preferred language:
 - **[Configuration](docs/source/user_guide/configuration.rst)** - Configuration options
 - **[FAQ](docs/source/faq.rst)** - Frequently asked questions
 - **[Troubleshooting](docs/source/troubleshooting.rst)** - Common issues & solutions
+- **[HDF5 Backend v2 Developer Guide, v2.1](developer_guide_v2.1.md)** - Backend v2 architecture (AL ↔ PanzerDB, read strategies, on-disk format)
+- **[PanzerDB Engine Guide, v1](developer_guide_v2.md)** - Storage-engine API reference (superseded overall by the v2.1 guide)
 
 ## System Requirements
 

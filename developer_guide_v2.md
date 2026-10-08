@@ -1,7 +1,8 @@
 # `imas` HDF5 Backend — PanzerDB Developer Guide
 
-**Version:** v1 (guide)
-**Status:** Reference for IMAS-Core HDF5 backend (reader/writer), C++
+**Version:** v1 (guide) — engine reference
+**Status:** Reference for the IMAS-Core HDF5 **engine** (`PanzerDB`, reader/writer API), C++.
+**Superseded for the backend as a whole by:** [`developer_guide_v2.1.md`](developer_guide_v2.1.md) — the current v2.1 guide covers the *backend v2 layer* (AL ↔ engine: `HDF5Reader_v2` / `HDF5Writer_v2`, read strategies, `ReadIndex`) and the on-disk changes since this guide: the `/index` is now **12 columns** (not 14 — Appendix A kept below describes the legacy layout, still readable), `Leaf` gained `row_id`, strings use `STRING_CHUNKED` + a `list_spans` span table, and read sessions share one engine + one index. Where this guide says "N × 14", read "N × 12 for current files, N × 14 for legacy ones".
 **Target reader:** Scientist or engineer with a physics background and general C++/HDF5/C familiarity. No prior knowledge of this code base is assumed.
 
 ---
@@ -95,14 +96,24 @@ That single decision buys, for free:
 
 ### 2.2 On-disk layout (what a PanzerDB file always looks like)
 
+> **v2.1 note:** current files use a **12-column** `/index` (`PANZER_INDEX_COLUMNS`,
+> `panzerdb.h:144`) — the never-read leading `type` and trailing `index_value` columns
+> were dropped. `getLeaves()` detects the stride from the dataset extent and reads both
+> layouts; APPEND keeps a legacy file on its own 14-column layout. See
+> `developer_guide_v2.1.md` §2 for the current column map, and Appendix A below for the
+> legacy 14-column detail.
+
 ```
 <instance group or file root>
-├── index            : N × 14 × uint64        (N = number of "leaves")
+├── index            : N × 12 × uint64        (N = number of "leaves"; legacy files: N × 14)
 ├── paths            : N × 256B (fixed C1)     (N = same N)
 ├── data_raw_f64     : 1-D float64, chunked
 ├── data_raw_i32     : 1-D int32,  chunked
 ├── data_raw_c128    : 1-D (8B × 2), chunked   (complex128)
-└── data_raw_str     : 1-D variable-length UTF-8, chunked
+├── data_raw_str     : 1-D FIXED 512B slots (STRING_MAX_LEN), chunked  — SWMR-safe,
+│                      scalars >511B use STRING_CHUNKED rows (slot concatenation)
+└── list_spans       : optional 1-D uint64 (4 u64/entry) — per-element spans of
+                       list elements wider than one slot (see v2.1 guide §5)
 ```
 
 Verified on the working example file (23 leaves) of §7:
@@ -141,7 +152,12 @@ struct Leaf {
 };
 ```
 
-The **row-14 × uint64 encoding** of a leaf in `index` is an implementation detail you can inspect in Appendix A.
+> **v2.1 note:** the current `Leaf` (see `panzerdb.h:202`) additionally carries `row_id`
+> (position in `/index`, used as key of the string span table), and `path`/`parent_path`
+> views are only valid until the next leaf-cache rebuild — detectable through
+> `PanzerDB::leaf_cache_generation()` (see `developer_guide_v2.1.md` §2.5 / §4.2).
+
+The **row-14 × uint64 encoding** of a leaf in `index` is an implementation detail you can inspect in Appendix A (current files: 12 columns; the two dropped columns were never read back).
 
 ### 2.4 The two kinds of AoS — the single most important concept
 
@@ -1606,6 +1622,11 @@ All three are **independent** enumerations — do not `static_cast` between them
 
 ## Appendix A — The M1 on-disk layout (the 14-column index)
 
+> **v2.1 note:** the *current* layout is **12 columns** — columns `[0]` (`type`) and
+> `[13]` (`index_value`) of the table below were never read back and are no longer
+> written; `parent_id` now sits at column `[11]`. `getLeaves()` maps both layouts from
+> the dataset extent. Current column map: `developer_guide_v2.1.md` §2.2.
+
 This is the part of the design that is *not* visible through the API, but it is what makes every read O(1) and what a writer can rely on when reasoning about gaps. The two authoritative sources are the column convention recorded in `new_example_check_index_design.md` §3, and the `index_buffer` / `Leaf` documentation in `src/hdf5/panzerdb.h`.
 
 ### A.1 Top-level datasets
@@ -1969,6 +1990,8 @@ target_link_libraries(my_reader PRIVATE al HDF5::HDF5)
 ---
 
 ## Change log
+
+* v2.1 (2026-10-07) — this guide is superseded, *as the backend reference*, by `developer_guide_v2.1.md` (new file): backend v2 layer (factory, `HDF5Reader_v2`/`HDF5Writer_v2`, read strategies, shared `ReadIndex` + generation contract), the 12-column `/index`, `STRING_CHUNKED` + `list_spans`, metadata replay, tools, and the measured performance history. This v1 text remains the engine (PanzerDB) API reference; its §2.2 / §2.3 / Appendix A have been annotated where they described the pre-2.1 format (14-column index, variable-length `data_raw_str`).
 
 * v1 (2026-09-05) — initial public version of this guide. Covers the engine (§2), the concepts (§3), every PanzerDB method with a verified example (§5–§7), the three-layer stack (§8), performance & I/O (§9), error handling (§10), and quick-reference tables (§11). Appendices A–F: M1 on-disk layout, the two time models, the path model, type decoding, and a reproducible build recipe. All examples are built and run against the current `libal.so` and verified against the same 23-leaf file.
 
