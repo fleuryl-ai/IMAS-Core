@@ -62,6 +62,10 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
     std::map<std::string, NodeType> aos_paths;
     std::map<std::string, size_t> aos_sizes;
     std::map<std::string, size_t> path_occurrence_count;
+    // Time coverage per schema path: max(time_index + steps) over its rows.
+    // A single row can carry several steps (bulk numeric writes, run-grouped
+    // string writes), so the row count alone under-estimates the time dim.
+    std::map<std::string, size_t> path_time_coverage;
     std::map<std::string, const PanzerDB::Leaf*> schema_to_leaf_map;
 
     for (const auto& leaf : leaves) {
@@ -69,7 +73,7 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
         if (leaf.flags == 2 || leaf.flags == 3) {
             aos_paths[schema_path] = (leaf.flags == 3) ? NodeType::AOS_DYNAMIC : NodeType::AOS_STATIC;
             
-            if (leaf.flags == 2 && !leaf.shape.empty()) {
+            if (leaf.flags == 2 && !leaf.shape_span().empty()) {
                 aos_sizes[schema_path] = leaf.shape[0];
             } else if (leaf.flags == 3) {
                 auto s = db.getAOSShape(std::string(leaf.path));
@@ -77,6 +81,18 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
             }
         } else if ((leaf.flags & 0xF) == 0) {
             path_occurrence_count[schema_path]++;
+            size_t steps = 1;
+            if (static_cast<uint64_t>(leaf.flags >> 4) !=
+                static_cast<uint64_t>(PanzerDB::DataType::STRING_CHUNKED)) {
+                size_t slice_volume = 1;
+                for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+                if (slice_volume > 0 && leaf.count > slice_volume) {
+                    steps = leaf.count / slice_volume;
+                }
+            }
+            const size_t cov = leaf.time_index + steps;
+            size_t& best = path_time_coverage[schema_path];
+            if (cov > best) best = cov;
             if (show_metadata || schema_path.find('@') == std::string::npos) {
                 if (schema_to_leaf_map.find(schema_path) == schema_to_leaf_map.end()) {
                     schema_to_leaf_map[schema_path] = &leaf;
@@ -119,6 +135,10 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
 
         // Determine if the signal has a time dimension
         size_t time_dim = (static_prod > 0) ? (occurrence / static_prod) : occurrence;
+        // Multi-step rows (bulk / run-grouped writes) carry more steps than rows:
+        // the recorded coverage wins when it is larger.
+        const size_t cov = path_time_coverage.count(schema_path) ? path_time_coverage[schema_path] : 0;
+        if (cov > time_dim) time_dim = cov;
 
         if (time_dim > 1 || has_dynamic_parent) {
             logical_dims.push_back(time_dim > 0 ? time_dim : 1);
@@ -128,22 +148,22 @@ list_nodes(const std::string& ids_name, bool recursive, bool show_aos, bool show
         // Add structural dimensions from static AoS parents
         logical_dims.insert(logical_dims.end(), static_parents.begin(), static_parents.end());
         
-        if (!rep_leaf->shape.empty()) {
+        if (!rep_leaf->shape_span().empty()) {
             size_t skip = 0;
             // Physical shape in PanzerDB for static AoS includes dimensions of static parents.
             for (size_t sp_dim : static_parents) {
-                if (skip < rep_leaf->shape.size() && rep_leaf->shape[skip] == sp_dim) {
+                if (skip < rep_leaf->shape_span().size() && rep_leaf->shape[skip] == sp_dim) {
                     skip++;
                 } else {
                     break;
                 }
             }
             
-            if (rep_leaf->shape.size() > skip) {
-                if (!(rep_leaf->shape.size() - skip == 1 && rep_leaf->shape[skip] <= 1 && !logical_dims.empty())) {
-                    logical_dims.insert(logical_dims.end(), 
-                                        rep_leaf->shape.begin() + skip, 
-                                        rep_leaf->shape.end());
+            if (rep_leaf->shape_span().size() > skip) {
+                if (!(rep_leaf->shape_span().size() - skip == 1 && rep_leaf->shape[skip] <= 1 && !logical_dims.empty())) {
+                    logical_dims.insert(logical_dims.end(),
+                                        rep_leaf->shape + skip,
+                                        rep_leaf->shape + rep_leaf->ndim);
                 }
             }
         } else if (rep_leaf->count > 1) {
@@ -466,7 +486,7 @@ TensorView read_tensor(const std::string& ids_name, const std::string& path)
         // 2. Fallback: standard PanzerDB metadata (useful if a static AOS has no data but a defined shape)
         if (leaf.flags == 2 || leaf.flags == 3) {
             std::string schema_path = PanzerDB::stripIndices(rp);
-            if (leaf.flags == 2 && !leaf.shape.empty()) {
+            if (leaf.flags == 2 && !leaf.shape_span().empty()) {
                 aos_sizes[schema_path] = std::max(aos_sizes[schema_path], (size_t)leaf.shape[0]);
             } else if (leaf.flags == 3) {
                 auto s = db.getAOSShape(rp);

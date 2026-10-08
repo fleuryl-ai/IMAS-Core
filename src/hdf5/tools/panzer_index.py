@@ -11,7 +11,9 @@ kind, type, ndim, shape, time, offset, count, parent — le même décodage que
 
   - kind  = flags & 0xF  ; 0=data 1=empty 2=AoS statique 3=AoS dynamique
   - type  = flags >> 4   ; 0=F64 1=I32 2=C128 3=STR 4=STR_LIST 5=STR_CHUNKED
-  - layout 12 colonnes (actuel) : ndim | shape[6] | time | off | count | flags | parent
+  - layout v3 (7 colonnes + attribut index_version=3) : lignes packées 56 o et
+    chemins internés dans /path_table ; décodé ici vers la vue 12 colonnes
+  - layout v2 12 colonnes : ndim | shape[6] | time | off | count | flags | parent
   - layout 14 colonnes (legacy) : + col. "type" en tête et "index_value" en queue (jamais lues)
 
 Usage:
@@ -66,10 +68,62 @@ def colmap(ncols):
     """Indices des colonnes décodées ; miroir de ``PanzerDB::getLeaves()``."""
     if ncols == 14:  # legacy : "type" en tête + "index_value" en queue (jamais relues)
         return dict(ndim=1, shape=2, time=8, off=9, cnt=10, flags=11, parent=12)
-    if ncols == 12:  # actuel : ndim | shape[6] | time | offset | count | flags | parent_id
+    if ncols == 12:  # v2 : ndim | shape[6] | time | offset | count | flags | parent_id
         return dict(ndim=0, shape=1, time=7, off=8, cnt=9, flags=10, parent=11)
     raise ValueError(
-        "dataset 'index' à {} colonnes : layout inconnu (attendu 12 ou 14)".format(ncols))
+        "dataset 'index' à {} colonnes : layout inconnu (attendu 7 (v3), 12 ou 14)".format(ncols))
+
+
+M32 = 0xFFFFFFFF
+
+
+def is_v3(group):
+    """Version du format : attribut index_version, sinon déduction par les colonnes."""
+    v = group["index"].attrs.get("index_version", 0)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        v = 0
+    return v == 3 or group["index"].shape[1] == 7
+
+
+def decode_v3(group):
+    """Décode les 7 colonnes u64 packées du layout v3 (+ /path_table interné)
+    dans la représentation 12 colonnes v2, miroir de PanzerDB::getLeaves().
+
+    col0 offset | col1 count
+    col2 path_id(u32 bas) | parent_id(u32 haut, 0xFFFFFFFF=racine)
+    col3 time(u32 bas) | (flags|ndim<<8)(u32 haut)
+    col4..6 shape[0..5] (2×u32 par colonne)
+    Retourne (rows_décodées, paths, n_entrées_path_table).
+    """
+    import numpy
+    raw = group["index"][:]
+    n = raw.shape[0]
+    table = []
+    if "path_table" in group:
+        table = [bytes(s).decode("utf-8", "replace").rstrip("\x00")
+                 for s in group["path_table"][:]]
+    dec = numpy.zeros((n, 12), dtype=numpy.uint64)
+    paths = []
+    for i in range(n):
+        r = raw[i]
+        pid = int(r[2]) & M32
+        parent32 = int(r[2]) >> 32
+        time_v = int(r[3]) & M32
+        sflags = int(r[3]) >> 32
+        flags = sflags & 0xFF
+        ndim = (sflags >> 8) & 0xF
+        dec[i][0] = ndim
+        for d in range(6):
+            dec[i][1 + d] = (int(r[4 + d // 2]) >> (32 * (d % 2))) & M32
+        dec[i][7] = time_v
+        dec[i][8] = int(r[0])
+        dec[i][9] = int(r[1])
+        dec[i][10] = flags
+        dec[i][11] = NO_PARENT if parent32 == 0xFFFFFFFF else parent32
+        paths.append(table[pid] if pid < len(table) else "?id{}".format(pid))
+    return dec, paths, len(table)
 
 
 def panzer_groups(f):
@@ -100,10 +154,16 @@ def dump_group(name, group, args):
         print("[{}] dataset 'index' non 2D : ignoré".format(name), file=sys.stderr)
         return
     n_rows, ncols = idx.shape
-    cm = colmap(ncols)  # lève ValueError si layout non prévu
-
-    rows = idx[:]  # ndarray (n_rows, ncols), uint64
-    paths = read_paths(group, n_rows)
+    v3 = is_v3(group)
+    if v3:
+        rows, paths, n_path_entries = decode_v3(group)
+        ncols_decoded = 12
+    else:
+        rows = idx[:]  # ndarray (n_rows, ncols), uint64
+        paths = read_paths(group, n_rows)
+        ncols_decoded = ncols
+        n_path_entries = None
+    cm = colmap(ncols_decoded)  # lève ValueError si layout non prévu
 
     # Nombre de lignes par path : le layout « per-slice » (legacy) écrit UNE LIGNE
     # PAR SLICE (la colonne t reste 0, le temps c'est l'ordre des lignes),
@@ -133,9 +193,15 @@ def dump_group(name, group, args):
             print("\t".join([str(i), path] + [str(int(v)) for v in row]))
         return
 
+    if v3:
+        layout = "7 colonnes v3 packées + /path_table interné ({} chemins uniques)".format(n_path_entries)
+    elif ncols == 14:
+        layout = "14 colonnes  (legacy : type@col0 et index_value@col13 non lues)"
+    else:
+        layout = "12 colonnes v2 (/paths aligné sur les lignes)"
     lines = [
         "### {}".format(name),
-        "layout : {} colonnes{}".format(ncols, "  (legacy : type@col0 et index_value@col13 non lues)" if ncols == 14 else ""),
+        "layout : " + layout,
     ]
     kinds_str = "  ".join(
         "{}={}".format(KIND_NAMES.get(k, "k{}".format(k)), c)
@@ -157,6 +223,8 @@ def dump_group(name, group, args):
     if tb:
         lines.append("timebase(s) : " + "  ".join(tb))
     extents = ["{}={}".format(d, group[d].shape[0]) for d in RAW_DATASETS if d in group]
+    if "path_table" in group:
+        extents.append("path_table={} chemins uniques".format(group["path_table"].shape[0]))
     if "list_spans" in group:
         extents.append("list_spans={} entrées".format(group["list_spans"].shape[0] // 4))
     if extents:

@@ -165,7 +165,7 @@ std::string serialize_surface(const std::string& filename) {
         return std::string(a->parent_path) < std::string(b->parent_path);
     });
 
-    auto dims_str = [](const std::vector<size_t>& v) {
+    auto dims_str = [](const auto& v) {
         std::string s;
         for (size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += std::to_string(v[i]); }
         return s;
@@ -184,7 +184,7 @@ std::string serialize_surface(const std::string& filename) {
            << " time=" << lf->time_index
            << " off=" << lf->offset
            << " cnt=" << lf->count
-           << " shape=(" << dims_str(lf->shape) << ")"
+           << " shape=(" << dims_str(lf->shape_span()) << ")"
            << " empty=" << (lf->is_empty ? 1 : 0)
            << " schema=" << PanzerDB::stripIndices(path)
            << "\n";

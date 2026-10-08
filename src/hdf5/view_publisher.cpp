@@ -41,7 +41,7 @@ bool isAllDigits(const std::string& s) {
     return true;
 }
 
-uint64_t productShape(const std::vector<size_t>& shape) {
+uint64_t productShape(PanzerDB::Leaf::ShapeView shape) {
     uint64_t p = 1;
     for (auto d : shape) p *= (d ? d : 1);
     return p;
@@ -121,7 +121,7 @@ const char* dtypeString(PanzerDB::DataType dt) {
     }
 }
 
-std::vector<hsize_t> computeDims(uint64_t count, const std::vector<size_t>& shape) {
+std::vector<hsize_t> computeDims(uint64_t count, PanzerDB::Leaf::ShapeView shape) {
     if (shape.empty()) {
         if (count == 1) return {};               // scalar
         return {(hsize_t)count};
@@ -175,7 +175,7 @@ bool createVDS(hid_t file_id, hid_t view_root, const PanzerDB::Leaf& leaf,
     H5Dclose(src);
 
     // 3. Target dataspace (the VDS shape)
-    std::vector<hsize_t> dims = computeDims(leaf.count, leaf.shape);
+    std::vector<hsize_t> dims = computeDims(leaf.count, leaf.shape_span());
     hid_t vspace;
     if (dims.empty()) vspace = H5Screate(H5S_SCALAR);
     else vspace = H5Screate_simple((int)dims.size(), dims.data(), nullptr);
@@ -204,8 +204,8 @@ bool createVDS(hid_t file_id, hid_t view_root, const PanzerDB::Leaf& leaf,
         // 7. Attributes (metadata that h5ls cannot infer)
         setStrAttr(vds, "datatype", dtypeString(dt));
         setU64Attr(vds, "n_elements", leaf.count);
-        uint64_t prod = productShape(leaf.shape);
-        uint64_t tdim = leaf.shape.empty()
+        uint64_t prod = productShape(leaf.shape_span());
+        uint64_t tdim = leaf.ndim == 0
                      ? (leaf.count > 1 ? leaf.count : 1)
                      : (leaf.count >= prod && leaf.count % prod == 0 ? leaf.count / prod : 1);
         if (tdim > 1) setU64Attr(vds, "time_dim", tdim);

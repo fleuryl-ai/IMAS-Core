@@ -123,6 +123,9 @@ al_add_hdf5_test(test_swmr_string_fixed_width)
 # Crash-safe commit ordering: reader guardrail against a dangling index row
 # (offset past the materialised data_raw_* extent — see PanzerDB::getLeaves).
 al_add_hdf5_test(test_engine_commit_order_guardrail)
+# v3 index format: packed 7-column /index + interned /path_table, version
+# attribute, and upward compatibility with legacy 12-column files.
+al_add_hdf5_test(test_engine_index_v3)
 target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +

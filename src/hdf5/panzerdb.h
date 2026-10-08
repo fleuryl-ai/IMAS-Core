@@ -143,6 +143,27 @@ inline constexpr uint64_t PANZER_NO_PARENT_ROW = 0xFFFFFFFFFFFFFFFFULL;
 // from the dataset extent and maps both layouts.
 inline constexpr uint64_t PANZER_INDEX_COLUMNS = 12;
 
+// Index-table format versions, persisted as the "index_version" attribute of the
+// /index dataset. Files without the attribute are v2 (12 columns) or legacy
+// (14 columns), inferred from the dataset extent.
+//   v2 (2): 12 u64 columns + /paths row-aligned (256B fixed C_S1 per row).
+//   v3 (3): 7 packed u64 columns + interned paths in /path_table (unique texts).
+// New files are written v3; APPEND keeps the layout of the file it opens.
+inline constexpr uint32_t PANZER_INDEX_VERSION_V2 = 2;
+inline constexpr uint32_t PANZER_INDEX_VERSION_V3 = 3;
+inline constexpr uint64_t PANZER_INDEX_COLUMNS_V3 = 7;
+inline constexpr uint32_t PANZER_NO_PARENT_ROW_V3 = 0xFFFFFFFFu;
+inline constexpr uint32_t PANZER_NO_PATH_ROW_V3 = 0xFFFFFFFFu;
+
+// v3 row packing inside the 7 u64 columns (see PANZER_INDEX_COLUMNS_V3):
+//   col0 offset(u64) | col1 count(u64)
+//   col2 path_id(u32 low) | parent_id(u32 high, 0xFFFFFFFF = no parent)
+//   col3 time_index(u32 low) | (flags | ndim<<8)(u32 high)
+//   col4 shape[0] | shape[1]<<32   col5 shape[2] | shape[3]<<32   col6 shape[4] | shape[5]<<32
+// Leaf::flags stays (kind | dtype<<4); ndim is recovered from bits 8..11 of the
+// stored word and masked out before reaching the public Leaf.
+inline constexpr uint64_t PANZER_V3_NDIM_SHIFT = 8;
+
 /**
  * @struct PathComponents
  * @brief Parsed components of an instance path inside a (possibly dynamic) AoS.
@@ -198,9 +219,14 @@ public:
      *   flags = 2        : static AoS meta-node (no raw data, size in `shape[0]`)
      *   flags = 3        : dynamic AoS meta-node (time-evolving; see aos_time_counters)
      *   flags = 1        : explicitly preserved empty node.
+     * - `shape` is inline storage (no per-leaf allocation — the index cache is
+     *   rebuilt on every flush/SWMR refresh and holds 10^5-10^7 leaves; a
+     *   std::vector there meant one malloc per row). Iterate with `shape_span()`
+     *   or index `shape[0..ndim-1]`.
      */
     struct Leaf {
-        std::vector<size_t> shape;      // Dimensions of a single time slice (empty for scalars/meta-nodes).
+        uint64_t shape[6] = {0, 0, 0, 0, 0, 0}; // Dimensions of a single time slice (ndim==0 for scalars/meta-nodes).
+        uint8_t  ndim = 0;                      // Number of meaningful entries in `shape` (<= 6).
         uint64_t time_index = 0;        // First time step stored in this leaf (0 for static data).
         std::string_view path;          // Full instance path, e.g. "profiles_1d/0/ion/0/density".
         std::string_view parent_path;   // Path of the immediate parent node.
@@ -209,6 +235,22 @@ public:
         uint64_t flags = 0;             // low 4 bits: node kind; upper bits: DataType. See struct doc.
         bool is_empty = false;          // Convenience flag mirroring (flags & 0xF) == 1.
         uint64_t row_id = 0;            // Position in /index (= getLeaves() vector index). Used for span-table lookup.
+
+        /**
+         * @brief Borrowed view over the meaningful prefix of `shape`, mimicking
+         *        the read-only surface of the former std::vector member
+         *        (size/empty/[]/range-for). Valid as long as the leaf cache lives.
+         */
+        struct ShapeView {
+            const uint64_t* p;
+            size_t n;
+            size_t size() const { return n; }
+            bool empty() const { return n == 0; }
+            const uint64_t& operator[](size_t i) const { return p[i]; }
+            const uint64_t* begin() const { return p; }
+            const uint64_t* end() const { return p + n; }
+        };
+        ShapeView shape_span() const { return ShapeView{shape, ndim}; }
     };
 
     /**
@@ -226,8 +268,19 @@ private:
     
     hid_t file_id = -1;
     hid_t index_dset = -1;
-    hid_t paths_dset = -1;
-    hid_t parent_paths_dset = -1;
+    hid_t paths_dset = -1;          // v2/legacy only (row-aligned full path text)
+    hid_t parent_paths_dset = -1;   // gone since M1; kept as an invalid handle
+    hid_t path_table_dset = -1;     // v3 only: interned unique path texts
+
+    // Index-table format version in effect for this file (see the
+    // PANZER_INDEX_VERSION_* constants). init() reads the "index_version"
+    // attribute of /index; missing attribute => v2/legacy inferred from extent.
+    uint32_t index_version = PANZER_INDEX_VERSION_V2;
+
+    // v3 writer side: path interning.
+    std::unordered_map<std::string, uint32_t> path_id_map; // text -> /path_table id
+    std::vector<char> path_text_buffer;                    // new unique texts, PATH_MAX_LEN each
+    uint32_t next_path_id = 0;
 
     // Datasets for each data type
     mutable hid_t data_dset_f64 = -1; // double
@@ -365,10 +418,12 @@ private:
     mutable std::unordered_map<std::string_view, std::vector<size_t>> parent_lookup;
     mutable std::vector<std::string> cached_dynamic_aos_roots;
 
-    // For each dynamic AoS root: the highest time_index found among ALL of its
-    // descendants (any depth), built in getLeaves(). Used by getAOSShape so a
-    // dynamic AoS that only contains nested static AoS (e.g. time_slice/ggd/
-    // theta/values) still reports the correct size.
+    // For each dynamic AoS root: the EXCLUSIVE end of the time range covered
+    // by ALL of its descendants (any depth), i.e. max(time_index + steps),
+    // built in getLeaves(). Used by getAOSShape so a dynamic AoS that only
+    // contains nested static AoS (e.g. time_slice/ggd/theta/values) still
+    // reports the correct size, and so multi-step rows (bulk numeric writes,
+    // run-grouped string writes) contribute their whole span.
     mutable std::unordered_map<std::string_view, uint64_t> max_time_at_dynamic_root;
 
     // Reusable scratch buffers to avoid repetitive malloc/free on reads
@@ -516,7 +571,7 @@ public:
      */
     static bool isStringScalarLeaf(const Leaf& leaf) {
         const DataType dt = leafDataType(leaf);
-        return leaf.shape.empty() &&
+        return leaf.ndim == 0 &&
                (dt == DataType::STRING ||
                 dt == DataType::LIST_OF_STRINGS ||
                 dt == DataType::STRING_CHUNKED);
@@ -991,7 +1046,7 @@ public:
             return static_cast<T>(-1);
         }
         const Leaf& leaf = cached_leaves[it->second.front()]; // First row at that path, as the old scan.
-        if (!leaf.shape.empty() || leaf.count != 1) {
+        if (leaf.ndim != 0 || leaf.count != 1) {
             throw ALBackendException("Leaf at path '" + path + "' is not a scalar.", LOG);
         }
         T value;
@@ -1164,6 +1219,25 @@ private:
                                  const std::vector<size_t>& shape, uint64_t type,
                                  uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags,
                                  uint64_t parent_id, uint64_t index_value);
+
+    /**
+     * @brief v3 only: returns the /path_table id of `full_path`, appending the text
+     *        to path_text_buffer and the map on first occurrence.
+     * @throws ALBackendException if the path table id space (u32) is exhausted.
+     */
+    uint32_t intern_path(const std::string& full_path);
+
+    /**
+     * @brief v3 only: appends the buffered unique path texts to /path_table.
+     * Called by flush() BEFORE the /index write (commit ordering).
+     */
+    void flushPathTable();
+
+    /**
+     * @brief v3 only (APPEND/READ): loads /path_table texts into path_id_map and
+     *        seeds next_path_id so appended ids continue the existing table.
+     */
+    void loadPathTable();
 
     /**
      * @brief Returns the path of the enclosing dynamic AoS, or an empty string.

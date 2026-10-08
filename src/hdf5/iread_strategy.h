@@ -855,7 +855,7 @@ public:
                 panzer_db_ptr->readTensor<std::complex<double>>(*leaf, buf.get());
                 *data = static_cast<void*>(buf.release());
             } else if (datatype == alconst::char_data) {
-                if (leaf->shape.size() <= 1) { // 1D list or Scalar
+                if (leaf->shape_span().size() <= 1) { // 1D list or Scalar
                     std::vector<std::string> str_list(leaf->count);
                     panzer_db_ptr->readTensor<std::string>(*leaf, str_list.data());
 
@@ -877,8 +877,8 @@ public:
             }
 
             // Update output dimensions
-            *dim = leaf->shape.size();
-            for (size_t i = 0; i < leaf->shape.size(); ++i) {
+            *dim = leaf->shape_span().size();
+            for (size_t i = 0; i < leaf->shape_span().size(); ++i) {
                 size[i] = leaf->shape[i];
             }
 
@@ -1081,7 +1081,7 @@ public:
         // FIX: Handle multiple static writes for scalars (overwrites).
         // A scalar leaf is one with count=1 (for strings) or an empty shape (for numerics).
         PanzerDB::DataType first_leaf_type = static_cast<PanzerDB::DataType>(first_leaf->flags >> 4);
-        bool is_numeric_scalar_leaf = (first_leaf_type != PanzerDB::DataType::STRING && first_leaf->shape.empty());
+        bool is_numeric_scalar_leaf = (first_leaf_type != PanzerDB::DataType::STRING && first_leaf->shape_span().empty());
         bool is_string_scalar_leaf =
             (first_leaf_type == PanzerDB::DataType::STRING && first_leaf->count == 1) ||
             (first_leaf_type == PanzerDB::DataType::STRING_CHUNKED); // multi-slot scalar
@@ -1114,7 +1114,7 @@ public:
                 return 0; // Unknown type
         }
 
-        size_t leaf_rank = first_leaf->shape.size();
+        size_t leaf_rank = first_leaf->shape_span().size();
 
         // 3. CHAR / STRING Processing
         // Always read with the actual file type. Conversion will be done by al_lowlevel.

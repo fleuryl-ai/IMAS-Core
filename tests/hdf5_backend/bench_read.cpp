@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
                 for (const auto& l : db.getLeaves()) {
                     if ((l.flags & 0xFULL) >= 2) {
                         std::cerr << "META " << l.path << " role=" << (l.flags & 0xF)
-                                  << " shape0=" << (l.shape.empty() ? 0 : l.shape[0]) << "\n";
+                                  << " shape0=" << (l.ndim == 0 ? 0 : l.shape[0]) << "\n";
                         if (++shown >= 12) break;
                     }
                 }
