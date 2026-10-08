@@ -142,6 +142,10 @@ target_include_directories(test_index_golden PRIVATE ${PROJECT_SOURCE_DIR}/inclu
 # --------------------------------------------------------------------------
 # regression reproductions
 al_add_hdf5_test(test_al_bfield_na_slice)
+# Round-trip 2x inflation: a top-level node (e.g. reflectometer_profile/n_e)
+# must not leak the channel(0) member data via the name_index last-segment
+# fallback (see tests/hdf5_backend/test_al_reflectometer_toplevel_no_leak.cpp).
+al_add_hdf5_test(test_al_reflectometer_toplevel_no_leak)
 al_add_hdf5_test(test_al_cic_string_slice)
 al_add_hdf5_test(test_al_dynamic_aos_nested_static_slice)
 al_add_hdf5_test(test_al_static_aos_signal_slice)

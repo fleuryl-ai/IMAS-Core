@@ -550,6 +550,15 @@ public:
                 if (leaf->path.size() < context_prefix.size() || leaf->path.compare(0, context_prefix.size(), context_prefix) != 0) {
                     continue;
                 }
+            } else if (!leaf->parent_path.empty()) {
+                // TOP-LEVEL QUERY: reject leaves that live under an AoS
+                // (e.g. channel(0).n_e) because the query's context is the
+                // record root.  Without this, name_index falls back to the
+                // first leaf sharing the same last path segment and returns
+                // channel(0).n_e for a top-level n_e read — causing the AL
+                // to duplicate each channel member as a root-level node on
+                // round-trip (2× file-size inflation bug).
+                continue;
             }
 
             return leaf;
@@ -1037,7 +1046,13 @@ public:
                         if (leaf->path.compare(0, context_prefix.size(), context_prefix) == 0) {
                             sorted_leaves.push_back(leaf);
                         }
-                    } else {
+                    } else if (leaf->parent_path.empty()) {
+                        // TOP-LEVEL QUERY (record root): only accept leaves
+                        // whose own parent is also the record root.  Rejecting
+                        // AoS members (e.g. channel(0).n_e) prevents the
+                        // name_index last-segment fallback from duplicating a
+                        // channel member into a top-level read on round-trip
+                        // (2× file-size inflation bug).
                         sorted_leaves.push_back(leaf);
                     }
                 }
