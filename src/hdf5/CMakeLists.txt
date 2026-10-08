@@ -34,6 +34,8 @@ target_sources( al PRIVATE
     direct_access_api.cpp
     path_parser.cpp
     direct_reader.cpp
+    view_publisher.h
+    view_publisher.cpp
     imas_h5read/imas_h5read.cpp
 )
 # target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_WRITER_V2 )
@@ -216,6 +218,10 @@ al_add_hdf5_test(test_al_metadata_extract_inttype)
 # Direct-access API
 # --------------------------------------------------------------------------
 al_add_hdf5_test(test_direct_api_validation)
+
+# User-friendly VDS view (snapshot): standard h5ls/h5dump/h5py can inspect the
+# IMAS instance tree without any IMAS-API dependency. See view_publisher.{h,cpp}.
+al_add_hdf5_test(test_publish_view)
 
 # --------------------------------------------------------------------------
 # h5read (imas_h5read library)
