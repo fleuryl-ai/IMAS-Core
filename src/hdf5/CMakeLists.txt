@@ -146,6 +146,9 @@ al_add_hdf5_test(test_al_bfield_na_slice)
 # must not leak the channel(0) member data via the name_index last-segment
 # fallback (see tests/hdf5_backend/test_al_reflectometer_toplevel_no_leak.cpp).
 al_add_hdf5_test(test_al_reflectometer_toplevel_no_leak)
+# Filter pipeline order: shuffle MUST be added before deflate (compressor last),
+# else the shuffle is a no-op and the numeric buffer costs ~+20% file size.
+al_add_hdf5_test(test_engine_filter_pipeline_order)
 al_add_hdf5_test(test_al_cic_string_slice)
 al_add_hdf5_test(test_al_dynamic_aos_nested_static_slice)
 al_add_hdf5_test(test_al_static_aos_signal_slice)
