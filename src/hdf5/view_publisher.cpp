@@ -8,13 +8,21 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <vector>
 
-namespace imas::view {
+namespace imas {
+namespace view {
 namespace {
+
+// IMAS invalid values, used as the HDF5 fill value for the cells an aggregated
+// dataset cannot map (ragged slices, sparse AoS instances).
+constexpr double  INVALID_F64 = -9.0e40;
+constexpr int32_t INVALID_I32 = -999999;
 
 // --------------------------------------------------------------------------
 // Small helpers
@@ -35,6 +43,12 @@ std::vector<std::string> splitPath(const std::string& p) {
     return out;
 }
 
+std::string joinPath(const std::vector<std::string>& segs) {
+    std::string out;
+    for (const auto& s : segs) { if (!out.empty()) out += '/'; out += s; }
+    return out;
+}
+
 bool isAllDigits(const std::string& s) {
     if (s.empty()) return false;
     for (char c : s) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
@@ -45,6 +59,18 @@ uint64_t productShape(PanzerDB::Leaf::ShapeView shape) {
     uint64_t p = 1;
     for (auto d : shape) p *= (d ? d : 1);
     return p;
+}
+
+template <typename T>
+uint64_t product(const std::vector<T>& v) {
+    uint64_t p = 1;
+    for (auto d : v) p *= (d ? (uint64_t)d : 1ull);
+    return p;
+}
+
+void bumpMax(std::map<std::string, uint64_t>& m, const std::string& k, uint64_t v) {
+    auto it = m.find(k);
+    if (it == m.end() || it->second < v) m[k] = v;
 }
 
 // Ensure a chain of groups (relative to loc) exists.  Returns an OPEN handle
@@ -93,10 +119,9 @@ void setU64Attr(hid_t obj, const std::string& name, uint64_t v) {
 }
 
 // --------------------------------------------------------------------------
-// VDS creation for one data leaf
+// Type helpers (global PanzerDB naming)
 // --------------------------------------------------------------------------
 
-// Returns the data_raw_* dataset name for a given DataType (global PanzerDB).
 const char* dataRawName(PanzerDB::DataType dt) {
     switch (dt) {
         case PanzerDB::DataType::FLOAT64:         return "data_raw_f64";
@@ -120,6 +145,10 @@ const char* dtypeString(PanzerDB::DataType dt) {
         default: return "unknown";
     }
 }
+
+// --------------------------------------------------------------------------
+// Expanded mode: one VDS per index row (historical behaviour)
+// --------------------------------------------------------------------------
 
 std::vector<hsize_t> computeDims(uint64_t count, PanzerDB::Leaf::ShapeView shape) {
     if (shape.empty()) {
@@ -222,25 +251,17 @@ bool createVDS(hid_t file_id, hid_t view_root, const PanzerDB::Leaf& leaf,
     return vds >= 0;
 }
 
-// --------------------------------------------------------------------------
-// Empty-node / AoS-group node creation
-// --------------------------------------------------------------------------
-
 void createNodeGroup(hid_t view_root, const std::vector<std::string>& segs) {
     if (segs.empty()) return;
     hid_t g = ensureGroups(view_root, segs);
     H5Gclose(g);
 }
 
-// --------------------------------------------------------------------------
-// Main processing
-// --------------------------------------------------------------------------
-
-void processAll(hid_t file_id, hid_t view_root,
-                const std::vector<PanzerDB::Leaf>& leaves,
-                const std::string& source_filename,
-                const std::string& raw_prefix,   // e.g. "magnetics/" or ""
-                PublishStats& st)
+void processExpanded(hid_t file_id, hid_t view_root,
+                     const std::vector<PanzerDB::Leaf>& leaves,
+                     const std::string& source_filename,
+                     const std::string& raw_prefix,
+                     PublishStats& st)
 {
     // Collect per-group max index (for @aos_size).  Key = relative group path
     // under view_root; value = max integer child index seen.
@@ -249,7 +270,7 @@ void processAll(hid_t file_id, hid_t view_root,
     for (const auto& leaf : leaves) {
         st.n_total++;
         unsigned kind = leaf.flags & 0xFu;
-        if (leaf.is_empty || (leaf.flags & 0xF) == 1) { st.n_empty_skipped++; continue; }
+        if (leaf.is_empty || kind == 1) { st.n_empty_skipped++; continue; }
 
         std::string fullPath = std::string(leaf.path);
         auto segs = splitPath(fullPath);
@@ -259,25 +280,20 @@ void processAll(hid_t file_id, hid_t view_root,
             else st.n_errors++;
         } else {
             // kind 1 handled above (is_empty); kind 2/3 = AoS node
-            if (segs.size() > 0) createNodeGroup(view_root, segs);
+            if (!segs.empty()) createNodeGroup(view_root, segs);
         }
 
         // Track the integer-children of every intermediate group (AoS size).
         // For a segs[i] that is a pure integer, its parent group
         // (view_root / segs[0..i-1]) is an AoS with size >= segs[i] + 1.
         if ((kind & 1u) == 0) {   // include data leaves and AoS leaves for the tree view
-            for (size_t i = 0; i < segs.size(); ++i) {
+            for (size_t i = 1; i < segs.size(); ++i) {
                 const auto& s = segs[i];
                 if (!isAllDigits(s)) continue;
-                // Parent = segs[0..i-1]; skip if parent is view_root itself
-                // (an integer at the TOP level is not a real IMAS AoS)
-                if (i == 0) continue;
+                // An integer at the TOP level is not a real IMAS AoS.
                 std::string key;
                 for (size_t j = 0; j < i; ++j) { if (j) key += '/'; key += segs[j]; }
-                uint64_t idx = strtoull(s.c_str(), nullptr, 10);
-                auto it = aosMax.find(key);
-                if (it == aosMax.end()) aosMax[key] = idx;
-                else if (it->second < idx) it->second = idx;
+                bumpMax(aosMax, key, strtoull(s.c_str(), nullptr, 10));
             }
         }
     }
@@ -293,13 +309,541 @@ void processAll(hid_t file_id, hid_t view_root,
     }
 }
 
-} // namespace
+// ==========================================================================
+// Collapsed mode: one VDS per schema path, with the AoS levels and the time
+// steps folded into leading dimensions.
+// ==========================================================================
+
+// Parent path -> names of its child GROUPS.  The last segment of a stored path
+// is a leaf, never a group, so `time_slice` still counts as an AoS although it
+// also holds direct leaf children (`time_slice/boundary&psi_norm`).
+struct TreeInfo {
+    std::map<std::string, std::set<std::string>> kids;
+    mutable std::set<std::string> dynamicAos;   // collapsed paths of the kind-3 (time-growing) AoS
+
+    bool isAos(const std::string& parent) const {
+        auto it = kids.find(parent);
+        if (it == kids.end() || it->second.empty()) return false;
+        for (const auto& n : it->second) if (!isAllDigits(n)) return false;
+        return true;
+    }
+};
+
+void buildTree(const std::vector<PanzerDB::Leaf>& leaves, TreeInfo& tree) {
+    for (const auto& leaf : leaves) {
+        const auto segs = splitPath(std::string(leaf.path));
+        for (size_t j = 0; j + 1 < segs.size(); ++j) {
+            tree.kids[joinPath(std::vector<std::string>(segs.begin(), segs.begin() + j))].insert(segs[j]);
+        }
+    }
+}
+
+// One AoS level met while collapsing an instance path.
+struct AoSLevel {
+    std::string name;       // the AoS name (the group that carries @aos_size)
+    std::string groupPath;  // collapsed group path of that AoS
+    uint64_t    index = 0;  // this row's instance index
+};
+
+// Strips the AoS index segments from the ANCESTORS of an instance path (the
+// caller keeps the last segment as the leaf name).
+struct PathSplit {
+    std::vector<std::string> groupSegs;
+    std::vector<AoSLevel>    levels;
+};
+
+PathSplit collapseAncestors(const std::vector<std::string>& segs, const TreeInfo& tree) {
+    PathSplit out;
+    const size_t n = segs.size();
+    for (size_t j = 0; j + 1 < n; ++j) {
+        const std::string parent = joinPath(std::vector<std::string>(segs.begin(), segs.begin() + j));
+        if (j > 0 && isAllDigits(segs[j]) && tree.isAos(parent)) {
+            AoSLevel lv;
+            lv.index     = strtoull(segs[j].c_str(), nullptr, 10);
+            lv.name      = isAllDigits(segs[j - 1])
+                             ? (out.groupSegs.empty() ? std::string("aos") : out.groupSegs.back())
+                             : segs[j - 1];
+            // The AoS name was itself kept as a group segment in the previous
+            // iteration, so the current groupSegs already end with it.
+            lv.groupPath = joinPath(out.groupSegs);
+            out.levels.push_back(std::move(lv));
+            continue;
+        }
+        out.groupSegs.push_back(segs[j]);
+    }
+    return out;
+}
+
+// Collapses every index segment of a path — used on AoS meta rows, whose last
+// segment is the AoS name itself rather than a data leaf.
+std::string collapseWholePath(const std::vector<std::string>& segs, const TreeInfo& tree) {
+    std::vector<std::string> kept;
+    for (size_t j = 0; j < segs.size(); ++j) {
+        const std::string parent = joinPath(std::vector<std::string>(segs.begin(), segs.begin() + j));
+        if (j > 0 && isAllDigits(segs[j]) && tree.isAos(parent)) continue;
+        kept.push_back(segs[j]);
+    }
+    return joinPath(kept);
+}
+
+// One stored index row, expressed in the aggregated dataset's coordinates.
+struct Cell {
+    std::vector<uint64_t> lead;   // position in each leading dim (raw order, see AggLeaf)
+    uint64_t slices = 1;          // time steps this row covers (a bulk row covers several)
+    std::vector<uint64_t> shape;  // per-slice shape (empty == scalar)
+    uint64_t off   = 0;
+    uint64_t count = 0;
+};
+
+struct AggLeaf {
+    std::vector<std::string> groupSegs;
+    std::string              leafName;
+    PanzerDB::DataType       dt = PanzerDB::DataType::UNKNOWN;
+    std::string              schema;
+
+    // Before the singleton squeeze: one slot per AoS level of the instance path,
+    // preceded by slot 0 holding the folded time position.
+    std::vector<std::string> rawLevelNames;
+    bool     hasTime = false;
+    uint64_t timeSize = 0;
+    std::string timeName;
+
+    // After the squeeze: the dataset's leading dimensions.
+    std::vector<std::string> levelNames;
+    std::vector<uint64_t>    levelSizes;
+
+    std::vector<uint64_t> sliceShape;     // element-wise max over the rows
+    bool     ragged = false;
+    uint64_t nElements = 0;
+    std::vector<Cell> cells;
+};
+
+// Aggregates every data row onto its schema path and resolves the leading
+// dimensions.  aosSizes collects each AoS level's size (its meta row when
+// present, otherwise max index + 1) and drives the @aos_size attributes.
+void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
+                     const TreeInfo& tree,
+                     std::map<std::string, AggLeaf>& aggs,
+                     std::map<std::string, uint64_t>& aosSizes,
+                     PublishStats& st)
+{
+    // 1. AoS sizes carried by the meta rows (kind 2 static / kind 3 dynamic).
+    for (const auto& leaf : leaves) {
+        const unsigned kind = leaf.flags & 0xFu;
+        if (kind != 2 && kind != 3) continue;
+        const std::string key = collapseWholePath(splitPath(std::string(leaf.path)), tree);
+        if (key.empty()) continue;
+        if (kind == 3) tree.dynamicAos.insert(key);
+        if (leaf.ndim >= 1 && leaf.shape[0] > 0) bumpMax(aosSizes, key, leaf.shape[0]);
+    }
+
+    // 2. Data rows, grouped by exact instance path: a logical node stored as one
+    //    row per time slice has no index in its path — the time order is the row
+    //    order (see the layout note in tools/panzer_index.py).
+    std::map<std::string, std::vector<const PanzerDB::Leaf*>> byPath;
+    for (const auto& leaf : leaves) {
+        st.n_total++;
+        const unsigned kind = leaf.flags & 0xFu;
+        if (leaf.is_empty || kind == 1) { st.n_empty_skipped++; continue; }
+        if (kind != 0) continue;                    // AoS meta nodes are groups only
+        if (leaf.count == 0) continue;
+        byPath[std::string(leaf.path)].push_back(&leaf);
+    }
+
+    for (auto& kv : byPath) {
+        const std::string& fullPath = kv.first;
+        std::vector<const PanzerDB::Leaf*>& rows = kv.second;
+        std::sort(rows.begin(), rows.end(), [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
+            if (a->time_index != b->time_index) return a->time_index < b->time_index;
+            return a->row_id < b->row_id;
+        });
+
+        const auto segs = splitPath(fullPath);
+        if (segs.empty()) continue;
+        const PathSplit ps = collapseAncestors(segs, tree);
+        const std::string leafName = segs.back();
+        // An "index" leaf sitting at the top level would clash with the raw index
+        // table name, exactly as in the expanded view.
+        const std::string storedLeaf =
+            (ps.groupSegs.empty() && leafName == "index") ? std::string("index_node") : leafName;
+
+        const auto dt = static_cast<PanzerDB::DataType>(rows.front()->flags >> 4);
+        const std::string key = joinPath(ps.groupSegs) + '\x1f' + storedLeaf + '\x1f' + dtypeString(dt);
+
+        AggLeaf& agg = aggs[key];
+        if (agg.cells.empty()) {
+            agg.groupSegs = ps.groupSegs;
+            agg.leafName  = storedLeaf;
+            agg.dt        = dt;
+            agg.schema    = PanzerDB::stripIndices(fullPath);
+            agg.timeName  = ps.groupSegs.empty() ? std::string("time") : ps.groupSegs.back();
+            for (const auto& lv : ps.levels) agg.rawLevelNames.push_back(lv.name);
+        }
+        for (const auto& lv : ps.levels) bumpMax(aosSizes, lv.groupPath, lv.index + 1);
+
+        uint64_t timePos = 0;
+        for (const PanzerDB::Leaf* r : rows) {
+            std::vector<uint64_t> shape;
+            for (size_t d = 0; d < r->ndim; ++d) shape.push_back(r->shape[d]);
+            const uint64_t vol = shape.empty() ? 1 : product(shape);
+            uint64_t slices = 1;
+            if (vol > 0 && r->count > vol && r->count % vol == 0) slices = r->count / vol;
+            else if (shape.empty() && r->count > 1)                slices = r->count;
+
+            Cell c;
+            c.lead.push_back(timePos);                       // slot 0: folded time position
+            for (const auto& lv : ps.levels) c.lead.push_back(lv.index);
+            c.slices = slices;
+            c.shape  = std::move(shape);
+            c.off    = r->offset;
+            c.count  = r->count;
+            agg.cells.push_back(std::move(c));
+            agg.nElements += r->count;
+            timePos += slices;
+        }
+        agg.timeSize = std::max(agg.timeSize, timePos);
+    }
+
+    // 3. Leading dimensions = folded time axis (when relevant) + AoS levels,
+    //    minus the singletons, which carry no information and only inflate shapes.
+    for (auto& kv : aggs) {
+        AggLeaf& agg = kv.second;
+        if (agg.cells.empty()) continue;
+
+        uint64_t timeEnd = 0;
+        for (const auto& c : agg.cells)
+            timeEnd = std::max(timeEnd, c.lead.front() + c.slices);
+        agg.hasTime  = (timeEnd > 1);
+        agg.timeSize = std::max<uint64_t>(1, timeEnd);
+
+        const size_t rawN = agg.rawLevelNames.size();
+        std::vector<uint64_t> sizes(rawN, 1);
+        for (const auto& c : agg.cells)
+            for (size_t d = 0; d < rawN; ++d) sizes[d] = std::max(sizes[d], c.lead[d + 1] + 1);
+        std::vector<size_t> keep;
+        for (size_t d = 0; d < rawN; ++d) if (sizes[d] > 1) keep.push_back(d);
+
+        if (agg.hasTime) { agg.levelNames.push_back(agg.timeName); agg.levelSizes.push_back(agg.timeSize); }
+        for (size_t d : keep) {
+            agg.levelNames.push_back(agg.rawLevelNames[d]);
+            agg.levelSizes.push_back(sizes[d]);
+        }
+
+        // Re-line every cell's leading coordinates with the kept dimensions.
+        for (auto& c : agg.cells) {
+            std::vector<uint64_t> nl;
+            if (agg.hasTime) nl.push_back(c.lead[0]);
+            for (size_t d : keep) nl.push_back(c.lead[d + 1]);
+            c.lead = std::move(nl);
+        }
+
+        // Per-slice shape = element-wise max; anything smaller leaves a hole.
+        size_t rank = 0;
+        for (const auto& c : agg.cells) rank = std::max(rank, c.shape.size());
+        bool flat = false;
+        for (const auto& c : agg.cells) {
+            if (c.shape.size() == rank) continue;
+            if (product(c.shape) * c.slices == c.count) continue;   // scalar-empty shape
+            flat = true;                                            // ranks disagree
+        }
+        agg.sliceShape.assign(flat ? 1 : rank, 0);
+        for (const auto& c : agg.cells) {
+            if (!flat && c.shape.size() == rank) {
+                for (size_t s = 0; s < rank; ++s)
+                    agg.sliceShape[s] = std::max(agg.sliceShape[s], c.shape[s]);
+            } else {
+                agg.sliceShape[0] = std::max(agg.sliceShape[0], c.count / c.slices);
+            }
+        }
+        for (const auto& c : agg.cells)
+            if (c.shape != agg.sliceShape) agg.ragged = true;
+    }
+}
+
+// A maximal group of cells shareable by one virtual mapping.
+struct Run {
+    size_t   firstCell = 0;
+    uint64_t len       = 1;
+    uint64_t tgtStep   = 1;   // step between consecutive cells along the run dimension
+    uint64_t srcStep   = 1;   // step between their source blocks
+};
+
+// Buckets the cells by "all leading dims but the run dim" and walks each bucket,
+// extending a run while the pattern stays affine: identical cells, constant
+// target step, evenly spaced and non-overlapping source blocks.  This is what
+// keeps a 13 857-instance AoS at a single mapping instead of 13 857.
+std::vector<Run> buildRuns(const AggLeaf& agg) {
+    const size_t leadN = agg.levelSizes.size();
+    const int runDim = (leadN > 0) ? (int)leadN - 1 : -1;   // innermost AoS level, else time
+
+    std::map<std::vector<uint64_t>, std::vector<size_t>> buckets;
+    for (size_t i = 0; i < agg.cells.size(); ++i) {
+        std::vector<uint64_t> key;
+        for (size_t d = 0; d < leadN; ++d) if ((int)d != runDim) key.push_back(agg.cells[i].lead[d]);
+        buckets[std::move(key)].push_back(i);
+    }
+
+    std::vector<Run> runs;
+    for (auto& kv : buckets) {
+        auto& idx = kv.second;
+        if (runDim >= 0) {
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return agg.cells[a].lead[runDim] < agg.cells[b].lead[runDim];
+            });
+        }
+        size_t i = 0;
+        while (i < idx.size()) {
+            const Cell& base = agg.cells[idx[i]];
+            uint64_t tStep = 0, sStep = 0;
+            size_t j = i + 1;
+            while (j < idx.size()) {
+                const Cell& prev = agg.cells[idx[j - 1]];
+                const Cell& c    = agg.cells[idx[j]];
+                if (c.count != base.count || c.shape != base.shape || c.slices != base.slices) break;
+                // Merging along the time axis is only sound for single-slice rows.
+                if (runDim == 0 && base.slices != 1) break;
+                if (runDim >= 0 && c.lead[runDim] <= prev.lead[runDim]) break;
+                if (c.off <= prev.off) break;
+                const uint64_t t = (runDim >= 0) ? c.lead[runDim] - prev.lead[runDim] : 1;
+                const uint64_t s = c.off - prev.off;
+                if (s < c.count) break;                      // overlapping source blocks
+                if (tStep == 0) { tStep = t; sStep = s; }
+                else if (t != tStep || s != sStep) break;
+                ++j;
+            }
+            Run run;
+            run.firstCell = idx[i];
+            run.len       = j - i;
+            run.tgtStep   = (tStep == 0) ? 1 : tStep;
+            run.srcStep   = (sStep == 0) ? 1 : sStep;
+            runs.push_back(run);
+            i = j;
+        }
+    }
+    return runs;
+}
+
+// Fill value for unmapped cells, per stored type.  False when the type has no
+// meaningful invalid value (then no fill is set).
+bool setImasFill(hid_t dcpl, hid_t type, PanzerDB::DataType dt) {
+    switch (dt) {
+        case PanzerDB::DataType::FLOAT64:
+            return H5Pset_fill_value(dcpl, type, &INVALID_F64) >= 0;
+        case PanzerDB::DataType::INT32: {
+            const size_t sz = H5Tget_size(type);
+            if (sz < sizeof(int32_t)) return false;
+            std::vector<char> buf(sz, 0);
+            const int32_t v = INVALID_I32;
+            memcpy(buf.data(), &v, sizeof(v));
+            return H5Pset_fill_value(dcpl, type, buf.data()) >= 0;
+        }
+        case PanzerDB::DataType::COMPLEX128: {
+            // data_raw_c128 is an array type of two IEEE 64-bit floats: both
+            // components take the invalid value.
+            const double buf[2] = { INVALID_F64, INVALID_F64 };
+            return H5Pset_fill_value(dcpl, type, buf) >= 0;
+        }
+        case PanzerDB::DataType::STRING:
+        case PanzerDB::DataType::LIST_OF_STRINGS:
+        case PanzerDB::DataType::STRING_CHUNKED: {
+            const size_t sz = H5Tget_size(type);
+            std::vector<char> buf(sz, 0);   // empty string, NUL-padded to the slot width
+            return H5Pset_fill_value(dcpl, type, buf.data()) >= 0;
+        }
+        default:
+            return false;
+    }
+}
+
+bool createAggVDS(hid_t file_id, hid_t view_root, const AggLeaf& agg,
+                  const std::string& source_filename,
+                  const std::string& raw_prefix,
+                  uint64_t mappingCap,
+                  PublishStats& st)
+{
+    const char* raw = dataRawName(agg.dt);
+    if (!raw || agg.cells.empty()) return false;
+
+    std::vector<hsize_t> dims;
+    dims.reserve(agg.levelSizes.size() + agg.sliceShape.size());
+    for (auto s : agg.levelSizes) dims.push_back((hsize_t)s);
+    for (auto s : agg.sliceShape) dims.push_back((hsize_t)s);
+    const size_t leadN  = agg.levelSizes.size();
+    const size_t shapeN = agg.sliceShape.size();
+    const size_t rank   = dims.size();
+    const int runDim    = (leadN > 0) ? (int)leadN - 1 : -1;
+    if (rank > H5S_MAX_RANK) { st.n_rank_overflow++; return false; }
+
+    hid_t parent = ensureGroups(view_root, agg.groupSegs);
+    const bool parent_is_loc = (parent == view_root);
+
+    const std::string full_raw = raw_prefix + raw;
+    hid_t src = H5Dopen2(file_id, full_raw.c_str(), H5P_DEFAULT);
+    if (src < 0) { if (!parent_is_loc) H5Gclose(parent); return false; }
+    hid_t src_type  = H5Dget_type(src);
+    hid_t src_space = H5Dget_space(src);   // real extent: every mapping lives inside it
+    H5Dclose(src);
+
+    hid_t vspace;
+    if (rank == 0) vspace = H5Screate(H5S_SCALAR);
+    else vspace = H5Screate_simple((int)rank, dims.data(), nullptr);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_layout(dcpl, H5D_VIRTUAL);
+    setImasFill(dcpl, src_type, agg.dt);
+
+    std::vector<Run> runs = buildRuns(agg);
+    const bool capped = (mappingCap > 0 && runs.size() > mappingCap);
+    if (capped) runs.resize(mappingCap);
+
+    uint64_t localMappings = 0, mappedElements = 0;
+    for (const Run& run : runs) {
+        const Cell& c0 = agg.cells[run.firstCell];
+
+        std::vector<hsize_t> start(rank, 0), count(rank, 1), stride(rank, 1), block(rank, 1);
+        for (size_t d = 0; d < leadN; ++d) {
+            // A cell spans `slices` consecutive positions on the time dim and
+            // `run.len` on the run dim; a multi-slice cell is never merged along
+            // time (see buildRuns), so the product is exact in every case.
+            const bool isRun  = ((int)d == runDim);
+            const bool isTime = (agg.hasTime && d == 0);
+            start[d]  = (hsize_t)c0.lead[d];
+            count[d]  = (hsize_t)((isRun ? run.len : 1) * (isTime ? c0.slices : 1));
+            stride[d] = (isRun && run.len > 1) ? (hsize_t)run.tgtStep : 1;
+        }
+        const bool flatShape = (c0.shape.size() != shapeN);
+        for (size_t s = 0; s < shapeN; ++s) {
+            start[leadN + s] = 0;
+            count[leadN + s] = flatShape ? 1 : (hsize_t)c0.shape[s];
+        }
+        if (flatShape) count[leadN] = (hsize_t)(c0.count / c0.slices);
+
+        uint64_t tgtElements = 1;
+        for (size_t d = 0; d < rank; ++d) tgtElements *= (uint64_t)count[d];
+        const uint64_t srcElements = (uint64_t)run.len * c0.count;
+
+        hid_t vsel   = H5Scopy(vspace);
+        hid_t srcsel = H5Scopy(src_space);
+        bool ok = true;
+        if (rank > 0)
+            ok = H5Sselect_hyperslab(vsel, H5S_SELECT_SET, start.data(), stride.data(),
+                                     count.data(), block.data()) >= 0;
+        if (ok && tgtElements != srcElements) ok = false;   // HDF5 requires equal counts
+        const hsize_t sStart[1]  = { (hsize_t)c0.off };
+        const hsize_t sStride[1] = { (hsize_t)run.srcStep };
+        const hsize_t sCount[1]  = { (hsize_t)run.len };
+        const hsize_t sBlock[1]  = { (hsize_t)c0.count };
+        if (ok)
+            ok = H5Sselect_hyperslab(srcsel, H5S_SELECT_SET, sStart, sStride, sCount, sBlock) >= 0;
+        if (ok && H5Pset_virtual(dcpl, vsel, source_filename.c_str(), full_raw.c_str(), srcsel) >= 0) {
+            ++localMappings;
+            mappedElements += srcElements;
+        }
+        H5Sclose(srcsel);
+        H5Sclose(vsel);
+    }
+
+    // A dataset with no mapping at all would read as nothing but fill values:
+    // worse than not publishing it, because it looks like real data. Refuse it.
+    if (localMappings == 0) {
+        st.n_errors++;
+        H5Pclose(dcpl);
+        H5Sclose(src_space);
+        H5Sclose(vspace);
+        H5Tclose(src_type);
+        if (!parent_is_loc) H5Gclose(parent);
+        return false;
+    }
+
+    hid_t vds = H5Dcreate2(parent, agg.leafName.c_str(), src_type, vspace,
+                           H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    const bool created = (vds >= 0);
+    if (created) {
+        setStrAttr(vds, "datatype", dtypeString(agg.dt));
+        setU64Attr(vds, "n_elements", agg.nElements);
+        setStrAttr(vds, "schema", agg.schema);
+        setU64Attr(vds, "aos_ndim", leadN);
+        setU64Attr(vds, "n_mappings", localMappings);
+        std::string label;
+        for (const auto& n : agg.levelNames) { if (!label.empty()) label += '|'; label += n; }
+        for (size_t s = 0; s < shapeN; ++s) { if (!label.empty()) label += '|'; label += agg.leafName; }
+        if (!label.empty()) setStrAttr(vds, "dims_label", label);
+        if (agg.hasTime)  setU64Attr(vds, "time_dim", agg.timeSize);
+        if (agg.ragged)   setU64Attr(vds, "ragged", 1);
+        if (capped)       setU64Attr(vds, "mapping_cap", 1);
+        st.n_mappings    += localMappings;
+        st.max_mappings_in_one_dataset = std::max(st.max_mappings_in_one_dataset, localMappings);
+        const uint64_t total = product(dims);
+        st.n_fill_holes += (total > mappedElements) ? total - mappedElements : 0;
+        if (capped) st.n_mapping_cap_fallback++;
+        st.n_aggregated_datasets++;
+        st.n_data_leaves++;
+        H5Dclose(vds);
+    } else {
+        st.n_errors++;
+    }
+
+    H5Pclose(dcpl);
+    H5Sclose(src_space);
+    H5Sclose(vspace);
+    H5Tclose(src_type);
+    if (!parent_is_loc) H5Gclose(parent);
+    return created;
+}
+
+void processCollapsed(hid_t file_id, hid_t view_root,
+                      const std::vector<PanzerDB::Leaf>& leaves,
+                      const std::string& source_filename,
+                      const std::string& raw_prefix,
+                      uint64_t mappingCap,
+                      PublishStats& st)
+{
+    TreeInfo tree;
+    buildTree(leaves, tree);
+
+    std::map<std::string, AggLeaf> aggs;
+    std::map<std::string, uint64_t> aosSizes;
+    buildAggregates(leaves, tree, aggs, aosSizes, st);
+
+    for (auto& kv : aggs)
+        createAggVDS(file_id, view_root, kv.second, source_filename, raw_prefix, mappingCap, st);
+
+    // @aos_size / @aos_dynamic on every AoS group of the collapsed tree.
+    for (const auto& kv : aosSizes) {
+        auto segs = splitPath(kv.first);
+        if (segs.empty()) continue;
+        hid_t g = ensureGroups(view_root, segs);
+        setU64Attr(g, "aos_size", kv.second);
+        if (tree.dynamicAos.count(kv.first)) setU64Attr(g, "aos_dynamic", 1);
+        H5Gclose(g);
+        st.n_aos_groups++;
+    }
+}
 
 // --------------------------------------------------------------------------
-// Public entry points
+// View handling shared by both modes
 // --------------------------------------------------------------------------
 
-PublishStats publish(const std::string& filename, const std::string& root_group)
+// PanzerDB may keep its tables in a top-level sub-group; find its name so the
+// VDS source paths resolve (the same check the PanzerDB constructor performs).
+std::string findRawPrefix(hid_t file_id) {
+    if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) return std::string();
+    H5G_info_t ginfo;
+    if (H5Gget_info(file_id, &ginfo) < 0) return std::string();
+    for (hsize_t i = 0; i < ginfo.nlinks; ++i) {
+        char name[256];
+        if (H5Lget_name_by_idx(file_id, ".", H5_INDEX_NAME, H5_ITER_INC, i,
+                               name, sizeof(name), H5P_DEFAULT) < 0) continue;
+        hid_t gid = H5Gopen2(file_id, name, H5P_DEFAULT);
+        if (gid < 0) continue;
+        const bool hasIndex = (H5Lexists(gid, "index", H5P_DEFAULT) > 0);
+        H5Gclose(gid);
+        if (hasIndex) return std::string(name) + "/";
+    }
+    return std::string();
+}
+
+PublishStats publishImpl(const std::string& filename, const PublishOptions& options)
 {
     // Two distinct (non-exclusive) handles to the same file:
     //   * write_h — an R/W handle WE OWN, used to create the view. We close it.
@@ -313,32 +857,8 @@ PublishStats publish(const std::string& filename, const std::string& root_group)
     PanzerDB db(filename, PanzerDB::OpenMode::READ, /*preserve_empty*/true);
     const std::vector<PanzerDB::Leaf>& leaves = db.getLeaves();  // valid while db lives
 
-    // Find the PanzerDB data sub-group. The PanzerDB constructor already
-    // discovered it (it stores loc_id internally); we replicate the same check
-    // to get the name needed for H5Dopen2 / H5Pset_virtual.
-    // If index is at file root → raw_prefix = ""; otherwise first top-level
-    // group containing "index" → raw_prefix = "<name>/".
-    std::string raw_prefix;
-    if (H5Lexists(write_h, "index", H5P_DEFAULT) <= 0) {
-        // Search top-level groups (same logic as PanzerDB ctor)
-        H5G_info_t ginfo;
-        if (H5Gget_info(write_h, &ginfo) >= 0) {
-            for (hsize_t i = 0; i < ginfo.nlinks; ++i) {
-                char name[256];
-                H5Lget_name_by_idx(write_h, ".", H5_INDEX_NAME, H5_ITER_INC, i,
-                                   name, sizeof(name), H5P_DEFAULT);
-                hid_t gid = H5Gopen2(write_h, name, H5P_DEFAULT);
-                if (gid >= 0) {
-                    if (H5Lexists(gid, "index", H5P_DEFAULT) > 0) {
-                        raw_prefix = std::string(name) + "/";
-                        H5Gclose(gid);
-                        break;
-                    }
-                    H5Gclose(gid);
-                }
-            }
-        }
-    }
+    const std::string rawPrefix   = findRawPrefix(write_h);
+    const std::string& root_group = options.root_group;
 
     // Idempotency: remove any existing view group before rebuilding.
     if (H5Lexists(write_h, root_group.c_str(), H5P_DEFAULT) > 0)
@@ -349,11 +869,41 @@ PublishStats publish(const std::string& filename, const std::string& root_group)
     if (view_root < 0) { H5Fclose(write_h); h5err("failed to create view root group: " + root_group); }
 
     PublishStats st;
-    processAll(write_h, view_root, leaves, filename, raw_prefix, st);
+    // The expanded view legitimately collides on paths stored as one row per
+    // time slice (the loser is counted in n_errors); without silencing the error
+    // stack, HDF5 prints a full trace for each of them.
+    H5E_auto2_t oldFunc = nullptr;
+    void* oldData = nullptr;
+    H5Eget_auto2(H5E_DEFAULT, &oldFunc, &oldData);
+    if (!options.collapse_aos) H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
 
+    if (options.collapse_aos)
+        processCollapsed(write_h, view_root, leaves, filename, rawPrefix,
+                         options.max_mappings_per_dataset, st);
+    else
+        processExpanded(write_h, view_root, leaves, filename, rawPrefix, st);
+
+    H5Eset_auto2(H5E_DEFAULT, oldFunc, oldData);
     H5Gclose(view_root);
     H5Fclose(write_h);   // db's own handle is closed by db's destructor at scope end
     return st;
 }
 
-}  // namespace imas::view
+} // namespace
+
+// --------------------------------------------------------------------------
+// Public entry points
+// --------------------------------------------------------------------------
+
+PublishStats publish(const std::string& filename, const std::string& root_group) {
+    PublishOptions o;
+    o.root_group = root_group;
+    return publishImpl(filename, o);
+}
+
+PublishStats publish(const std::string& filename, const PublishOptions& options) {
+    return publishImpl(filename, options);
+}
+
+}  // namespace view
+}  // namespace imas

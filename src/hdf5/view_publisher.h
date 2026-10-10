@@ -4,12 +4,26 @@
 // without any IMAS-API dependency.
 //
 // Design (snapshot only — the VDS mapping is static):
-//   * One VDS per data leaf at <view_root>/<full-instance-path>.
-//       - source = data_raw_*[offset : offset+count] (1 contiguous hyperslab)
-//       - dims   = leaf.shape (or [time_dim] + leaf.shape if count > prod(shape))
-//   * Intermediate groups are auto-created along each leaf path.
-//   * AoS groups (all-integer children) get a @aos_size attribute.
-//   * Each VDS gets @datatype, @n_elements, @time_dim, @schema attributes.
+//   * ONE VDS PER SCHEMA PATH (collapse mode, the default).  The Array-of-
+//     Structures levels and the time steps are NOT listed as separate HDF5
+//     objects: they become LEADING DIMENSIONS of the aggregated dataset.
+//       dims = [n_time?, n_aos_0, ..., n_aos_k-1, *leaf_slice_shape]
+//     The enclosing AoS levels come first, outermost to innermost; a leading
+//     time dimension is added when one logical path is stored as several index
+//     rows (one row per time slice).  Singleton levels (size 1) are squeezed
+//     out, so `grids_ggd/0/grid/0/...` reads as `grids_ggd/grid/...`.
+//     Unmapped cells (ragged slices, sparse AoS instances) keep the HDF5 fill
+//     value, set to the IMAS invalid value: -9E+40 for reals (both components
+//     of a complex), -999999 for integers, empty string for text.
+//     Each AoS group carries @aos_size (@aos_dynamic=1 when it grows with
+//     time); each dataset carries @datatype, @n_elements, @schema, @aos_ndim
+//     (how many leading dims are AoS/time) and @dims_label (the name of every
+//     dim, so [195,10] can be read as time_slice|constraints&faraday_angle).
+//     Object names never contain '[' — the HDF5 command line parses brackets
+//     as a selection, which makes such an object unreachable by h5dump -d.
+//   * --expand (collapse_aos=false) restores the historical view: one VDS per
+//     index row, every AoS instance listed under its own subgroup.
+//   * Intermediate groups are auto-created along each path.
 //
 // No PanzerDB data file (index/paths/data_raw_*) is modified — the view is
 // additive and isolated under <view_root>. Safe to re-run (idempotent: the
@@ -18,6 +32,7 @@
 #ifndef PANZER_VIEW_PUBLISHER_H
 #define PANZER_VIEW_PUBLISHER_H
 
+#include <cstdint>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -25,11 +40,27 @@
 namespace imas::view {
 
 struct PublishStats {
-    int n_data_leaves  = 0;   // number of VDS created
+    int n_data_leaves  = 0;   // VDS created (index rows in expand mode, schema paths in collapse mode)
     int n_aos_groups   = 0;   // number of groups that received @aos_size
     int n_empty_skipped= 0;   // empty leaves (kind 1) not mirrored
     int n_errors       = 0;   // leaves that failed VDS creation (skipped)
     int n_total        = 0;   // total leaves visited
+
+    // Collapse-mode gauges (see the --stats option of imas_publish_view):
+    int      n_aggregated_datasets       = 0;  // schema paths published
+    uint64_t n_mappings                  = 0;  // total H5Pset_virtual calls (DCPL cost driver)
+    uint64_t max_mappings_in_one_dataset = 0;  // worst single dataset
+    uint64_t n_fill_holes                = 0;  // target cells left to the fill value
+    int      n_rank_overflow             = 0;  // datasets skipped: rank > H5S_MAX_RANK
+    int      n_mapping_cap_fallback      = 0;  // datasets reduced to the first slice
+};
+
+struct PublishOptions {
+    std::string root_group = "imas_view";
+    bool     collapse_aos = true;    // false == historical per-index-row view
+    // Safety valve: when a dataset would need more mappings than this, publish
+    // only its first slice and flag it (@mapping_cap=1).  0 == unlimited.
+    uint64_t max_mappings_per_dataset = 0;
 };
 
 // Publish (idempotent) a VDS view under <root_group> (default "imas_view").
@@ -40,6 +71,9 @@ struct PublishStats {
 // NOT modified — the operation is purely additive and safe to re-run.
 PublishStats publish(const std::string& filename,
                      const std::string& root_group = "imas_view");
+
+// Same, with the full option set (collapse mode, mapping cap).
+PublishStats publish(const std::string& filename, const PublishOptions& options);
 
 }  // namespace imas::view
 
