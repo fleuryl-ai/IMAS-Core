@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -116,6 +117,45 @@ void setU64Attr(hid_t obj, const std::string& name, uint64_t v) {
     H5Awrite(a, H5T_NATIVE_DOUBLE, &dv);
     H5Aclose(a);
     H5Sclose(sp);
+}
+
+// Readers for the attributes this publisher writes (we own the vocabulary, so
+// they are looked up by name rather than iterated).  All of them are optional:
+// the --expand view carries fewer attributes than the collapsed one.
+bool hasAttrName(hid_t obj, const char* name) {
+    return H5Aexists(obj, name) > 0;
+}
+
+bool attrStr(hid_t obj, const char* name, std::string& out) {
+    if (H5Aexists(obj, name) <= 0) return false;
+    hid_t a = H5Aopen(obj, name, H5P_DEFAULT);
+    if (a < 0) return false;
+    hid_t t = H5Aget_type(a);
+    std::vector<char> buf(H5Tget_size(t) + 1, 0);
+    const bool ok = (H5Aread(a, t, buf.data()) >= 0);
+    H5Tclose(t);
+    H5Aclose(a);
+    if (!ok) return false;
+    out.assign(buf.data());          // stored NUL-terminated
+    return true;
+}
+
+bool attrU64(hid_t obj, const char* name, uint64_t& out) {
+    if (H5Aexists(obj, name) <= 0) return false;
+    hid_t a = H5Aopen(obj, name, H5P_DEFAULT);
+    if (a < 0) return false;
+    double v = 0.0;
+    const bool ok = (H5Aread(a, H5T_NATIVE_DOUBLE, &v) >= 0);
+    H5Aclose(a);
+    if (!ok || !(v >= 0.0)) return false;
+    out = static_cast<uint64_t>(v);
+    return true;
+}
+
+std::string u64Text(uint64_t v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+    return buf;
 }
 
 // --------------------------------------------------------------------------
@@ -889,6 +929,123 @@ PublishStats publishImpl(const std::string& filename, const PublishOptions& opti
     return st;
 }
 
+// --------------------------------------------------------------------------
+// Listing an already published view (read-only)
+// --------------------------------------------------------------------------
+
+// Body of the listing line for one object: kind, shape, and the annotations
+// h5ls -r never prints.  Every attribute lookup is optional — the --expand view
+// carries no @dims_label, @aos_ndim or @n_mappings.
+bool describeObject(hid_t file, const std::string& path, std::string& body, bool& isGroup) {
+    hid_t obj = H5Oopen(file, path.c_str(), H5P_DEFAULT);
+    if (obj < 0) return false;
+    H5O_info2_t info;
+    const bool haveInfo = (H5Oget_info3(obj, &info, H5O_INFO_BASIC) >= 0);
+    isGroup = haveInfo && info.type == H5O_TYPE_GROUP;
+
+    if (isGroup) {
+        body = "Group";
+        uint64_t n = 0;
+        if (attrU64(obj, "aos_size", n)) body += " @aos_size=" + u64Text(n);
+        if (hasAttrName(obj, "aos_dynamic")) body += " @aos_dynamic";
+    } else if (haveInfo && info.type == H5O_TYPE_DATASET) {
+        hid_t space = H5Dget_space(obj);
+        const int rank = H5Sget_simple_extent_ndims(space);
+        std::vector<hsize_t> dims(rank > 0 ? (size_t)rank : 0, 1);
+        if (rank > 0) H5Sget_simple_extent_dims(space, dims.data(), nullptr);
+        H5Sclose(space);
+
+        body = "Dataset {";
+        for (size_t d = 0; d < dims.size(); ++d) {
+            if (d) body += ", ";
+            body += std::to_string((long long)dims[d]);
+        }
+        body += "}";
+
+        std::string label;
+        if (attrStr(obj, "dims_label", label)) body += " @dims_label=" + label;
+        if (hasAttrName(obj, "ragged")) body += " @ragged";
+        if (hasAttrName(obj, "mapping_cap")) body += " @mapping_cap";
+
+        // Cells the mapping cannot reach (ragged slices, sparse AoS instances).
+        // Derived from the shape and @n_elements so the view needs no extra
+        // attribute — and stays correct for a view published by an older build.
+        uint64_t stored = 0;
+        if (attrU64(obj, "n_elements", stored)) {
+            const uint64_t cells = product(dims);
+            if (cells > stored) body += " holes=" + u64Text(cells - stored);
+        }
+    } else {
+        body = "Object";
+    }
+    H5Oclose(obj);
+    return true;
+}
+
+// Tree order: parent first, then its links in name order (what h5ls -r gives per
+// directory, but here each object is one annotated line).
+void walkList(hid_t file, const std::string& dir, std::vector<std::string>& out) {
+    hid_t g = H5Gopen2(file, dir.c_str(), H5P_DEFAULT);
+    if (g < 0) return;
+    H5G_info_t gi;
+    const bool listed = (H5Gget_info(g, &gi) >= 0);
+    std::vector<std::string> kids;
+    if (listed) {
+        for (hsize_t i = 0; i < gi.nlinks; ++i) {
+            char name[1024];
+            if (H5Lget_name_by_idx(g, ".", H5_INDEX_NAME, H5_ITER_INC, i,
+                                   name, sizeof(name), H5P_DEFAULT) < 0) continue;
+            kids.push_back(name);
+        }
+    }
+    H5Gclose(g);
+
+    for (const auto& k : kids) {
+        const std::string full = dir + "/" + k;
+        std::string body;
+        bool isGroup = false;
+        if (!describeObject(file, full, body, isGroup)) continue;
+        out.push_back(full + '\t' + body);      // the tab is aligned in a second pass
+        if (isGroup) walkList(file, full, out);
+    }
+}
+
+ListViewResult listImpl(const std::string& filename, const std::string& root_group) {
+    if (root_group.empty()) h5err("listView: empty root_group");
+    ListViewResult res;
+
+    hid_t file = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file < 0) h5err("cannot open read-only: " + filename);
+
+    // A file whose view was never published is a normal state, not an error:
+    // the caller turns found==false into "publish first".
+    const std::string root = (root_group[0] == '/') ? root_group : "/" + root_group;
+    if (H5Lexists(file, root.c_str(), H5P_DEFAULT) <= 0) {
+        H5Fclose(file);
+        return res;
+    }
+    res.found = true;
+
+    std::vector<std::string> raw;
+    walkList(file, root, raw);
+    H5Fclose(file);
+
+    size_t width = 0;
+    for (const auto& l : raw) {
+        const size_t tab = l.find('\t');
+        if (tab != std::string::npos) width = std::max(width, tab);
+    }
+    for (auto& l : raw) {
+        const size_t tab = l.find('\t');
+        if (tab == std::string::npos) { res.lines.push_back(std::move(l)); continue; }
+        std::string line = l.substr(0, tab);
+        line.append(width + 2 - line.size(), ' ');
+        line += l.substr(tab + 1);
+        res.lines.push_back(std::move(line));
+    }
+    return res;
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -903,6 +1060,10 @@ PublishStats publish(const std::string& filename, const std::string& root_group)
 
 PublishStats publish(const std::string& filename, const PublishOptions& options) {
     return publishImpl(filename, options);
+}
+
+ListViewResult listView(const std::string& filename, const std::string& root_group) {
+    return listImpl(filename, root_group);
 }
 
 }  // namespace view

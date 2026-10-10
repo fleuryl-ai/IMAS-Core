@@ -24,6 +24,9 @@
 //   * --expand (collapse_aos=false) restores the historical view: one VDS per
 //     index row, every AoS instance listed under its own subgroup.
 //   * Intermediate groups are auto-created along each path.
+//   * listView() reads a published view back and prints one annotated line per
+//     object — needed because `h5ls -r` prints NO attribute at all, so the
+//     annotations above are invisible in a plain listing.
 //
 // No PanzerDB data file (index/paths/data_raw_*) is modified — the view is
 // additive and isolated under <view_root>. Safe to re-run (idempotent: the
@@ -74,6 +77,24 @@ PublishStats publish(const std::string& filename,
 
 // Same, with the full option set (collapse mode, mapping cap).
 PublishStats publish(const std::string& filename, const PublishOptions& options);
+
+// Read-only listing of an already published view: one line per HDF5 object,
+// carrying the annotations that h5ls -r never prints (it shows no attribute at
+// all, whatever the HDF5 version).  Nothing is written — the file is opened
+// H5F_ACC_RDONLY and the PanzerDB tables are not touched.
+//   dataset: /imas_view/<path>  Dataset {195, 519}  @dims_label=...  @ragged  holes=2
+//   group:   /imas_view/<path>  Group  @aos_size=195  @aos_dynamic
+// `holes` is derived (product of the dims minus @n_elements), so it needs no
+// extra attribute and is printed only when non-zero.  Attributes a view does
+// not carry (--expand has no @dims_label, @aos_ndim or @n_mappings) are simply
+// omitted.  Order is tree order: parent first, children in link-name order.
+struct ListViewResult {
+    bool found = false;                 // false == <root_group> absent (not an error)
+    std::vector<std::string> lines;     // aligned, one entry per object
+};
+
+ListViewResult listView(const std::string& filename,
+                        const std::string& root_group = "imas_view");
 
 }  // namespace imas::view
 

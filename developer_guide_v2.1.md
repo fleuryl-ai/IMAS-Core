@@ -492,6 +492,7 @@ Tuning hooks if you need them: `PanzerDB::setDefaultChunkingConfig()` (process-w
 | `imas_h5dump <file> [path]` | values + metadata; supports slice syntax `profiles_1d[0:5]/grid/rho` |
 | `panzer_index.py <f.h5> [--limit N --match R --kinds ... --raw --no-parent]` | the **physical** index table, decoded; handles both 12- and 14-column layouts; derived `slices` column and `timebase(s)` header. Plain Python + h5py, no build step |
 | `imas_publish_view <f.h5> [--root N] [--expand] [--max-mappings N] [--stats]` | builds an idempotent **VDS** view under `imas_view/` so `h5ls`/`h5dump`/`h5py` can browse the file with zero IMAS dependency. Purely additive; never touches `index/paths/data_raw_*` |
+| `imas_publish_view <f.h5> --list [--root N]` | **read-only, publishes nothing**: prints the view that is already in the file, one annotated line per object (dims, `@dims_label`, `@ragged`, `@aos_size`, `holes=…`). Exits 2 when the file has no view |
 
 **Collapse mode (default) — one dataset per *logical* node.** Every Array-of-Structures level and every time step becomes a **leading dimension** instead of a separate HDF5 object, so `h5ls -r` lists the IMAS tree rather than one path per instance (verbatim output):
 
@@ -502,7 +503,7 @@ Tuning hooks if you need them: `PanzerDB::setDefaultChunkingConfig()` (process-w
 /imas_view/grids_ggd/grid/space/objects_per_dimension/object/nodes      Dataset {3, 13857, 3}
 ```
 
-The same objects with their annotations (via `h5dump -A` / h5py, **not** `h5ls -r`):
+The same objects with their stored annotations (read back with `h5dump -A` or h5py — see below):
 
 ```
 /imas_view/time_slice                                     Group  @aos_size=195 @aos_dynamic=1
@@ -512,11 +513,26 @@ The same objects with their annotations (via `h5dump -A` / h5py, **not** `h5ls -
 
 dims = `[n_time?, n_aos_0, …, n_aos_k-1, *slice_shape]`; AoS levels outermost→innermost; a leading time dim appears when one logical path is stored as several index rows (per-slice rows *or* one bulk row with `count == n_slices`). Singleton AoS levels are squeezed (`grids_ggd/0/grid/0/…` → `grids_ggd/grid/…`). Unmapped cells keep the IMAS invalid value as HDF5 fill: `-9E+40` for reals (both components of a complex), `-999999` for integers, empty string for text. Attributes: `@datatype`, `@n_elements`, `@schema`, `@aos_ndim` (how many leading dims are AoS/time), `@dims_label` (one name per dim), `@n_mappings`, plus `@time_dim` / `@ragged` / `@mapping_cap` when relevant; AoS groups carry `@aos_size` and `@aos_dynamic=1`. **Object names never contain `[`** — the HDF5 CLI parses brackets as a selection, which makes such an object unreachable by `h5dump -d` (the v1 limitation); `&` is harmless.
 
-**How to see the annotations** — `h5ls -r` never prints attributes; `-v` is required, and only `h5dump`/h5py print *values*:
+**How to see the annotations** — `h5ls -r` prints **no attribute at all** (verified on HDF5 1.14.4; it is not a version quirk), so the annotations above are invisible in a plain recursive listing. The one-liner is the tool's own read-only listing:
+
+```bash
+imas_publish_view f.h5 --list      # publishes nothing: reads the view back, one annotated line per object
+```
+
+```
+/imas_view/grids_ggd                                                    Group @aos_size=1 @aos_dynamic
+/imas_view/time_slice/boundary&outline&r                               Dataset {195, 519} @dims_label=time_slice|boundary&outline&r @ragged holes=31105
+/imas_view/grids_ggd/grid/space/objects_per_dimension/object/nodes     Dataset {3, 13857, 3} @dims_label=objects_per_dimension|object|nodes holes=83142
+```
+
+`holes=N` is derived at print time (`product(dims) − @n_elements`), so it needs no extra attribute and appears only when non-zero; it counts cells left to the fill value by ragged slices or sparse AoS instances. The file is opened `H5F_ACC_RDONLY` — `--list` cannot change it. On `equilibrium_1.h5`: `h5ls -r` = 124 lines (9 of them the PanzerDB tables + the `/` root, 115 inside the view including the `imas_view` group itself), `--list` = 114 (the view contents only). When the file holds no view, `--list` prints a hint and exits 2.
+
+For the raw attribute values (including `@n_mappings`, `@datatype`, `@n_elements`, which `--list` keeps out of the line), use `h5ls -v -r` for *names* (6 lines per object) or `h5dump` for *values* — `-d` selects a dataset, `-g` selects a group (`-d` on a group errors with *"is a hard link"*). Attributes are stored as `H5T_IEEE_F64LE` scalars or `H5T_C_S1` strings:
 
 ```bash
 h5ls   -v -r f.h5                                   # attribute names (6 lines per object)
-h5dump -H -A -d "imas_view/time_slice/boundary&outline&r" f.h5   # names + values
+h5dump -H -A -d "imas_view/time_slice/boundary&outline&r" f.h5   # dataset: names + values
+h5dump -H -A -g "imas_view/time_slice" f.h5                       # group: @aos_size, @aos_dynamic
 ```
 
 Note `-A` (all attributes), not `-a NAME` (selects one attribute by name).

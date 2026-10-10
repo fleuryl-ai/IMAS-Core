@@ -238,6 +238,16 @@ static void dumpTree(hid_t fid, const char* root) {
     std::cout << "  --- end ---\n";
 }
 
+// Finds the listing line describing <path> (listView pads the path with spaces,
+// so the character after it must be a space).
+static bool findLine(const std::vector<std::string>& lines, const std::string& path, std::string& out) {
+    for (const auto& l : lines) {
+        if (l.size() > path.size() + 1 && l.compare(0, path.size(), path) == 0
+            && l[path.size()] == ' ') { out = l; return true; }
+    }
+    return false;
+}
+
 int main() {
     const std::string filename = "test_publish_view.h5";
     const char* V = "imas_view";
@@ -308,6 +318,11 @@ int main() {
         H5Fclose(fid);
     }
     check(!beforePublish.empty(), "raw file has top-level objects");
+    // A file whose view was never published is a normal state, not an error.
+    {
+        const auto none = imas::view::listView(filename, V);
+        check(!none.found && none.lines.empty(), "listView reports no view before publishing");
+    }
 
     // =====================================================================
     // 2. Collapse mode (the default): one dataset per logical node
@@ -414,6 +429,50 @@ int main() {
         // 2f. The raw PanzerDB tables are untouched (the view is additive): the
         // top-level object list is identical once the view group is set aside.
         check(rootLinks(fid, V) == beforePublish, "publishing only adds the view group");
+
+        // 2g. listView: the annotations h5ls -r cannot show, one line per object.
+        {
+            const auto lv = imas::view::listView(filename, V);
+            check(lv.found, "listView finds the published view");
+            check(lv.lines.size() == 11, "listView lists 5 AoS groups + 6 aggregated datasets");
+            for (const auto& l : lv.lines) std::cout << "    " << l << '\n';
+
+            std::string line;
+            check(findLine(lv.lines, "/imas_view/A/B/val", line)
+                      && line.find("Dataset {2, 2}") != std::string::npos
+                      && line.find("@dims_label=A|B") != std::string::npos
+                      && line.find("holes") == std::string::npos,
+                  "A/B/val listed with dims, dim labels, and no hole");
+            check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/r", line)
+                      && line.find("Dataset {2, 5}") != std::string::npos
+                      && line.find("@ragged") != std::string::npos
+                      && line.find("holes=2") != std::string::npos,
+                  "ragged node listed with @ragged and holes=2 (10 cells, 8 stored)");
+            check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/label", line)
+                      && line.find("holes=1") != std::string::npos,
+                  "ragged text node lists holes=1 (4 cells, 3 stored)");
+            check(findLine(lv.lines, "/imas_view/C/vec5", line)
+                      && line.find("Dataset {5}") != std::string::npos,
+                  "C/vec5 listed squeezed to dims {5}");
+            check(findLine(lv.lines, "/imas_view/series", line)
+                      && line.find("Dataset {4}") != std::string::npos
+                      && line.find("@dims_label=time") != std::string::npos,
+                  "folded time series listed with its time dim label");
+            check(findLine(lv.lines, "/imas_view/A", line)
+                      && line.find("Group") != std::string::npos
+                      && line.find("@aos_size=2") != std::string::npos,
+                  "AoS group A listed with @aos_size=2");
+
+            // Read-only proof: publish needs write access, the listing must not.
+            std::error_code pec;
+            fs::permissions(filename, fs::perms::owner_read, fs::perm_options::replace, pec);
+            check(!pec, "could not make the snapshot read-only");
+            const auto ro = imas::view::listView(filename, V);
+            fs::permissions(filename, fs::perms::owner_all, fs::perm_options::add, pec);
+            check(!pec, "could not restore write permission");
+            check(ro.found && ro.lines.size() == lv.lines.size(),
+                  "listView works on a file with no write permission");
+        }
         H5Fclose(fid);
     }
     std::cout << "[collapse] OK\n";
