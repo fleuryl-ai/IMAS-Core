@@ -105,11 +105,13 @@ traités). Voici ce qui reste, par ordre d'impact.
     (T puts sur un fichier à N croissant) pour confirmer la courbe quadratique de A1
     avant/après — c'est la seule path non mesurée par to_improve.md.
 
-**Top 5 si un seul effort** : (1) engine APPEND partagé + rechargement incrémental de
-l'index, (6) parent_path en string_view préfixe (déjà fait en v3 : reste la branche
-v2/legacy), (8) hyperslab stride + lecture directe dans le buffer sortant,
-(9) cache des timebases, E3/E4 (TIMERANGE : supprimer la double sonde et la relecture
-globale-puis-troncation).
+**Top 5 si un seul effort** (mis à jour le 2026-10-11 après mesures) : (1) engine APPEND
+partagé + rechargement incrémental de l'index — c'est ce qui domine le SLICE cp
+(≈95-150 ms d'index par opération), (8) hyperslab stride + lecture directe dans le buffer
+sortant (`readLeavesUnion` : 28× d'amplification sur cp), (9) cache des timebases,
+E5 (**invalidé** — voir ci-dessous), bookkeeping par nœud du chemin TIMERANGE (cause du
+1,6× mesurée : `stripIndices` + `stringstream`, hashing, churn d'allocation —
+1,6 → 1,4 après la première correction).
 
 ## E. Nouveaux constats (2026-10-10) — lignes vérifiées dans le code courant
 
@@ -119,7 +121,7 @@ le bloc `if (status < 0) { // Handle HDF5 read error }` est **vide** → un éch
 lecture remonte comme un succès avec un buffer non initialisé. La spécialisation
 `std::string` jette, elle. — **TRAITÉ (2026-10-11)** : `H5Dread`, `H5Dget_space` et
 `H5Sselect_hyperslab` lèvent maintenant `ALBackendException` (fermeture poignées +
-`mem_type` COMPLEX128 avant le throw). Test `test_read_error_status.cpp` : 3 échecs
+`mem_type` COMPLEX128 avant le throw). Test `test_read_tensor_contract.cpp` : 3 échecs
 contre le code précédent, OK après (to_improve.md point 15).
 E2. **`readTensor<T>` ne valide pas `T` contre le dtype du leaf** : `mem_type` vient de
 `leaf.flags >> 4`, jamais de `T`. Un `readTensor<int32_t>` sur un leaf FLOAT64 écrit
@@ -142,14 +144,28 @@ E3. **TIMERANGE avec resampling lit la tranche 0 deux fois** : la sonde de forme
 boucle `for (k = 0 …)` (`:259-276`) relit exactement la même tranche. — **TRAITÉ
 (2026-10-11)** : payload de la sonde recopié dans le slot 0, boucle à partir de `k = 1`.
 **Aucun gain mesurable** (1 lecture économisée sur 8150 en plage complète ; bruit de
-±30 ms) — to_improve.md point 15. Corriger E3 seul ne sert à rien sans E4.
+±30 ms) — to_improve.md point 15. Gain de travail gaspillé et de fuite, pas de perf.
 E4. **TIMERANGE sans resampling relit le signal entier puis le tronque en RAM**
 (`timerange_read_strategy.cpp:292` `read_dataset_globally`, puis `:360-367` malloc +
 memcpy + `free(full_data)`) : lire `[tmin, tmax]` coûte la lecture complète + 2 copies.
-**Reste ouvert — c'est le vrai levier TIMERANGE.**
+— **NON ATTEIGNABLE, mesuré (2026-10-11)** : la branche (`dynamic_index == -1` avec
+`timebasename` non vide) a été instrumentée d'un compteur ; **0 hit** sur cp (5 modes de
+bench), **0 hit** sur eq (5 modes), **0 hit** sur reflectometer_profile_v2 (3 plages),
+**0 hit** sur les 85 tests. Affirmation précédente de cette revue (« c'est le vrai levier
+TIMERANGE », et le 1,6× GLOBAL→TIMERANGE qu'elle devait expliquer) est **fausse** : les
+deux modes lisent un contenu identique (244 513 nœuds, 19 780 050 doubles, même hash),
+donc l'écart vient d'ailleurs et demande sa propre mesure. La branche reste un pire cas
+théorique ; aucune mesure ne justifie d'y toucher.
 E5. **Re-tri de buckets déjà triés par temps** : `iread_strategy.h:1070`
 (`sorted_leaves`), `panzerdb.cpp:2841` (`getTimeIndex`), `:3069` `:3258` `:3532` `:3707`
 (les quatre `readXByIndex`), `:3944` (`getWholeDynamicSignal`).
+— **INVALIDÉ comme explication du 1,6× (mesuré 2026-10-11)** : dans les profils `perf` de la
+marche TIMERANGE cp, les seuls `std::sort` visibles sont celui de
+`ReadIndex::build_indexes()` (0,14-2,85 % selon le mode — il appartient au poste A1, pas ici)
+et celui de `read_dataset_globally` (0,01 %). Les tris cités par E5 (les quatre
+`readXByIndex`, `getTimeIndex`, `getWholeDynamicSignal`, `sorted_leaves`) n'apparaissent pas :
+sur la marche par nœud leur bucket contient un seul élément, et la branche d'agrégation
+`time_index == -1` n'est pas ce chemin. À ne traiter que pour de gros buckets d'agrégation.
 E6. **`restoreTimeContext()` s'exécute aussi en mode READ** — appelé à la fin d'`init()`
 après le if/else de mode (`panzerdb.cpp:408`) ; alloue `aos_path + "/"` par
 (feuille × root) plus une copie `std::string` par feuille. Mesuré **1,65 %** de la

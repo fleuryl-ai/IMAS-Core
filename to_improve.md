@@ -417,9 +417,9 @@ Medians of 3, cp, checksums identical before/after:
 
 The spread inside a single run (1711–1744 ms on the full span) is larger than the
 differences: everything here is noise. E3 is a wasted-work and leak fix, not a
-performance one. The TIMERANGE lever that does measure is **E4** — reading the
-whole signal and truncating it in RAM — still open. eq regression check
-(TIMERANGE 979 ms, SLICE 436 ms/get) unchanged within noise.
+performance one. (The sentence that used to close this point — “the TIMERANGE lever
+that does measure is E4” — was wrong and is retracted in point 17.) eq regression
+check (TIMERANGE 979 ms, SLICE 436 ms/get) unchanged within noise.
 
 ## 16. `readTensor` picked its memory type from the leaf, never from `T` (item E2) — RESOLVED (2026-10-11)
 
@@ -450,4 +450,85 @@ No behaviour change on the bench: cp/eq hashes identical to the point-14 baselin
 (`f91016520c33243d`, `cc02212c7c86c329`, `eb9093018cb67253`, `d92537f55c5f2e4b`),
 cp GLOBAL 1110 ms / SLICE 127.9 ms/get / TIMERANGE 1731 ms, eq 1384 / 438 / 985 ms.
 Suite 85/85 (test renamed to `test_read_tensor_contract`).
+
+## 17. E4 (TIMERANGE “read the whole signal, then truncate”) is never reached — mesuré (2026-10-11)
+
+Before touching it, the branch was instrumented with a one-shot counter (the
+`dynamic_index == -1` branch with a non-empty `timebasename`,
+`timerange_read_strategy.cpp:292`) and run over everything available:
+
+| où | hits |
+|---|---|
+| cp — `--timerange`, `--timerange --range` (2 points), `--timerange --dt 0.1`, `--slice`, `--global` | 0 |
+| eq — mêmes 5 modes | 0 |
+| `reflectometer_profile_v2.h5` — 3 plages | 0 |
+| `ctest` (85 tests) | 0 |
+
+Two claims are therefore retracted, mine in point 15 and in `REVIEW_PERF_hdf5_v2.md`:
+E4 is **not** “the TIMERANGE lever”, and it does not explain cp TIMERANGE full span
+being 1.6× cp GLOBAL. The measurement against that: both modes return identical content
+(244 513 nodes, 19 780 050 doubles, hash `f91016520c33243d`), so a branch that never runs
+cannot account for the gap. The gap itself is real; its cause is **not established** and
+measuring it is its own task.
+
+Side observation from the same run, **retracted as a backend bug**: on
+`reflectometer_profile_v2.h5` a 1 s window appeared to return the same 2 571 141 doubles
+as the full span. That came from the bench harness — `bench_read.cpp:244` passes
+`timebasename = ""` for AoS levels it does not mark dynamic, which takes the static
+fallback `timerange_read_strategy.cpp:155`. Probed through `HDF5Backend` with the
+timebasename the AL takes from the dictionary (`n_e/time`), the same file filters:
+`dim=2 size=[100,5126]` on the full span, `size=[100,164]` on `[34.942, 34.95]`. See
+point 19 for the real inhomogeneous-time bug found while chasing this one.
+
+Decision: leave E4 alone. Nothing measured justifies refactoring the 380-line
+`read_dataset_globally` for a branch no available file, IDS or test reaches.
+
+## 18. Cause of the remaining GLOBAL→TIMERANGE gap, measured — and one fix applied (2026-10-11)
+
+**Instrumentation:** temporary call counters on the four payload readers
+(`readSliceDirect`, `readLeavesUnion`, `readTensor`, `readStringBulk`), `--reps 1`, cp:
+
+| mode | calls HDF5 | éléments lus | éléments voulus |
+|---|---|---|---|
+| GLOBAL | 228 203 (`readLeavesUnion`) | 19 804 501 | 19 804 501 |
+| TIMERANGE pleine plage | 228 200 (`readSliceDirect`) | 19 788 200 | — |
+| TIMERANGE 2 points | 56 | 4 856 | — |
+| SLICE (20 gets) | 560 + 80 | 48 560 + 489 020 | — |
+
+So the two full walks make **the same number of HDF5 reads of the same volume**
+(≈228 k reads of ≈87 elements, no read amplification: disk == wanted). The 1.6× is
+therefore not I/O. `perf` comparing the two walks names it: in the TIMERANGE profile
+`stripIndices` 1.84 % + `getline` 1.04 % + the stream-construction cluster
+(`std::locale::locale` 1.74 %, `basic_ios::_M_cache_locale` 1.07 %,
+`__ostream_insert` 1.84 %) ≈ 7 %, allocation churn (`_int_free` 3.0 + `malloc` 2.33 +
+`cfree` 1.36) 6.7 % vs 3.8 % in GLOBAL, string hashing 4.7 % vs 3.3 %, `memmove` 6.98 %
+vs 2.6 %. Decompression is *lower* in TIMERANGE (11.9 % vs 18 %) because the per-node
+bookkeeping takes a larger share. `stripIndices` is called **twice per node**
+(`iread_strategy.h:758`, `:800`).
+
+**Fix applied:** `PanzerDB::stripIndices` rewritten without `stringstream`/`getline`
+(one pass, one string). Equivalence proven, not assumed: `test_strip_indices.cpp` pins
+a 22-case table (empty segments collapsing, all-index paths → empty, near-numeric
+segments kept, non-ASCII), and a standalone differential run of the old vs new body over
+300 021 inputs (21 hand cases + 300 000 fuzzed paths over an alphabet containing `/`)
+reports **0 mismatches**.
+
+**Measured** (medians of 3, cp, hash `f91016520c33243d` unchanged):
+
+| mode | avant | après |
+|---|---|---|
+| TIMERANGE pleine plage | 1731 ms | **1541 ms (−11 %)** |
+| SLICE (par get) | 127.9 ms | **120.2 ms (−6 %)** |
+| GLOBAL | 1110 ms | 1076 ms (~−3 %, dans le bruit : étalement 1074-1131) |
+
+Suite 86/86. Reste à attaquer dans le même poste : les constructeurs de chemin en
+`stringstream` du chemin GLOBAL (`iread_strategy.h:966`, `:1003`) et le hachage de
+chaîne par nœud.
+
+**Correction de E5** (revue) : dans les profils `perf` de la marche TIMERANGE cp, les seuls
+`std::sort` visibles sont celui de `ReadIndex::build_indexes()` (0,14 % — il relève du poste
+A1) et celui de `read_dataset_globally` (0,01 %). Les tris listés par E5 (les quatre
+`readXByIndex`, `getTimeIndex`, `getWholeDynamicSignal`, `sorted_leaves`) n'y apparaissent
+pas : leur bucket compte un seul élément sur ce chemin, et la branche d'agrégation
+`time_index == -1` n'est pas la marche par nœud. Ils ne sont pas la cause du 1,6×.
 

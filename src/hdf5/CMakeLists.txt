@@ -252,6 +252,9 @@ al_add_hdf5_test(test_time_resolution)
 al_add_hdf5_test(test_read_tensor_contract)
 # Explicit read-side node-role rules (to_improve.md point 3, conservative pass).
 al_add_hdf5_test(test_read_node_roles)
+# stripIndices equivalence table, pinning its stringstream-free rewrite (the
+# function runs twice per node on the read path).
+al_add_hdf5_test(test_strip_indices)
 
 # Ajouter les outils HDF5
 add_subdirectory(tools)

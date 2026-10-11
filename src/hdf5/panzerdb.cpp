@@ -3994,22 +3994,24 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
 std::string PanzerDB::stripIndices(const std::string& path) {
     std::string result;
     result.reserve(path.size());
-    
-    std::stringstream ss(path);
-    std::string segment;
-    
-    bool first = true;
-    while(std::getline(ss, segment, '/')) {
-        if (segment.empty()) continue;
-        
-        // Check if numeric (heuristic for index)
-        bool is_index = !segment.empty() && std::all_of(segment.begin(), segment.end(), ::isdigit);
-        
-        if (!is_index) {
-            if (!first) result += '/';
-            result += segment;
-            first = false;
+
+    // One pass over the segments. Equivalent to splitting on '/' and dropping the
+    // empty ones and the purely-numeric ones (AoS indices), but without a
+    // stringstream: this runs twice per node on the read path, and constructing a
+    // stream (locale + ios bookkeeping) was measurable there.
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t end = path.find('/', i);
+        if (end == std::string::npos) end = path.size();
+        const size_t len = end - i;
+        bool is_index = (len > 0);
+        for (size_t k = i; k < end && is_index; ++k)
+            is_index = (path[k] >= '0' && path[k] <= '9');
+        if (len > 0 && !is_index) {
+            if (!result.empty()) result += '/';
+            result.append(path, i, len);
         }
+        i = end + 1;
     }
     return result;
 }
