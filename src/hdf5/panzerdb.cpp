@@ -1860,11 +1860,21 @@ void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
     hid_t space = H5Dget_space(dset_id);
-    H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL);
+    if (space < 0) {
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Dget_space failed", LOG);
+    }
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL) < 0) {
+        H5Sclose(space);
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Sselect_hyperslab failed", LOG);
+    }
     hid_t memspace = H5Screate_simple(1, &hcount, NULL);
     herr_t status = H5Dread(dset_id, mem_type, memspace, space, H5P_DEFAULT, out_buffer);
     if (status < 0) {
-        // Handle HDF5 read error
+        H5Sclose(memspace); H5Sclose(space);
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Dread failed for numeric tensor", LOG);
     }
     H5Sclose(memspace); H5Sclose(space);
     if (type == DataType::COMPLEX128) {

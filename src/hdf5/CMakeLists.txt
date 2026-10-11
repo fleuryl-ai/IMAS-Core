@@ -246,6 +246,9 @@ al_add_hdf5_test(test_path_sanitization)
 # Slice-resolution contract of DataInterpolation (oracle = original linear scans),
 # the safety net for replacing those scans by binary searches.
 al_add_hdf5_test(test_time_resolution)
+# readTensor must raise on a failing HDF5 read instead of returning the caller's
+# uninitialized buffer (REVIEW_PERF_hdf5_v2.md item E1).
+al_add_hdf5_test(test_read_error_status)
 # Explicit read-side node-role rules (to_improve.md point 3, conservative pass).
 al_add_hdf5_test(test_read_node_roles)
 

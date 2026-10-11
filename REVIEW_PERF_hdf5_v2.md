@@ -117,21 +117,28 @@ globale-puis-troncation).
 E1. **`readTensor` numeric ignore le statut de `H5Dread`** (`panzerdb.cpp:1865-1868`) :
 le bloc `if (status < 0) { // Handle HDF5 read error }` est **vide** → un échec de
 lecture remonte comme un succès avec un buffer non initialisé. La spécialisation
-`std::string` jette, elle.
+`std::string` jette, elle. — **TRAITÉ (2026-10-11)** : `H5Dread`, `H5Dget_space` et
+`H5Sselect_hyperslab` lèvent maintenant `ALBackendException` (fermeture poignées +
+`mem_type` COMPLEX128 avant le throw). Test `test_read_error_status.cpp` : 3 échecs
+contre le code précédent, OK après (to_improve.md point 15).
 E2. **`readTensor<T>` ne valide pas `T` contre le dtype du leaf** : `mem_type` vient de
 `leaf.flags >> 4`, jamais de `T`. Un `readTensor<int32_t>` sur un leaf FLOAT64 écrit
 8 octets/élément dans un buffer de `count` `int32_t` → débordement. Le chemin chaud
 alloue d'après `actual_type_enum` (`iread_strategy.h:1264-1269`) donc n'est pas exposé ;
 `iread_strategy.h:842 readLeafData` l'est — et `readLeafData` n'a **aucun appelant**
-(code mort, à supprimer ou à protéger).
+(code mort, à supprimer ou à protéger). **Reste ouvert.**
 
 ### Performances
 E3. **TIMERANGE avec resampling lit la tranche 0 deux fois** : la sonde de forme
 (`timerange_read_strategy.cpp:235-245`, sur `requested_times[0]`) est `free()`, puis la
-boucle `for (k = 0 …)` (`:259-276`) relit exactement la même tranche.
+boucle `for (k = 0 …)` (`:259-276`) relit exactement la même tranche. — **TRAITÉ
+(2026-10-11)** : payload de la sonde recopié dans le slot 0, boucle à partir de `k = 1`.
+**Aucun gain mesurable** (1 lecture économisée sur 8150 en plage complète ; bruit de
+±30 ms) — to_improve.md point 15. Corriger E3 seul ne sert à rien sans E4.
 E4. **TIMERANGE sans resampling relit le signal entier puis le tronque en RAM**
 (`timerange_read_strategy.cpp:292` `read_dataset_globally`, puis `:360-367` malloc +
 memcpy + `free(full_data)`) : lire `[tmin, tmax]` coûte la lecture complète + 2 copies.
+**Reste ouvert — c'est le vrai levier TIMERANGE.**
 E5. **Re-tri de buckets déjà triés par temps** : `iread_strategy.h:1070`
 (`sorted_leaves`), `panzerdb.cpp:2841` (`getTimeIndex`), `:3069` `:3258` `:3532` `:3707`
 (les quatre `readXByIndex`), `:3944` (`getWholeDynamicSignal`).

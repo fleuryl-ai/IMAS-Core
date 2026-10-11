@@ -377,3 +377,47 @@ once per operation because `endAction` closes the file). eq SLICE_OP ≈ 440 ms/
 is ≈ 30 % `inflate`: chunk/filter granularity, not read-path algorithm. cp
 TIMERANGE (1763 ms) is still 1.6× a GLOBAL read of the same content.
 
+## 15. Two read-path defects from the bottom-up re-read: swallowed HDF5 error, duplicated slice — RESOLVED (2026-10-11)
+
+`REVIEW_PERF_hdf5_v2.md` items E1 and E3, both fixed.
+
+**E1 — `readTensor` numeric ignored the `H5Dread` status.** The body of
+`if (status < 0)` was literally a comment, so a failing read came back as a
+success carrying whatever the caller's buffer held. `H5Dget_space` and
+`H5Sselect_hyperslab` were unchecked too, unlike the `std::string`
+specialisation which already threw. Now all three raise
+`ALBackendException` (handles and the COMPLEX128 array type closed first).
+
+Not reachable through the index on a healthy file — the `getLeaves()` guardrail
+skips data rows running past the materialised extent — which is why it never
+showed up. It is reachable with a half-written index, so it is pinned directly:
+`tests/hdf5_backend/test_read_error_status.cpp` hands a hand-built `Leaf` to
+`readTensor` (offset past the extent, and offset inside / count past it).
+Against the pre-fix code that test reports 3 failures (silent success); with
+the fix, 85/85 ctest.
+
+**E3 — TIMERANGE read slice 0 twice.** The shape probe
+(`timerange_read_strategy.cpp`) read `requested_times[0]`, reported its shape,
+then `free()`d the payload while the fill loop started again at `k = 0` and read
+the same slice a second time. The probe payload is now kept and copied to slot 0
+and the loop starts at `k = 1`; because the free moved later, the two
+early-return paths that sit between (`elem_bytes == 0`, `malloc` failure) free it
+themselves so nothing leaks.
+
+**Measured: no gain, as expected.** E3 removes exactly one slice read per
+`get()` — 1 of 8150 on a full-span cp range, 1 of 3 on a 2-point range — and the
+walk is dominated by the once-per-operation index reload (94–151 ms, point 1).
+Medians of 3, cp, checksums identical before/after:
+
+| cas cp TIMERANGE | avant | après |
+|---|---|---|
+| plage complète (8150 pas) | 1751.6 ms | 1717.4 ms |
+| 10 points | 113.7 ms | 110.5 ms |
+| 2 points | 107.4 ms | 108.9 ms |
+
+The spread inside a single run (1711–1744 ms on the full span) is larger than the
+differences: everything here is noise. E3 is a wasted-work and leak fix, not a
+performance one. The TIMERANGE lever that does measure is **E4** — reading the
+whole signal and truncating it in RAM — still open. eq regression check
+(TIMERANGE 979 ms, SLICE 436 ms/get) unchanged within noise.
+

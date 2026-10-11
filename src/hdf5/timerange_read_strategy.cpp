@@ -242,21 +242,25 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
             }
             size_t per_slice_count = 1;
             for (size_t d = 0; d < probe_ndim; ++d) per_slice_count *= (size_t)probe_shape[d];
-            free(probe_buf);
 
             size_t elem_bytes = 0;
             if (*datatype == alconst::double_data)      elem_bytes = sizeof(double);
             else if (*datatype == alconst::integer_data) elem_bytes = sizeof(int);
             else if (*datatype == alconst::complex_data) elem_bytes = sizeof(std::complex<double>);
-            if (elem_bytes == 0) return 0;
+            if (elem_bytes == 0) { free(probe_buf); return 0; }
 
             size_t nb = requested_times.size();
             void* out_buf = malloc(nb * per_slice_count * elem_bytes);
-            if (!out_buf) return 0;
+            if (!out_buf) { free(probe_buf); return 0; }
             char* out_ptr = (char*)out_buf;
 
+            // The probe above already resolved requested_times[0]; keep its payload
+            // instead of reading that same slice a second time as k = 0.
+            memcpy(out_ptr, probe_buf, per_slice_count * elem_bytes);
+            free(probe_buf);
+
             // Fill the output buffer: one resolved slice per requested time.
-            for (size_t k = 0; k < nb; ++k) {
+            for (size_t k = 1; k < nb; ++k) {
                 uint64_t ndim_k = 0;
                 uint64_t shape_k[6] = {0};
                 void* slice_buf = nullptr;
