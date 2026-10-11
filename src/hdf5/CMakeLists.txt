@@ -243,6 +243,9 @@ al_add_hdf5_test(test_h5read_overloads)
 # --------------------------------------------------------------------------
 al_add_hdf5_test(test_path_parser_syntax)
 al_add_hdf5_test(test_path_sanitization)
+# Slice-resolution contract of DataInterpolation (oracle = original linear scans),
+# the safety net for replacing those scans by binary searches.
+al_add_hdf5_test(test_time_resolution)
 # Explicit read-side node-role rules (to_improve.md point 3, conservative pass).
 al_add_hdf5_test(test_read_node_roles)
 

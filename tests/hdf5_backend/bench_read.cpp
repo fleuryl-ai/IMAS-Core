@@ -11,6 +11,15 @@
 //
 // Usage: bench_read --file <file.h5> [--reps N] [--cold] [--mode all|perleaf|grouped]
 //                  [--cache <nbytes>,<nslots>,<w0>]
+//                  --global|--slice|--timerange --dir <pulse dir> --ids <IDS name>
+//                  [--nslices N] [--range tmin,tmax] [--dt step] [--interp ...]
+//
+// --global / --slice / --timerange walk the same index-derived tree through
+// HDF5Backend, once per range mode: GLOBAL_OP (all slices), SLICE_OP (one time,
+// repeated --nslices times) and TIMERANGE_OP ([tmin,tmax], optionally resampled
+// with --dt).  Each mode prints content checksums, so a read-side change is
+// proved lossless by comparing a mode's checksums before/after (they are not
+// comparable ACROSS modes: each range mode reads a different set of elements).
 // @note Not a ctest test: a measurement tool (src/hdf5/CMakeLists.txt builds it).
 #include "panzerdb.h"
 #include "hdf5_backend.h"
@@ -48,15 +57,26 @@ struct Options {
     bool grouped = true;
     bool cache_set = false;
     bool global = false;
+    bool slice = false;
+    bool timerange = false;
     std::string dir, ids;
     size_t cache_bytes = 0, cache_slots = 0;
     double cache_w0 = 0.75;
+    // Range-mode knobs (shared by --slice / --timerange).
+    int nslices = 20;                 // how many SLICE_OP gets per rep
+    double tmin = 0, tmax = 0;        // TIMERANGE window (0,0 == whole timebase)
+    std::vector<double> dtime;        // --dt: resampling step (TIMERANGE only)
+    int interp = alconst::closest_interp;
 };
 
 static void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " --file <v2 file> [--reps N] [--cold] [--mode all|perleaf|grouped]"
-                 " [--cache <nbytes>,<nslots>,<w0>]\n";
+                 " [--cache <nbytes>,<nslots>,<w0>]\n"
+                 "       " << argv0
+              << " --global|--slice|--timerange --dir <pulse dir> --ids <IDS name>"
+                 " [--nslices N] [--range tmin,tmax] [--dt step]\n"
+                 "                        [--interp closest|previous|linear]\n";
 }
 
 static bool parse_args(int argc, char** argv, Options& o) {
@@ -71,6 +91,20 @@ static bool parse_args(int argc, char** argv, Options& o) {
             o.grouped = (m == "all" || m == "grouped");
         }
         else if (a == "--global") o.global = true;
+        else if (a == "--slice") o.slice = true;
+        else if (a == "--timerange") o.timerange = true;
+        else if (a == "--nslices" && i + 1 < argc) o.nslices = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--range" && i + 1 < argc) {
+            if (sscanf(argv[++i], "%lf,%lf", &o.tmin, &o.tmax) < 2) { usage(argv[0]); return false; }
+        }
+        else if (a == "--dt" && i + 1 < argc) o.dtime.push_back(std::atof(argv[++i]));
+        else if (a == "--interp" && i + 1 < argc) {
+            const std::string m = argv[++i];
+            if (m == "closest") o.interp = alconst::closest_interp;
+            else if (m == "previous") o.interp = alconst::previous_interp;
+            else if (m == "linear") o.interp = alconst::linear_interp;
+            else { usage(argv[0]); return false; }
+        }
         else if (a == "--dir" && i + 1 < argc) o.dir = argv[++i];
         else if (a == "--ids" && i + 1 < argc) o.ids = argv[++i];
         else if (a == "--cache" && i + 1 < argc) {
@@ -82,9 +116,10 @@ static bool parse_args(int argc, char** argv, Options& o) {
         else { usage(argv[0]); return false; }
     }
     if (o.file.empty()) { usage(argv[0]); return false; }
-    if (o.global) {
+    const bool al_mode = o.global || o.slice || o.timerange;
+    if (al_mode) {
         if (o.dir.empty() || o.ids.empty()) { usage(argv[0]); return false; }
-        o.perleaf = o.grouped = false;   // --global replaces the engine modes
+        o.perleaf = o.grouped = false;   // the AL walk replaces the engine modes
     }
     return true;
 }
@@ -264,6 +299,34 @@ static void walk(HDF5Backend& backend, Ctx* ctx, const GNode& node,
     }
 }
 
+// Reads every "time" dataset of the IDS so --slice / --timerange can pick probe
+// times out of real stored values.  Sorted + deduplicated: a file holding one
+// timebase per dynamic AoS yields the union of their points.
+static std::vector<double> load_timebase(PanzerDB& db) {
+    std::vector<double> out;
+    for (const auto& l : db.getLeaves()) {
+        if ((l.flags & 0xFULL) != 0 || l.count == 0) continue;
+        if (static_cast<PanzerDB::DataType>(l.flags >> 4) != PanzerDB::DataType::FLOAT64) continue;
+        const auto slash = l.path.find_last_of('/');
+        const std::string_view name = (slash == std::string_view::npos) ? l.path : l.path.substr(slash + 1);
+        if (name != "time") continue;
+        std::vector<double> buf(l.count);
+        db.readTensor(l, buf.data());
+        out.insert(out.end(), buf.begin(), buf.end());
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static const char* interp_name(int interp) {
+    switch (interp) {
+        case alconst::previous_interp: return "previous";
+        case alconst::linear_interp:   return "linear";
+        default:                       return "closest";
+    }
+}
+
 int main(int argc, char** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) return 1;
@@ -377,7 +440,7 @@ int main(int argc, char** argv) {
         runs.push_back(r);
     }
 
-    if (o.global) {
+    if (o.global || o.slice || o.timerange) {
         namespace fs = std::filesystem;
         const std::string uri = "imas:hdf5?path=" + o.dir;
         // A pulse directory needs its master file: create it once, then drop the
@@ -397,6 +460,7 @@ int main(int argc, char** argv) {
         // Tree + types come from the index (outside of the timed sections).
         GNode root;
         std::map<std::string, PanzerDB::DataType> dtype_of;
+        std::vector<double> timebase;
         {
             PanzerDB db(o.file, PanzerDB::OpenMode::READ);
             for (const auto& l : db.getLeaves()) {
@@ -406,6 +470,7 @@ int main(int argc, char** argv) {
                     static_cast<PanzerDB::DataType>(l.flags >> 4);
             }
             build_tree(db.getLeaves(), root);
+            if (o.slice || o.timerange) timebase = load_timebase(db);
             if (getenv("BENCH_DEBUG")) {
                 int shown = 0;
                 for (const auto& l : db.getLeaves()) {
@@ -460,31 +525,102 @@ int main(int argc, char** argv) {
             }
         }
 
-        for (int rep = 0; rep < o.reps; ++rep) {
-            if (o.cold) drop_page_cache(o.dir + "/" + o.ids + ".h5");
-            auto t0 = clock_type::now();
-            DataEntryContext dec(uri);
-            HDF5Backend backend;
-            backend.openPulse(&dec, OPEN_PULSE);
-            const double open_ms = ms_since(t0);
+        if (o.global) {
+            for (int rep = 0; rep < o.reps; ++rep) {
+                if (o.cold) drop_page_cache(o.dir + "/" + o.ids + ".h5");
+                auto t0 = clock_type::now();
+                DataEntryContext dec(uri);
+                HDF5Backend backend;
+                backend.openPulse(&dec, OPEN_PULSE);
+                const double open_ms = ms_since(t0);
 
-            auto t1 = clock_type::now();
-            OperationContext oc(&dec, o.ids, "", READ_OP);
-            backend.beginAction(&oc);
-            GCounters c;
-            walk(backend, &oc, root, dtype_of, c);
-            backend.endAction(&oc);
-            const double read_ms = ms_since(t1);
+                auto t1 = clock_type::now();
+                OperationContext oc(&dec, o.ids, "", READ_OP);
+                backend.beginAction(&oc);
+                GCounters c;
+                walk(backend, &oc, root, dtype_of, c);
+                backend.endAction(&oc);
+                const double read_ms = ms_since(t1);
 
-            backend.closePulse(&dec, CLOSE_PULSE);
-            printf("rep %d: open %.1f ms | global read %.1f ms | nodes %lld | d_elems %lld i_elems %lld | hash %016llx i=%lld str=%lld\n",
-                   rep, open_ms, read_ms, c.nodes, c.d_elems, c.i_elems, (unsigned long long)c.d_hash, c.i_sum, c.str_len);
-            g_runs.push_back({read_ms});
+                backend.closePulse(&dec, CLOSE_PULSE);
+                printf("rep %d: open %.1f ms | global read %.1f ms | nodes %lld | d_elems %lld i_elems %lld | hash %016llx i=%lld str=%lld\n",
+                       rep, open_ms, read_ms, c.nodes, c.d_elems, c.i_elems, (unsigned long long)c.d_hash, c.i_sum, c.str_len);
+                g_runs.push_back({read_ms});
+            }
+            std::vector<double> gv;
+            for (const auto& r : g_runs) gv.push_back(r.index_ms);
+            std::sort(gv.begin(), gv.end());
+            printf("MEDIAN GLOBAL READ: %.1f ms\n", gv[gv.size() / 2]);
         }
-        std::vector<double> gv;
-        for (const auto& r : g_runs) gv.push_back(r.index_ms);
-        std::sort(gv.begin(), gv.end());
-        printf("MEDIAN GLOBAL READ: %.1f ms\n", gv[gv.size() / 2]);
+
+        // SLICE_OP: K gets, each at one stored time.  A real client reading many
+        // slices does exactly this, so the per-operation cost (index load, time
+        // resolution) shows up here multiplied by K.
+        if (o.slice) {
+            if (timebase.empty()) { std::cerr << "--slice: no 'time' dataset in " << o.file << '\n'; return 1; }
+            std::vector<double> times;
+            for (int k = 0; k < o.nslices; ++k) {
+                const size_t idx = (o.nslices == 1)
+                    ? timebase.size() / 2
+                    : (size_t)((double)k * (double)(timebase.size() - 1) / (double)(o.nslices - 1));
+                times.push_back(timebase[idx]);
+            }
+            std::vector<double> ms_rep;
+            for (int rep = 0; rep < o.reps; ++rep) {
+                if (o.cold) drop_page_cache(o.dir + "/" + o.ids + ".h5");
+                DataEntryContext dec(uri);
+                HDF5Backend backend;
+                backend.openPulse(&dec, OPEN_PULSE);
+                GCounters c;
+                const auto t1 = clock_type::now();
+                for (double t : times) {
+                    OperationContext oc(&dec, o.ids, READ_OP, alconst::slice_op, t, o.interp);
+                    backend.beginAction(&oc);
+                    walk(backend, &oc, root, dtype_of, c);
+                    backend.endAction(&oc);
+                }
+                const double ms = ms_since(t1);
+                backend.closePulse(&dec, CLOSE_PULSE);
+                printf("rep %d: %zu SLICE_OP gets (%s interp) -> %.1f ms | %.2f ms/get | nodes %lld | d_elems %lld i_elems %lld | hash %016llx i=%lld str=%lld\n",
+                       rep, times.size(), interp_name(o.interp), ms, ms / (double)times.size(),
+                       c.nodes, c.d_elems, c.i_elems, (unsigned long long)c.d_hash, c.i_sum, c.str_len);
+                ms_rep.push_back(ms);
+            }
+            std::sort(ms_rep.begin(), ms_rep.end());
+            const double med = ms_rep[ms_rep.size() / 2];
+            printf("MEDIAN %zu-SLICE WALK: %.1f ms (%.2f ms/get)\n",
+                   times.size(), med, med / (double)times.size());
+        }
+
+        // TIMERANGE_OP: one get() over [tmin,tmax].  --dt adds resampling, which
+        // routes the read through DataInterpolation::interpolate_with_resampling.
+        if (o.timerange) {
+            if (timebase.empty()) { std::cerr << "--timerange: no 'time' dataset in " << o.file << '\n'; return 1; }
+            double tmin = o.tmin, tmax = o.tmax;
+            if (tmax <= tmin) { tmin = timebase.front(); tmax = timebase.back(); }
+            std::vector<double> ms_rep;
+            for (int rep = 0; rep < o.reps; ++rep) {
+                if (o.cold) drop_page_cache(o.dir + "/" + o.ids + ".h5");
+                DataEntryContext dec(uri);
+                HDF5Backend backend;
+                backend.openPulse(&dec, OPEN_PULSE);
+                GCounters c;
+                const auto t1 = clock_type::now();
+                OperationContext oc(&dec, o.ids, READ_OP, alconst::timerange_op, tmin, tmax, o.dtime, o.interp);
+                backend.beginAction(&oc);
+                walk(backend, &oc, root, dtype_of, c);
+                backend.endAction(&oc);
+                const double ms = ms_since(t1);
+                backend.closePulse(&dec, CLOSE_PULSE);
+                printf("rep %d: TIMERANGE [%g, %g] ndt=%zu dt=%g (%s interp) -> %.1f ms | nodes %lld | d_elems %lld i_elems %lld | hash %016llx i=%lld str=%lld\n",
+                       rep, tmin, tmax, o.dtime.size(), o.dtime.empty() ? 0.0 : o.dtime.front(),
+                       interp_name(o.interp), ms,
+                       c.nodes, c.d_elems, c.i_elems, (unsigned long long)c.d_hash, c.i_sum, c.str_len);
+                ms_rep.push_back(ms);
+            }
+            std::sort(ms_rep.begin(), ms_rep.end());
+            printf("MEDIAN TIMERANGE WALK: %.1f ms\n", ms_rep[ms_rep.size() / 2]);
+        }
         return 0;
     }
 

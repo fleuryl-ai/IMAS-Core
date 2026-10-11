@@ -63,9 +63,12 @@ traités). Voici ce qui reste, par ordre d'impact.
    `time_values_cache` côté stratégie.
 10. **`nearestAvailableSliceIndex` (panzerdb.cpp:2528-2539)** : recherche **linéaire**
     index par index dans les gaps, chaque test faisant jusqu'à 3 hash lookups +
-    construction de `substituted_path`. Parcourir les lignes du bucket (déjà écrites en
-    ordre de temps) avec une recherche binaire sur `time_index` → O(log) au lieu de
-    O(gap).
+    construction de `substituted_path`. **PARTIELLEMENT TRAITÉ (2026-10-10)** : le
+    balayage des *lignes d'un path* (le coût réel de chaque test) est devenu une
+    recherche binaire sur `time_index` via `PanzerDB::rowsForTime()` — cp TIMERANGE
+    12 949 ms → 1 763 ms, `isTimeInLeaf` sorti du profil (to_improve.md point 14).
+    Reste la boucle **index par index** sur `time_basis` : interroger directement
+    les lignes triées du bucket en binaire supprimerait aussi cette boucle.
 11. **`readStringDataByIndex` (panzerdb.cpp:2933)** lit **toutes** les slots de la
     feuille (`scratch_str.resize(count)`) pour extraire un seul pas : hyperslab exact
     `[offset + local_step*element_size, element_size)` quand la feuille a plusieurs pas.
@@ -75,21 +78,23 @@ traités). Voici ce qui reste, par ordre d'impact.
 
 ## C. Table d'index — évolutions qui valent le coup
 
-13. **Interning des chemins (plus gros gain structurel)** : colonne `path_id` (u32)
-    dans `/index` + table `/path_table` des chemins uniques. Les lignes répétées
-    (signal × 8150 pas, même path) passent de 256 B/ligne à 4 B ; le bench (171k
-    lignes) : ~44 MB → ~1 MB lus en RAM. `leaf_lookup`/`parent_lookup` construits sur
-    des ids (hash u32 au lieu de strlen+hash de chaîne) ; parent_path devient
-    `(path_id, n_strip)` ou un id. C'est l'évolution n°1 du schéma.
-14. **Packing des colonnes** : ndim/shape/time/flags/parent tiennent en u32
-    (offset/count en u64) → dataset compound : 96 B → ~56 B/ligne (-40 % d'I/O index).
-    Combiné avec 13 : ~24 B/ligne.
+13. **Interning des chemins (plus gros gain structurel)** — **FAIT (layout v3)** :
+    colonne `path_id` (u32) dans `/index` + table `/path_table` des chemins uniques
+    (`panzerdb.h:152-154` `PANZER_INDEX_VERSION_V3` / `PANZER_INDEX_COLUMNS_V3`,
+    création `panzerdb.cpp:206-208`, lecture `panzerdb.cpp` branche v3 de `getLeaves`).
+    Les nouveaux fichiers écrivent en v3 ; le lecteur garde la branche v2/legacy
+    (12/14 colonnes + `/paths`) pour les fichiers existants — c'est là que restent les
+    2 allocations `std::string`/feuille et les 2 blocs de 256 B.
+14. **Packing des colonnes** — **FAIT (layout v3)** : `/index` v3 = 7 u64 packés.
+    Un fichier v3 se recharge donc déjà au quart du volume ; rien de fait pour les
+    fichiers v2.
 15. **Bit de rôle dans `flags`** (timebase / scalaire / liste / signal temporel) :
     achève le point 3 "still open" de to_improve.md — supprime
     `stripIndices`/`isTimebaseDataset`/heuristiques de shape à chaque lecture, et rend
     le contrat scalaire-vs-liste indépendant de l'inférence legacy.
-16. **Attribut de version de format** explicite (au lieu d'inférer 12/14 colonnes via
-    `dims[1]`) pour débloquer 13/14 sans devinettes.
+16. **Attribut de version de format explicite** — **FAIT** : attribut `index_version`
+    lu à l'ouverture (branche READ de `init()`) avec repli sur `dims[1]` pour les
+    fichiers sans attribut.
 17. (Optionnel) **Table de récap par signal** (path_id → range de lignes, min/max
     time, dtype) pour que `read_dataset_globally`/`getWholeDynamicSignal` trouvent
     leurs feuilles par plage de lignes sans buckets de strings.
@@ -101,5 +106,51 @@ traités). Voici ce qui reste, par ordre d'impact.
     avant/après — c'est la seule path non mesurée par to_improve.md.
 
 **Top 5 si un seul effort** : (1) engine APPEND partagé + rechargement incrémental de
-l'index, (6) parent_path en string_view préfixe, (8) hyperslab stride + lecture directe
-dans le buffer sortant, (13) path interning, (9) cache des timebases.
+l'index, (6) parent_path en string_view préfixe (déjà fait en v3 : reste la branche
+v2/legacy), (8) hyperslab stride + lecture directe dans le buffer sortant,
+(9) cache des timebases, E3/E4 (TIMERANGE : supprimer la double sonde et la relecture
+globale-puis-troncation).
+
+## E. Nouveaux constats (2026-10-10) — lignes vérifiées dans le code courant
+
+### Correction (à traiter avant les performances)
+E1. **`readTensor` numeric ignore le statut de `H5Dread`** (`panzerdb.cpp:1865-1868`) :
+le bloc `if (status < 0) { // Handle HDF5 read error }` est **vide** → un échec de
+lecture remonte comme un succès avec un buffer non initialisé. La spécialisation
+`std::string` jette, elle.
+E2. **`readTensor<T>` ne valide pas `T` contre le dtype du leaf** : `mem_type` vient de
+`leaf.flags >> 4`, jamais de `T`. Un `readTensor<int32_t>` sur un leaf FLOAT64 écrit
+8 octets/élément dans un buffer de `count` `int32_t` → débordement. Le chemin chaud
+alloue d'après `actual_type_enum` (`iread_strategy.h:1264-1269`) donc n'est pas exposé ;
+`iread_strategy.h:842 readLeafData` l'est — et `readLeafData` n'a **aucun appelant**
+(code mort, à supprimer ou à protéger).
+
+### Performances
+E3. **TIMERANGE avec resampling lit la tranche 0 deux fois** : la sonde de forme
+(`timerange_read_strategy.cpp:235-245`, sur `requested_times[0]`) est `free()`, puis la
+boucle `for (k = 0 …)` (`:259-276`) relit exactement la même tranche.
+E4. **TIMERANGE sans resampling relit le signal entier puis le tronque en RAM**
+(`timerange_read_strategy.cpp:292` `read_dataset_globally`, puis `:360-367` malloc +
+memcpy + `free(full_data)`) : lire `[tmin, tmax]` coûte la lecture complète + 2 copies.
+E5. **Re-tri de buckets déjà triés par temps** : `iread_strategy.h:1070`
+(`sorted_leaves`), `panzerdb.cpp:2841` (`getTimeIndex`), `:3069` `:3258` `:3532` `:3707`
+(les quatre `readXByIndex`), `:3944` (`getWholeDynamicSignal`).
+E6. **`restoreTimeContext()` s'exécute aussi en mode READ** — appelé à la fin d'`init()`
+après le if/else de mode (`panzerdb.cpp:408`) ; alloue `aos_path + "/"` par
+(feuille × root) plus une copie `std::string` par feuille. Mesuré **1,65 %** de la
+marche SLICE cp (le moteur étant recréé à chaque opération, cf. A1).
+E7. **Buffers de chaînes zero-initialisés pour rien** : `panzerdb.cpp:1917` et `:1962`
+(`std::vector<char> buf(n * STRING_MAX_LEN, 0)` puis `H5Dread` qui écrase tout).
+E8. **Métadonnées lues puis jetées** : `slice_read_strategy.cpp:111`,
+`iread_strategy.h:978`, `timerange_read_strategy.cpp:437` appellent `readMetadata` et
+descartent le résultat ; `readMetadata` marque le schema traité, donc la valeur n'est
+plus récupérable ensuite → une relecture disque inutile par schema et par session.
+E9. **API directe** : `direct_access_api.cpp:321-327` relit la feuille sonde dans la
+boucle qui suit ; `get_time_vector` fait un `readScalar` (= 1 `H5Dread`) par pas alors
+que `getWholeDynamicSignal("time")` est appelé juste en dessous.
+
+### Fausse alerte — ne pas « corriger »
+`cached_paths_blocks` / `cached_parent_paths_blocks` **ne fuient pas** : la file est
+vidée à chaque rebuild (`panzerdb.cpp:1514-1515`), avant les deux branches de layout ;
+elle ne contient qu'un bloc. Le coût réel reste le rechargement **total** de `/index` +
+`/paths` à chaque rebuild (point A1), pas l'accumulation de blocs.

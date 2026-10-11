@@ -61,6 +61,34 @@ constexpr size_t STRING_MAX_LEN = 512;
 
 // Process-wide chunking override (see setDefaultChunkingConfig).
 ChunkingConfig PanzerDB::s_default_chunk_config;
+namespace {
+// Time span covered by one index row: [time_index, time_index + steps). Shares
+// the arithmetic with PanzerDB::isTimeInLeaf so the ordering check done while the
+// index cache is built cannot drift away from the predicate it guards.
+uint64_t row_time_steps(const PanzerDB::Leaf& leaf)
+{
+    size_t slice_volume = 1;
+    for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+    size_t n_steps = (slice_volume > 0) ? (leaf.count / slice_volume) : 1;
+    if (n_steps == 0) n_steps = 1;
+    return n_steps;
+}
+
+// Rows of one path may be narrowed by binary search only while every adjacent
+// pair keeps increasing, non-overlapping time spans of data rows; anything else
+// (meta rows interleaved, appended out of order, overlapping chunks) is recorded
+// in time_lookup_unsafe_paths and keeps the original row-by-row lookup.
+void note_row_order(std::string_view path, const PanzerDB::Leaf& prev, const PanzerDB::Leaf& cur,
+                    std::unordered_set<std::string_view>& unsafe_paths)
+{
+    if ((prev.flags & 0xF) != 0 || (cur.flags & 0xF) != 0) {
+        unsafe_paths.insert(path);
+        return;
+    }
+    if (cur.time_index < prev.time_index + row_time_steps(prev)) unsafe_paths.insert(path);
+}
+} // namespace
+
 bool PanzerDB::s_has_default_chunk_config = false;
 
 // PanzerDB constructor modification
@@ -1446,6 +1474,7 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     ++leaf_cache_gen;
     cached_leaves.clear();
     leaf_lookup.clear();
+    time_lookup_unsafe_paths.clear();
     parent_lookup.clear();
     metadata_by_schema.clear();
     max_time_at_dynamic_root.clear();
@@ -1585,7 +1614,10 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
                 leaf.shape[d] = (row[4 + d / 2] >> ((d % 2) * 32)) & 0xFFFFFFFFULL;
             }
 
-            leaf_lookup[leaf.path].push_back(cached_leaves.size() - 1);
+            auto& path_rows = leaf_lookup[leaf.path];
+            if (!path_rows.empty())
+                note_row_order(leaf.path, cached_leaves[path_rows.back()], leaf, time_lookup_unsafe_paths);
+            path_rows.push_back(cached_leaves.size() - 1);
             parent_lookup[leaf.parent_path].push_back(cached_leaves.size() - 1);
 
             const auto at_pos = leaf.path.find('@');
@@ -1735,7 +1767,10 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         for (uint64_t d = 0; d < ndim && d < 6; ++d) leaf.shape[d] = row[shape_c + d];
         
         // Populate lookups
-        leaf_lookup[leaf.path].push_back(cached_leaves.size() - 1);
+        auto& path_rows = leaf_lookup[leaf.path];
+        if (!path_rows.empty())
+            note_row_order(leaf.path, cached_leaves[path_rows.back()], leaf, time_lookup_unsafe_paths);
+        path_rows.push_back(cached_leaves.size() - 1);
         parent_lookup[leaf.parent_path].push_back(cached_leaves.size() - 1);
 
         // Metadata rows are "@key" leaves: index them by their schema path (the
@@ -2845,15 +2880,38 @@ bool PanzerDB::isTimeInLeaf(const Leaf& leaf, int64_t time_index) const {
     // Spatial volume calculation
     size_t slice_volume = 1;
     for (auto s : leaf.shape_span()) if(s > 0) slice_volume *= s;
-    
+
     // Time steps count calculation
     size_t n_steps = (slice_volume > 0) ? (leaf.count / slice_volume) : 1;
     if (n_steps == 0) n_steps = 1;
 
-    return (static_cast<uint64_t>(time_index) >= leaf.time_index && 
+    return (static_cast<uint64_t>(time_index) >= leaf.time_index &&
             static_cast<uint64_t>(time_index) < (leaf.time_index + n_steps));
 }
 
+PanzerDB::RowSlice PanzerDB::rowsForTime(std::string_view path, int64_t time_index) const
+{
+    getLeaves(); // Makes sure leaf_lookup and its safety record are built.
+    const auto it = leaf_lookup.find(path);
+    if (it == leaf_lookup.end()) return {nullptr, 0};
+    const std::vector<size_t>& rows = it->second;
+    if (rows.empty()) return {nullptr, 0};
+
+    if (time_lookup_unsafe_paths.find(path) != time_lookup_unsafe_paths.end()) {
+        return {rows.data(), rows.size()};
+    }
+
+    // Rows of this path are ordered and their time spans disjoint, so only the
+    // last row starting at or before the requested step can hold it.
+    size_t lo = 0, hi = rows.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if ((int64_t)cached_leaves[rows[mid]].time_index <= time_index) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return {nullptr, 0};
+    return {&rows[lo - 1], 1};
+}
 int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
                                              int64_t prefer_direction,
                                              const std::vector<double>& time_basis,
@@ -2886,9 +2944,7 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
     }
 
     auto path_covers = [&](const std::string& path, int64_t idx) -> bool {
-        auto it = leaf_lookup.find(path);
-        if (it == leaf_lookup.end()) return false;
-        for (size_t lidx : it->second) {
+        for (size_t lidx : rowsForTime(path, idx)) {
             if (isTimeInLeaf(getLeaves()[lidx], idx)) return true;
         }
         return false;
@@ -3040,7 +3096,7 @@ int PanzerDB::readDataByIndex(
         // 1. Direct search
         auto it = leaf_lookup.find(target_path);
         if (it != leaf_lookup.end()) {
-            for (size_t idx : it->second) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
                 const auto& leaf = leaves[idx];
                 if (isTimeInLeaf(leaf, time_index)) {
                     size_t slice_volume = 1;
@@ -3105,7 +3161,7 @@ int PanzerDB::readDataByIndex(
 
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
                         const auto& leaf = leaves[idx];
                         if (isTimeInLeaf(leaf, time_index)) {
                             size_t slice_volume = 1;
@@ -3136,7 +3192,7 @@ int PanzerDB::readDataByIndex(
 
                 auto it_sub = leaf_lookup.find(substituted_path);
                 if (it_sub != leaf_lookup.end()) {
-                    for (size_t idx : it_sub->second) {
+                    for (size_t idx : rowsForTime(substituted_path, time_index)) {
                         const auto& leaf = leaves[idx];
                         if (isTimeInLeaf(leaf, time_index)) {
                             size_t slice_volume = 1;
@@ -3239,7 +3295,7 @@ int PanzerDB::readStringDataByIndex(
     // 1. Direct search
     auto it = leaf_lookup.find(target_path);
     if (it != leaf_lookup.end()) {
-        for (size_t idx : it->second) {
+        for (size_t idx : rowsForTime(target_path, time_index)) {
             if (isTimeInLeaf(leaves[idx], time_index)) {
                 target_leaf = &leaves[idx];
                 break;
@@ -3275,7 +3331,7 @@ int PanzerDB::readStringDataByIndex(
 
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
                         if (isTimeInLeaf(leaves[idx], time_index)) {
                             target_leaf = &leaves[idx];
                             break;
@@ -3291,7 +3347,7 @@ int PanzerDB::readStringDataByIndex(
                     }
                     auto it_sub = leaf_lookup.find(substituted_path);
                     if (it_sub != leaf_lookup.end()) {
-                        for (size_t idx : it_sub->second) {
+                        for (size_t idx : rowsForTime(substituted_path, time_index)) {
                             if (isTimeInLeaf(leaves[idx], time_index)) {
                                 target_leaf = &leaves[idx];
                                 break;
@@ -3307,7 +3363,7 @@ int PanzerDB::readStringDataByIndex(
         // Fallback to direct search if substitution fails (for root dynamic signals)
         auto it_fb = leaf_lookup.find(target_path);
         if (it_fb != leaf_lookup.end()) {
-            for (size_t idx : it_fb->second) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
                 if (isTimeInLeaf(leaves[idx], time_index)) {
                     target_leaf = &leaves[idx];
                     break;
@@ -3505,7 +3561,7 @@ int PanzerDB::readComplexDataByIndex(
     // 1. Direct search
     auto it = leaf_lookup.find(target_path);
     if (it != leaf_lookup.end()) {
-        for (size_t idx : it->second) {
+        for (size_t idx : rowsForTime(target_path, time_index)) {
             if (isTimeInLeaf(leaves[idx], time_index)) {
                 target_leaf = &leaves[idx];
                 break;
@@ -3540,7 +3596,7 @@ int PanzerDB::readComplexDataByIndex(
                 }
                 auto it_gen = leaf_lookup.find(generic_path);
                 if (it_gen != leaf_lookup.end()) {
-                    for (size_t idx : it_gen->second) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
                         if (isTimeInLeaf(leaves[idx], time_index)) {
                             target_leaf = &leaves[idx];
                             break;
@@ -3556,7 +3612,7 @@ int PanzerDB::readComplexDataByIndex(
                     }
                     auto it_sub = leaf_lookup.find(substituted_path);
                     if (it_sub != leaf_lookup.end()) {
-                        for (size_t idx : it_sub->second) {
+                        for (size_t idx : rowsForTime(substituted_path, time_index)) {
                             if (isTimeInLeaf(leaves[idx], time_index)) {
                                 target_leaf = &leaves[idx];
                                 break;
@@ -3682,7 +3738,7 @@ int PanzerDB::readIntDataByIndex(
         // 1. Direct search
         auto it = leaf_lookup.find(target_path);
         if (it != leaf_lookup.end()) {
-            for (size_t idx : it->second) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
                 const auto& leaf = leaves[idx];
                 if (static_cast<DataType>(leaf.flags >> 4) == DataType::INT32 && isTimeInLeaf(leaf, time_index)) {
                     target_leaf = &leaf;

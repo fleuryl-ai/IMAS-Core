@@ -418,6 +418,37 @@ private:
     mutable std::unordered_map<std::string_view, std::vector<size_t>> parent_lookup;
     mutable std::vector<std::string> cached_dynamic_aos_roots;
 
+    // Subset of `leaf_lookup` whose rows cannot be narrowed by time (rows not in
+    // increasing, non-overlapping time_index order, or meta rows among data rows).
+    // Recorded row by row while leaf_lookup is built; see rowsForTime().
+    mutable std::unordered_set<std::string_view> time_lookup_unsafe_paths;
+
+    /**
+     * @brief Borrowed view over the index rows of one path that can hold a time
+     *        step, so callers can keep iterating row indices directly.
+     */
+    struct RowSlice {
+        const size_t* p;
+        size_t n;
+        const size_t* begin() const { return p; }
+        const size_t* end() const { return p + n; }
+    };
+
+    /**
+     * @brief Narrows `leaf_lookup[path]` down to the row(s) that can hold a step.
+     *
+     * One signal written slice by slice appears as one /index row per time slice,
+     * all sharing the same path, so that list can hold tens of thousands of rows.
+     * Their stored time ranges increase without overlapping, so the covering row
+     * is located by binary search (the full sweep made a single get() O(n_slices)
+     * per node, and a full time-range get() O(n_slices^2)). Paths whose rows do
+     * not satisfy that order are returned whole, keeping the sweep.
+     *
+     * Borrowed from the leaf cache: use it immediately, before the next
+     * getLeaves() rebuild.
+     */
+    RowSlice rowsForTime(std::string_view path, int64_t time_index) const;
+
     // For each dynamic AoS root: the EXCLUSIVE end of the time range covered
     // by ALL of its descendants (any depth), i.e. max(time_index + steps),
     // built in getLeaves(). Used by getAOSShape so a dynamic AoS that only

@@ -3,9 +3,30 @@
 #include "al_const.h"
 #include "al_exception.h"
 
+#include <algorithm>
 #include <math.h>
 #include <limits>
 #include <complex>
+
+namespace {
+
+// IMAS invalid value left in a time vector by a partially written slice.
+constexpr double kInvalidTime = -9.e40;
+
+// A timebase is strictly increasing. The only unsorted shape the reader has to
+// tolerate is a trailing run of invalid values, which binary searches must
+// ignore: this returns where the increasing prefix ends. A vector made of
+// invalid values only is constant, hence still sorted, so it is searched whole
+// (matching what the former linear scan returned).
+size_t increasing_prefix_size(const std::vector<double> &time_vector)
+{
+    size_t n = time_vector.size();
+    while (n > 0 && time_vector[n - 1] == kInvalidTime)
+        n--;
+    return n == 0 ? time_vector.size() : n;
+}
+
+} // namespace
 
 DataInterpolation::DataInterpolation()
 {
@@ -20,13 +41,13 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
         *time_min_index = -1;
         *time_max_index = -1;
 
-        for (size_t i = 0; i < time_vector.size(); i++)
+        const size_t nb_valid = increasing_prefix_size(time_vector);
+        const std::vector<double>::const_iterator begin = time_vector.begin();
+
+        const std::vector<double>::const_iterator min_it = std::lower_bound(begin, begin + nb_valid, tmin);
+        if (min_it != begin + nb_valid)
         {
-            if (time_vector[i] >= tmin)
-            {
-                *time_min_index = i;
-                break;
-            }
+            *time_min_index = (int)(min_it - begin);
         }
         //printf("time_vector.size()=%d\n", time_vector.size());
 
@@ -35,17 +56,11 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
             return;
         }
 
-        const double default_value = -9.e40;
-
-        for (int i = time_vector.size() - 1; i >= 0; i--)
+        // Last sample that is neither an invalid value nor beyond tmax.
+        const std::vector<double>::const_iterator max_it = std::upper_bound(begin, begin + nb_valid, tmax);
+        if (max_it != begin)
         {
-
-            if (time_vector[i] != default_value && time_vector[i] <= tmax)
-            {
-                //printf("found i = %d\n", i);
-                *time_max_index = i;
-                break;
-            }
+            *time_max_index = (int)(max_it - begin) - 1;
         }
 
         if (*time_max_index == -1)
@@ -124,22 +139,23 @@ int DataInterpolation::getSlicesTimesIndices(double requested_time, const std::v
 
     int closest;
 
-    for (size_t i = 0; i < time_vector.size(); i++)
+    // First sample that is not below the requested time (see the note about the
+    // trailing invalid run done in increasing_prefix_size).
+    const size_t nb_valid = increasing_prefix_size(time_vector);
+    const std::vector<double>::const_iterator begin = time_vector.begin();
+    const std::vector<double>::const_iterator sup_it = std::lower_bound(begin, begin + nb_valid, requested_time);
+    if (sup_it != begin + nb_valid)
     {
-        if (time_vector[i] >= requested_time)
+        slice_sup = (int)(sup_it - begin);
+        if (interp != CLOSEST_INTERP)
         {
-            slice_sup = i;
-            if (interp != CLOSEST_INTERP)
-            {
-                if (slice_sup == 0 && time_vector.size() > 1)
-                    slice_sup = 1;
-            }
-            if (slice_sup > 0)
-                slice_inf = slice_sup - 1;
-            else
-                slice_inf = slice_sup;
-            break;
+            if (slice_sup == 0 && time_vector.size() > 1)
+                slice_sup = 1;
         }
+        if (slice_sup > 0)
+            slice_inf = slice_sup - 1;
+        else
+            slice_inf = slice_sup;
     }
     //printf("DataInterpolation::getSlicesTimesIndices::slice_inf=%d\n", slice_inf);
     //printf("DataInterpolation::getSlicesTimesIndices::slice_sup=%d\n", slice_sup);
@@ -410,6 +426,9 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
     int start = getSlicesTimesIndices(tmin, time_vector, times_indices, interp);
     std::vector<void *> interpolation_results;
     std::map<std::string, double> slices_times;
+    // Both keys are filled at each iteration when interp is LINEAR, and only
+    // SLICE_INF is ever read otherwise, so the map can be reused across points.
+    std::map<std::string, void *> y_slices;
 
     void *slice1;
     void *slice2;
@@ -499,8 +518,6 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
         }
 
         //printf("slices_times[SLICE_INF]=%f, slices_times[SLICE_SUP]=%f\n", slices_times[SLICE_INF], slices_times[SLICE_SUP]);
-
-        std::map<std::string, void *> y_slices;
 
         switch (datatype)
         {

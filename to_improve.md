@@ -317,3 +317,63 @@ Same content (identical checksum / element counts), **3707 ms → 1105 ms
 Measurement hooks added: `PanzerDB::setDefaultChunkingConfig()`,
 `PanzerDB::setReadCache()`, and the `IMAS_HDF5_FAPL` environment override in
 `HDF5Utils::openIDSFile` (unset ⇒ `H5P_DEFAULT`, unchanged production behaviour).
+
+## 14. SLICE_OP / TIMERANGE_OP never measured — the same O(slices²) sweep, second copy — RESOLVED
+
+Point 13 fixed the time filter on the **GLOBAL** path only. The slice and
+time-range strategies resolve their leaf through `PanzerDB` instead of
+`ReadIndex`, and that side still swept every row of a path linearly.
+
+`bench_read` gained AL-level modes (`--slice`, `--timerange`, `--nslices`,
+`--range`, `--dt`, `--interp`) that walk the tree through `HDF5Backend` and
+checksum the content, so a mode can be compared against itself before/after.
+Files (warm, AFS, median of 3): `core_profiles_3.h5` = 122,263 index rows,
+8,150 time slices, one row per slice per signal; `equilibrium_1.h5` = 56,594 rows.
+
+| mode | cp before | cp after | eq before | eq after |
+|---|---|---|---|---|
+| GLOBAL | 1111 ms | 1120 ms | 1388 ms | 1399 ms |
+| 20 × SLICE_OP | 2636 ms (131.8 ms/get) | 2581 ms (129.1 ms/get) | 8743 ms (437 ms/get) | 8795 ms (440 ms/get) |
+| TIMERANGE, full span | **12 949 ms** | **1763 ms (7.3×)** | 1009 ms | 1000 ms |
+| TIMERANGE, `--dt 0.1` | 576 ms | 550 ms | — | 974 ms |
+
+Content identical everywhere (cp GLOBAL/TIMERANGE hash `f91016520c33243d`,
+244,513 nodes / 19,780,050 doubles in both modes; cp SLICE `cc02212c7c86c329`).
+`perf record` on the cp TIMERANGE walk: `PanzerDB::isTimeInLeaf` alone was
+**64.4 %** of the time — `leaf_lookup[path]` holds one row per time slice, so
+resolving one node cost O(n_slices) and a full-span range get cost
+O(n_slices²). After the fix that symbol is out of the profile.
+
+**Resolution (implemented):** `PanzerDB::rowsForTime()` narrows a path's row
+list by binary search on `time_index` (11 lookup sites in `readDataByIndex` /
+`readStringDataByIndex` / `readIntDataByIndex` / `readComplexDataByIndex` and in
+`nearestAvailableSliceIndex`'s `path_covers`). Rows of one path are appended with
+increasing, non-overlapping time spans, so at most one row can match; the
+ordering is **verified row by row while `leaf_lookup` is built** — any path whose
+rows are meta rows, out of order, or overlapping is recorded in
+`time_lookup_unsafe_paths` and keeps the original sweep. Doing the check inside
+the build loop matters: a separate validating pass measured **+6 %** on the
+SLICE_OP walk (the index is rebuilt per operation, see `REVIEW_PERF_hdf5_v2.md` §A).
+
+Also replaced, in `DataInterpolation::getSlicesTimesIndices` /
+`getTimeRangeIndices`, the forward/backward scans of the timebase by
+`lower_bound`/`upper_bound` (trailing `-9.e40` invalid run trimmed), and hoisted
+the per-point `y_slices` map out of `interpolate_with_resampling`. That part is
+**within measurement noise (±5 %)** on these two files — the AL-level timebase was
+not the hot lookup; it is kept because it is the same quadratic shape on files
+with a longer timebase, and because it costs nothing.
+
+Safety net added first: `tests/hdf5_backend/test_time_resolution.cpp` pins the
+exact contract of both lookups (returned index, `SLICE_INF`/`SLICE_SUP`, and the
+`range` left untouched by some branches) against an oracle copy of the original
+scans — 854 comparisons, 4 interpolation modes, fixtures covering single-point
+and 8,150-point timebases, trailing invalid runs, `tmin > tmax`, out-of-range
+windows and resampling. Suite: 84/84.
+
+**Still open, measured:** cp SLICE_OP ≈ 130 ms/get is dominated by zlib `inflate`
+plus the per-operation index reload (`PanzerDB::getLeaves` + `ReadIndex::build_indexes`
++ `~PanzerDB` ≈ 7 % of that walk, and the 94–151 ms index load of point 1 is paid
+once per operation because `endAction` closes the file). eq SLICE_OP ≈ 440 ms/get
+is ≈ 30 % `inflate`: chunk/filter granularity, not read-path algorithm. cp
+TIMERANGE (1763 ms) is still 1.6× a GLOBAL read of the same content.
+
