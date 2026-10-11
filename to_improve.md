@@ -532,3 +532,49 @@ A1) et celui de `read_dataset_globally` (0,01 %). Les tris listés par E5 (les q
 pas : leur bucket compte un seul élément sur ce chemin, et la branche d'agrégation
 `time_index == -1` n'est pas la marche par nœud. Ils ne sont pas la cause du 1,6×.
 
+## 19. TIMERANGE sans filtrage en temps non homogène (AoS statique, base de temps par élément) — BUG CORRIGÉ (2026-10-11)
+
+**Reproduit** : IDS en `homogeneous_time = 0`, AoS **statique** dont la base de temps est
+posée sur l'élément d'AoS (la forme de `reflectometer_profile/channel[]/n_e`) — le
+TIMERANGE renvoyait **rc = 0 sur tout** (le signal *et* le nœud `time`), y compris sur la
+plage complète. Test : `tests/hdf5_backend/test_al_timerange_inhom_static_aos.cpp`,
+12 échecs avant le correctif, ALL PASSED après (vérifié en stashant les deux sources).
+
+**Cause** : `TimeRangeReadStrategy::read_ND_Data` résolvait `time_basis_vector` par
+`getTimeValues(ctx, homogeneous_time)` — **sans le `timebasename` du nœud**, alors que le
+chemin SLICE le passe (`slice_read_strategy.cpp:84`). Or `IReadStrategy::getTimeValues` ne
+trouve une base de temps locale à un élément d'AoS statique qu'à l'aide de ce
+`timebasename` ; sans lui la résolution rend un vecteur vide, `getTimeRangeIndices` rend
+-1, et la lecture rend 0.
+
+**Correction** (`timerange_read_strategy.cpp`, `iread_strategy.h`) :
+1. passer `timebasename` à `getTimeValues`, et re-résoudre **par nœud** quand la base est
+   par élément (`homogeneous_time == 0 && !timebasename.empty() && !isTimedContext(ctx)`) —
+   sinon le deuxième élément hériterait de la base du premier ;
+2. cache `time_values_cache["ELEMENT:" + chemin]` pour la branche locale (la clé porte
+   l'index d'élément, via `buildFullPath`), sinon relecture du timebase à chaque nœud ;
+3. le nœud `time` de l'élément passait par le chemin « signal » et sortait en `dim = 2`
+   avec le tableau complet répété une fois par temps demandé ; il sort maintenant la base
+   **coupée à la fenêtre** (`dim = 1`).
+
+**Coût mesuré** : la première version (résolution par nœud dans tous les cas) faisait passer
+le TIMERANGE cp de 1541 à 1933 ms (+25 % : ~1,6 µs de `sanitize_path` × 244 513 nœuds).
+La restriction au cas par-élément ramène la médiane à 1578 ms (étalement 1542-1581 sur
+5 reps), hash cp inchangé `f91016520c33243d`. Suite : 87/87.
+
+**Rectification sur `reflectometer_profile_v2.h5`** : la mesure initiale (« la fenêtre est
+ignorée, 2 571 141 doubles quel que soit l'intervalle ») venait du **harness de bench**, pas
+du backend — `bench_read.cpp:244` passe `timebasename = ""` aux nœuds d'un AoS qu'il ne
+déclare pas dynamique, ce qui déclenche le repli global (`timerange_read_strategy.cpp:155`).
+Ce fichier est en `homogeneous_time = 1` avec un `time` racine de 5128 points
+(34,942 → 41,356). Sonde `HDF5Backend` avec le `timebasename` que l'AL tirerait du
+dictionnaire (`n_e/time`) : plage complète → `dim=2 size=[100,5126]` ; fenêtre
+`[34.942, 34.95]` → `size=[100,164]` et non 5128. Le filtrage se faisait donc déjà.
+`[35, 36]` → rc = 0 est **correct** : la base saute de 34,952 à 37,742 et ne contient aucun
+point dans [35, 36] (vérifié sur le payload).
+
+**Reste ouvert** : `timebasename` vide sur un nœud *dynamique* donne toujours une lecture
+globale (fenêtre ignorée). Inatteignable par l'AL — tout nœud `dynamic` a un `timebasepath`
+au dictionnaire (`channel/n_e/data` : `timebasepath="n_e/time"`, vérifié dans IDSDef.xml) —
+donc pas de correctif sans reproducteur.
+

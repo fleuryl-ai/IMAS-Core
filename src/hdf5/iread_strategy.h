@@ -369,14 +369,21 @@ public:
             // 1. Try to find timebase relative to the current static AoS element.
             std::replace(timebasename_copy.begin(), timebasename_copy.end(), '/', '&');
             std::string local_timebase_path = buildFullPath(ctx, timebasename_copy);
-            
+
+            // The key carries the AoS element index (buildFullPath), so each element
+            // gets its own base while repeated reads of one element stay cheap.
+            const std::string local_key = "ELEMENT:" + local_timebase_path;
+            auto local_it = time_values_cache.find(local_key);
+            if (local_it != time_values_cache.end()) return local_it->second;
+
             time_values = panzer_db_ptr->getWholeDynamicSignal(local_timebase_path);
-            
+
 
             // 2. If not found locally, fall back to the root timebase.
             if (time_values.empty()) {
                 time_values = panzer_db_ptr->getWholeDynamicSignal(timebasename_copy);
             }
+            time_values_cache[local_key] = time_values;
             return time_values;
         }
         return {}; // No timebase found

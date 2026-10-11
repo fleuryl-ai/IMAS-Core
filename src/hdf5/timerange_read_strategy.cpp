@@ -168,9 +168,20 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
     double requested_time; // requested time for time range with dtime !=-1 (resampling)
     int slice_index;
 
-    if (time_basis_vector.empty()) {
-        int homogeneous_time = getHomogeneousTime();
-        time_basis_vector = getTimeValues(ctx, homogeneous_time);
+    // Resolve the time base of the node being read. With homogeneous_time = 0 the
+    // base can sit on the AoS element itself (reflectometer_profile/channel[]/
+    // n_e/time): it then changes from one element to the next and must be
+    // re-resolved per node instead of keeping the AoS-level vector. Passing
+    // timebasename is what lets getTimeValues find that element-local base —
+    // without it the resolution yields nothing and the whole read is dropped
+    // (to_improve.md point 19). Elsewhere the base is per-AoS, so the cached
+    // member stays authoritative: re-resolving it on every node of a global walk
+    // costs ~1,6 us of path sanitising per node (measured: +25 % on the cp
+    // TIMERANGE walk).
+    const bool per_element_timebase =
+        homogeneous_time == 0 && !timebasename.empty() && !isTimedContext(ctx);
+    if (per_element_timebase || time_basis_vector.empty()) {
+        time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
         DEBUG_PRINT("Loaded time_basis_vector on demand, size: " << time_basis_vector.size());
     }
 
@@ -194,6 +205,25 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
         
         
+        // The element's own time base (homogeneous_time = 0, no timed ancestor):
+        // that base is stored as a single array, so the signal path below would
+        // re-emit the whole array once per requested time. Cut it to the window
+        // instead — that is what the AL expects from a time node.
+        if (is_inhomogeneous_time_basis_dataset && !resampling &&
+            !isTimedContext(ctx) && *datatype == alconst::double_data)
+        {
+            if (time_min_index == -1 || time_max_index == -1) return 0;
+            const size_t nb = (size_t)(time_max_index - time_min_index + 1);
+            double* tb_out = (double*)malloc(nb * sizeof(double));
+            if (!tb_out) throw ALBackendException("Memory allocation failed", LOG);
+            for (size_t k = 0; k < nb; ++k)
+                tb_out[k] = time_basis_vector[(size_t)time_min_index + k];
+            *data = tb_out;
+            *dim = 1;
+            size[0] = (int)nb;
+            return 1;
+        }
+
         if (dynamic_index == -1 &&
             (*datatype == alconst::double_data ||
              *datatype == alconst::integer_data ||

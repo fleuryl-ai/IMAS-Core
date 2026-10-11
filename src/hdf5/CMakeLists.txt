@@ -209,6 +209,9 @@ al_add_hdf5_test(test_al_global_code_output_1slice)
 # time-range operator
 al_add_hdf5_test(test_al_timerange_basic)
 al_add_hdf5_test(test_al_timerange_aos)
+# TIMERANGE window on a dynamic signal inside a STATIC AoS whose time base sits on
+# the AoS element (homogeneous_time = 0): the window must filter that signal.
+al_add_hdf5_test(test_al_timerange_inhom_static_aos)
 al_add_hdf5_test(test_al_timerange_aos_string_list)
 al_add_hdf5_test(test_al_timerange_nested_dynamic_aos)
 al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling)
