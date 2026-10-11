@@ -391,7 +391,7 @@ specialisation which already threw. Now all three raise
 Not reachable through the index on a healthy file — the `getLeaves()` guardrail
 skips data rows running past the materialised extent — which is why it never
 showed up. It is reachable with a half-written index, so it is pinned directly:
-`tests/hdf5_backend/test_read_error_status.cpp` hands a hand-built `Leaf` to
+`tests/hdf5_backend/test_read_tensor_contract.cpp` hands a hand-built `Leaf` to
 `readTensor` (offset past the extent, and offset inside / count past it).
 Against the pre-fix code that test reports 3 failures (silent success); with
 the fix, 85/85 ctest.
@@ -420,4 +420,34 @@ differences: everything here is noise. E3 is a wasted-work and leak fix, not a
 performance one. The TIMERANGE lever that does measure is **E4** — reading the
 whole signal and truncating it in RAM — still open. eq regression check
 (TIMERANGE 979 ms, SLICE 436 ms/get) unchanged within noise.
+
+## 16. `readTensor` picked its memory type from the leaf, never from `T` (item E2) — RESOLVED (2026-10-11)
+
+`mem_type` comes from `leaf.flags >> 4`, so `H5Dread` writes the stored element
+width no matter what the template argument is: `readTensor<int32_t>` on a FLOAT64
+leaf writes 8 bytes per element into a 4-bytes-per-element buffer. The exposure is
+`iread_strategy.h:842 readLeafData`, which chooses `T` from the datatype the **AL
+asks for** rather than from the leaf — a dictionary/file disagreement reaches the
+overflow. `readLeafData` has no callers (verified by grep over `src/` and
+`include/`), so the defect is latent, not live.
+
+Guard added at the single choke point, and it is a **width** check, not an
+equality check, because the opposite direction is a live idiom I found while
+looking: `readInterpolatedData` (`panzerdb.cpp:3837`) routes `integer_data`
+through `readDataByIndex(double**)`, which over-allocates 8 bytes per element and
+whose consumer reads the buffer back as int32 — the values are correct, only the
+allocation is 2× too big. An exact-match assert would therefore have broken every
+integer slice read. The test pins both directions: narrow buffer raises, wider
+buffer (double over an INT32 leaf) must still return the int32 values at the front.
+
+Two consequences recorded as new items rather than fixed: E10 (the integer-via-double
+malloc, ×2 per integer tranche) and E11 (`readLeavesUnion` selects the *dataset* from
+the caller's `DataType`, so the aggregation branch of `readDataByIndex` hard-coding
+FLOAT64 would read INT32 offsets out of `data_raw_f64` if that combination were ever
+reachable — not demonstrated reachable, both real paths take the type from the file).
+
+No behaviour change on the bench: cp/eq hashes identical to the point-14 baselines
+(`f91016520c33243d`, `cc02212c7c86c329`, `eb9093018cb67253`, `d92537f55c5f2e4b`),
+cp GLOBAL 1110 ms / SLICE 127.9 ms/get / TIMERANGE 1731 ms, eq 1384 / 438 / 985 ms.
+Suite 85/85 (test renamed to `test_read_tensor_contract`).
 

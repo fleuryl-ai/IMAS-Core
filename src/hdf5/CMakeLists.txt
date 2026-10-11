@@ -247,8 +247,9 @@ al_add_hdf5_test(test_path_sanitization)
 # the safety net for replacing those scans by binary searches.
 al_add_hdf5_test(test_time_resolution)
 # readTensor must raise on a failing HDF5 read instead of returning the caller's
-# uninitialized buffer (REVIEW_PERF_hdf5_v2.md item E1).
-al_add_hdf5_test(test_read_error_status)
+# uninitialized buffer, and on a buffer element smaller than the stored element
+# (REVIEW_PERF_hdf5_v2.md items E1 and E2).
+al_add_hdf5_test(test_read_tensor_contract)
 # Explicit read-side node-role rules (to_improve.md point 3, conservative pass).
 al_add_hdf5_test(test_read_node_roles)
 

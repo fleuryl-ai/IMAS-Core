@@ -1857,6 +1857,22 @@ void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
 
     if (dset_id < 0) throw std::runtime_error("Dataset for this type is not open");
 
+    // mem_type above is chosen by the LEAF, never by T, so H5Dread writes
+    // `stored_size` bytes per element no matter what T is: a narrower T gets
+    // overrun. The opposite direction is deliberate and live -- readInterpolatedData
+    // routes integer signals through readDataByIndex(double**), which over-allocates
+    // and whose consumer reads the buffer back as int32. So only the narrow
+    // direction is fatal.
+    const size_t stored_size = (type == DataType::COMPLEX128) ? 2 * sizeof(double)
+                               : (type == DataType::FLOAT64)   ? sizeof(double)
+                                                               : sizeof(int32_t);
+    if (sizeof(T) < stored_size) {
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("readTensor: " + std::to_string(sizeof(T)) +
+                                 "-byte buffer element cannot hold a " +
+                                 std::to_string(stored_size) + "-byte stored element", LOG);
+    }
+
     hsize_t hoffset = leaf.offset;
     hsize_t hcount = leaf.count;
     hid_t space = H5Dget_space(dset_id);

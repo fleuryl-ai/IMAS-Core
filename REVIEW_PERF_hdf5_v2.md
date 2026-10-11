@@ -125,8 +125,16 @@ E2. **`readTensor<T>` ne valide pas `T` contre le dtype du leaf** : `mem_type` v
 `leaf.flags >> 4`, jamais de `T`. Un `readTensor<int32_t>` sur un leaf FLOAT64 écrit
 8 octets/élément dans un buffer de `count` `int32_t` → débordement. Le chemin chaud
 alloue d'après `actual_type_enum` (`iread_strategy.h:1264-1269`) donc n'est pas exposé ;
-`iread_strategy.h:842 readLeafData` l'est — et `readLeafData` n'a **aucun appelant**
-(code mort, à supprimer ou à protéger). **Reste ouvert.**
+`iread_strategy.h:842 readLeafData` l'est — il choisit `T` d'après le `datatype` **demandé
+par l'AL**, pas d'après le leaf, donc un désaccord dictionnaire/fichier atteint le débordement
+— et `readLeafData` n'a **aucun appelant** (code mort). — **TRAITÉ (2026-10-11)** :
+garde de largeur dans `readTensor` (`sizeof(T) < taille_stockée` → `ALBackendException`).
+Garde de **largeur** et non d'égalité, parce que le sens inverse est un idiom vivant :
+`readInterpolatedData` (`panzerdb.cpp:3837`) route `integer_data` vers
+`readDataByIndex(double**)`, qui sur-alloue 8 o/élément et dont le consommateur relit le
+buffer en int32 — donc un `assert` d'égalité exact aurait cassé la lecture des signaux
+entiers en mode SLICE. Test `test_read_tensor_contract.cpp` (une `Leaf` fabriquée à la main
+par type) : échec reproduit avant le correctif, et les deux sens figés après.
 
 ### Performances
 E3. **TIMERANGE avec resampling lit la tranche 0 deux fois** : la sonde de forme
@@ -155,6 +163,21 @@ plus récupérable ensuite → une relecture disque inutile par schema et par se
 E9. **API directe** : `direct_access_api.cpp:321-327` relit la feuille sonde dans la
 boucle qui suit ; `get_time_vector` fait un `readScalar` (= 1 `H5Dread`) par pas alors
 que `getWholeDynamicSignal("time")` est appelé juste en dessous.
+E10. **Signaux entiers lus via l'API double** (constaté en cherchant E2) :
+`readInterpolatedData` envoie `integer_data` dans `readDataByIndex(double**)`
+(`panzerdb.cpp:3837`), qui fait `malloc(count * sizeof(double))` là où 4 o/élément
+suffiraient — ×2 sur chaque tranche entière lue en SLICE/TIMERANGE. Les valeurs sont
+justes (le consommateur relit en int32), donc c'est uniquement du gaspillage ; le
+corriger veut dire router `integer_data` vers `readIntDataByIndex`, ce qui change la
+taille du bloc rendu à l'AL — à faire avec le test AL entier, pas à l'aveugle.
+E11. **`readLeavesUnion` choisit le DATASET d'après le `DataType` passé par l'appelant,
+pas d'après le leaf** (`panzerdb.cpp:1275`) : les quatre agrégations lui passent leur
+propre type (`:3102` FLOAT64, `:3565` COMPLEX128, …). Si `readDataByIndex(time_index=-1)`
+était appelé sur un path stocké en INT32 avec ≥2 feuilles, la plage serait lue dans
+`data_raw_f64` aux offsets de `data_raw_i32` → données d'un autre signal. **Non démontré
+atteignable** : les GLOBAL d'entiers passent par `read_dataset_globally` avec
+`actual_type_enum` pris du fichier (`iread_strategy.h:1278`), et `direct_reader.cpp:75`
+est codé en dur sur `z_ion` (double). À verrouiller par un test si l'exposition apparaît.
 
 ### Fausse alerte — ne pas « corriger »
 `cached_paths_blocks` / `cached_parent_paths_blocks` **ne fuient pas** : la file est
