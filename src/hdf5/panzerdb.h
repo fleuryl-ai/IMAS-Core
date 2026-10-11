@@ -468,6 +468,62 @@ private:
     // loop, the vector still grows there).
     mutable std::unordered_map<std::string_view, std::vector<size_t>> metadata_by_schema;
 
+    // ── Index handoff between engine instances on one file ───────────────
+    // /index and /paths are append-only, and reading them dominates the cost of
+    // opening an engine (measured: decoding 171k rows costs ~100 ms, a third of
+    // it inflating the tables). A writer using SLICE_OP builds a fresh engine per
+    // time step, which made the whole write quadratic in the number of rows.
+    // The parsed state therefore survives the engine that built it: close() hands
+    // it over, the next init() on the same file takes it back and only reads the
+    // rows appended since.
+    /**
+     * @brief How many /index rows and path rows the current leaf cache covers.
+     *        Zero when the cache was not inherited from a previous engine.
+     */
+    mutable uint64_t index_rows_loaded = 0;
+    mutable uint64_t index_paths_loaded = 0;
+    /// offset/count of the last /index row the cache consumed: lets the next
+    /// engine verify the cached prefix is still the on-disk prefix before it
+    /// appends onto it (a rewrite that reused the row count would not pass).
+    mutable uint64_t index_last_offset = 0;
+    mutable uint64_t index_last_count = 0;
+    /// Which file and which /index this engine reads, recorded in init(): the AL
+    /// closes the group the engine hangs on before PanzerDB::close() runs, so the
+    /// handles are already gone by handoff time and the identity has to be the one
+    /// noted while they were alive.
+    std::string index_file_name;
+    H5O_token_t index_token = H5O_TOKEN_UNDEF;
+
+    /** Parsed index state of one file, parked here while no engine holds it. */
+    struct IndexHandoff {
+        std::string key;            // HDF5 file name the state was read from
+        H5O_token_t index_token = H5O_TOKEN_UNDEF;  // identity of the /index it came from
+        uint64_t rows = 0;          // /index rows the state covers
+        uint64_t paths = 0;         // rows of /paths (v2) or /path_table (v3)
+        uint64_t last_offset = 0;   // offset/count of the last row read: prefix check
+        uint64_t last_count = 0;
+        uint64_t generation = 0;    // leaf_cache_gen at handoff time
+        bool valid = false;
+        std::vector<Leaf> leaves;
+        std::list<std::vector<char>> paths_blocks;
+        std::list<std::vector<char>> parent_paths_blocks;
+        std::unordered_map<std::string_view, std::vector<size_t>> leaf_lookup;
+        std::unordered_map<std::string_view, std::vector<size_t>> parent_lookup;
+        std::unordered_map<std::string_view, std::vector<size_t>> metadata_by_schema;
+        std::unordered_map<std::string_view, uint64_t> max_time_at_dynamic_root;
+        std::unordered_set<std::string_view> time_lookup_unsafe_paths;
+        std::vector<std::string> dynamic_aos_roots;
+    };
+
+    /// The single parked state this thread owns (replaced when another file opens).
+    static IndexHandoff& indexHandoff();
+    /// Takes the parked state back if it belongs to this file and to this /index.
+    /// Called by init() before the index is read.
+    void adoptIndexHandoff();
+    /// Parks the parsed state so the next engine on this file can reuse it.
+    /// Called by close(), while the file handle is still usable.
+    void handBackIndexHandoff();
+
     std::unordered_set<std::string> written_metadata_schema_paths;
 
     /**
@@ -860,6 +916,9 @@ public:
       (the read strategies' ReadIndex) stamp this value and compare it before
       using their caches; a change means "rebuild your caches first" (SWMR).
       * @return The current cache generation.
+      * @note The index handoff (adoptIndexHandoff) carries this value over, so it keeps
+      *       increasing across engines opened on the same file; an engine that decodes
+      *       the table itself starts again at 1.
       */
     uint64_t leaf_cache_generation() const { return leaf_cache_gen; }
 

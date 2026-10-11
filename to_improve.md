@@ -660,3 +660,96 @@ Suite : **88/88**. Sonde chrono retirée du source.
 ouverture (eq : 43 598 entrées de `std::unordered_map`). Le vrai gain d'ouverture reste A1
 (rechargement incrémental de `/index`) : en régime chaud le chrono d'ouverture est de
 95→92 ms sur cp et 40→34 ms sur eq, c'est donc ~92 ms / ~34 ms par ouverture qui subsistent.
+
+---
+
+## 21. Rechargement incrémental de `/index` entre moteurs d'un même fichier (A1) — TRAITÉ (2026-10-11)
+
+**Le coût mesuré d'abord.** `setWriteStrategy(SLICE_OP)` (`hdf5_events_handler.cpp:35`) crée
+un PanzerDB APPEND neuf par pas de temps, donc `init()` → `restoreTimeContext()` →
+`getLeaves()` relit **toute** la table à chaque pas. Chrono `index` de `bench_read` en régime
+chaud, sources HEAD : **86,5–112,8 ms** par ouverture sur cp (171 165 feuilles), **42,0–52,3 ms**
+sur eq. C'est ce qui rend l'écriture quadratique : T pas coûtent O(T × N).
+
+**Le mécanisme.** L'état décodé survit au moteur qui l'a produit : `PanzerDB::IndexHandoff`
+garé dans un `thread_local` (un seul bloc — le dernier fichier touché, pas une carte par
+fichier), rendu par `close()` (`handBackIndexHandoff`), repris par `init()`
+(`adoptIndexHandoff`). Neuf conteneurs sont échangés par `std::swap` ; `leaf.path` et
+`parent_path` restent valides parce que `cached_paths_blocks` est un `std::list` de blocs
+(nœuds stables). `getLeaves()` ne relit que la queue `[index_rows_loaded, n_rows)` en
+`H5Sselect_hyperslab` et pousse un bloc de plus ; `leaf_cache_gen` continue de monter, donc
+le contrat des consommateurs qui détiennent des `Leaf*` est respecté. `rebuildDynamicRootTimeIndex()`
+reste une reconstruction complète : ses clés sont des `string_view` pointant dans
+`cached_dynamic_aos_roots`, qui grossit — fusion incrémentale les ferait danser.
+
+**Quatre garde-fous** — la table n'est réutilisable que si elle est toujours la tête de la
+table disque : même nom de fichier HDF5 (`H5Fget_name`), même objet `/index` (`H5Otoken_cmp` —
+un dataset recréé a un nouveau jeton, ce que `WRITE` fait), extent qui n'a pas rétréci, et
+même couple `(offset, count)` sur la dernière ligne lue. L'ouverture WRITE (truncate) purge
+l'état garé de ce fichier. Un moteur d'un autre fichier ne reprend jamais rien.
+
+**Piège rencontré** : l'identité (nom + jeton) doit être relevée dans `init()`, pas dans
+`close()`. Dans le chemin AL, le groupe sur lequel le moteur est accroché est déjà fermé
+quand `PanzerDB::close()` s'exécute (`H5Iget_type(file_id) == -1`) : relevée à la fermeture,
+l'identité est perdue et l'écrivain ne gare jamais rien — la première version du correctif
+ne changeait donc rien pour lui.
+
+**Ouverture, même set des deux côtés** (médiane de 4 reps) :
+
+| fixture | chrono `index` avant | après |
+|---|---|---|
+| cp, mode moteur | 89,4 ms | **11,8 ms** |
+| eq, mode moteur | 52,3 ms | **11,8 ms** |
+| cp, mode AL | 91,2–116,1 ms | **6,1–6,9 ms** |
+| eq, mode AL | 42,0–58,9 ms | **7,1–7,7 ms** |
+
+**Écrivain AL** — 8 `put` SLICE_OP sur une copie du pulse `core_profiles_3` (8 150 pas) :
+
+| | HEAD | avec handoff |
+|---|---|---|
+| open+begin (moyenne 8 pas) | 98,36 ms | **29,66 ms** (158 ms au premier pas froid, 10,1–13,3 ms ensuite) |
+| TOTAL par pas | 108,94 ms | **40,22 ms** |
+| régime établi (pas 1–7) | 104,5 ms | **20,8 ms** (−80 %) |
+
+La courbe pas-à-pas n'est plus montante : 123,6 → 115,0 → 118,8 → 90,2 → 78,2 → 74,2 → 91,1 →
+96,0 ms avant, 158,2 → 13,3 → 12,7 → 12,3 → 10,2 → 10,2 → 10,2 → 10,1 ms après.
+
+**Temps mural** (médiane, paires strictement alternées HEAD / corrigé) : cp SLICE 20 get
+2 300,6 → **692,6 ms** (115,03 → 34,63 ms/get), cp TIMERANGE 1 646,5 → **1 472,2 ms**
+(−10,6 %), cp GLOBAL 1 142,9 → **985,7 ms** (−13,8 %), eq SLICE 8 458,8 → **7 734,8 ms**
+(−8,6 %), eq TIMERANGE 956,5 → **927,8 ms** (−3,0 %), eq GLOBAL 1 372,0 → 1 429,9 ms
+= +4,2 %, sous le plancher de bruit de ±4 % (GLOBAL n'ouvre qu'un moteur par rep).
+
+**Différentiel de décodage** — la table obtenue par la chaîne incrémentale est identique à un
+chargement à froid d'une copie du même fichier, et aux deux décodages HEAD : v3 en chaîne de
+5 moteurs APPEND (2 500 feuilles, préfixes garés 0/500/1000/1500/2000) → `388d4d2498cbdb91`
+partout ; cp 14 colonnes (171 165 feuilles) → `8a812af4014fb41b` ; eq 12 colonnes
+(58 162 feuilles) → `254bc8cd49ba2fdc`. Empreintes de contenu des opérations inchangées
+(`cc02212c7c86c329` / `f91016520c33243d` / `d92537f55c5f2e4b` / `eb9093018cb67253` côté AL,
+`c46c2d515f8dba31` / `a381e258df2800b0` côté moteur).
+
+**Mémoire** : l'état garé n'ajoute pas une seconde copie de la table — RSS max 208 744 kB
+pour une seule ouverture contre 209 516 kB pour une chaîne de quatre sur cp (+0,4 %). Il est en
+revanche conservé tant qu'un autre fichier n'est pas ouvert : la mémoire rendue par `close()`
+ne l'est plus.
+
+**Le lecteur du même moteur** (`invalidateLeafCache()` puis `getLeaves()`, le chemin du rafraîchissement
+SWMR) tombe sur la même voie incrémentale : 500 lignes ajoutées puis rafraîchies sur la copie du
+pulse cp → **4,53 ms** pour 171 165 → 171 665 feuilles, contre ~90 ms de re-décodage complet en
+chaud sur HEAD. Ce qui reste dans ces 4,53 ms n'est pas le disque mais `rebuildDynamicRootTimeIndex()`
+(parcours complet des 171 665 feuilles) et la réallocation de `cached_leaves`.
+
+**Test goupille** : `tests/hdf5_backend/test_engine_index_handoff.cpp` — chaîne de cinq moteurs
+qui relit les tranches garées par les précédents (chemins internés avant le handoff), reopen
+sans rien ajouter, truncate WRITE qui ne doit pas faire ressurgir les lignes supprimées, et
+fichier voisin qui ne doit rien hériter. Il échoue sur les sources HEAD (3 échecs, génération
+qui repart à 1). Suite : **89/89**.
+
+**Ce qui reste** : l'autre idée du poste A1 — garder l'APPEND engine ouvert entre opérations —
+n'est pas faite (le handoff obtient le même effet sans toucher au cycle de vie AL) ; les
+~6 ms par ouverture encore debout sont `restoreTimeContext()` + l'ouverture HDF5 du fichier ;
+`endAction` de l'écrivain coûte encore ~9,4 ms par pas. Et un défaut indépendant, non corrigé :
+ouvertures APPEND répétées ⇒ segfault à la sortie du processus dans `H5_term_library`
+(`H5F_term_package → H5I_clear_type → H5VL_file_close → H5I_find_id`), reproduit ici encore
+après 10 ouvertures sur cp — les mesures ci-dessus restent valides (le crash est après le
+dernier chrono).

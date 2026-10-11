@@ -87,6 +87,82 @@ void note_row_order(std::string_view path, const PanzerDB::Leaf& prev, const Pan
     }
     if (cur.time_index < prev.time_index + row_time_steps(prev)) unsafe_paths.insert(path);
 }
+
+// ── Helpers for the index handoff (see PanzerDB::indexHandoff) ──────────────
+// Name of the file an id belongs to (works for a group id too): identifies the file
+// a parked decode came from, so another file never adopts it.
+std::string panzer_file_name(hid_t file_id) {
+    if (file_id < 0) return std::string();
+    const ssize_t n = H5Fget_name(file_id, nullptr, 0);
+    if (n <= 0) return std::string();
+    std::string name(static_cast<size_t>(n) + 1, '\0');
+    if (H5Fget_name(file_id, name.data(), name.size()) < 0) return std::string();
+    name.resize(static_cast<size_t>(n));
+    return name;
+}
+
+// Identity token of an open object; opaque, only compared with H5Otoken_cmp.
+bool panzer_object_token(hid_t obj_id, H5O_token_t& out) {
+    if (obj_id < 0) return false;
+    H5O_info2_t info;
+    if (H5Oget_info3(obj_id, &info, H5O_INFO_BASIC) < 0) return false;
+    out = info.token;
+    return true;
+}
+
+// True when obj_id is the very object the parked token was taken from. HDF5
+// hands a new token to a recreated dataset, which is exactly the case the
+// handoff must reject.
+bool panzer_same_object(hid_t obj_id, const H5O_token_t& parked_token) {
+    if (H5O_IS_TOKEN_UNDEF(parked_token)) return false;
+    H5O_token_t now;
+    if (!panzer_object_token(obj_id, now)) return false;
+    int cmp = 0;
+    if (H5Otoken_cmp(obj_id, &now, &parked_token, &cmp) < 0) return false;
+    return cmp == 0;
+}
+
+uint64_t panzer_index_rows(hid_t index_dset) {
+    if (index_dset < 0) return 0;
+    hid_t space = H5Dget_space(index_dset);
+    if (space < 0) return 0;
+    hsize_t dims[2] = {0, 0};
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+    return dims[0];
+}
+
+// (offset, count) of one /index row read from disk. Same column mapping as
+// getLeaves(): 14 columns in legacy files, 12 in v2, 7 packed in v3.
+bool panzer_index_row(hid_t index_dset, uint64_t row, uint64_t& offset, uint64_t& count) {
+    if (index_dset < 0) return false;
+    hid_t fspace = H5Dget_space(index_dset);
+    if (fspace < 0) return false;
+    hsize_t dims[2] = {0, 0};
+    const int ndims = H5Sget_simple_extent_ndims(fspace);
+    H5Sget_simple_extent_dims(fspace, dims, nullptr);
+    if (ndims != 2 || row >= dims[0] || dims[1] == 0) { H5Sclose(fspace); return false; }
+
+    const uint64_t ncols = dims[1];
+    unsigned off_c = 0, cnt_c = 0;
+    if (ncols == PANZER_INDEX_COLUMNS_V3) { off_c = 0; cnt_c = 1; }
+    else if (ncols == PANZER_INDEX_COLUMNS) { off_c = 8; cnt_c = 9; }
+    else { off_c = 9; cnt_c = 10; }   // legacy 14 columns
+
+    uint64_t values[14] = {0};
+    const hsize_t start[2] = {row, 0};
+    const hsize_t block[2] = {1, ncols};
+    H5Sselect_hyperslab(fspace, H5S_SELECT_SET, start, nullptr, block, nullptr);
+    const hsize_t mem_dims[2] = {1, ncols};
+    hid_t mspace = H5Screate_simple(2, mem_dims, nullptr);
+    const herr_t rc = H5Dread(index_dset, H5T_NATIVE_UINT64, mspace, fspace, H5P_DEFAULT, values);
+    H5Sclose(mspace);
+    H5Sclose(fspace);
+    if (rc < 0) return false;
+    offset = values[off_c];
+    count = values[cnt_c];
+    return true;
+}
 } // namespace
 
 bool PanzerDB::s_has_default_chunk_config = false;
@@ -202,6 +278,10 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) H5Ldelete(file_id, "path_table", H5P_DEFAULT);
+
+        // A WRITE open throws the table away: anything parked for this file describes
+        // rows that no longer exist, so it must not be resumed from.
+        if (indexHandoff().key == panzer_file_name(file_id)) indexHandoff() = IndexHandoff{};
 
         // V3: new files use the packed 7-column /index + interned /path_table.
         index_version = PANZER_INDEX_VERSION_V3;
@@ -405,6 +485,11 @@ void PanzerDB::init(OpenMode mode) {
     }
 
     H5Pclose(dapl);
+    // Identity of what this engine reads, noted while the handles are alive: the AL
+    // may close the group we hang on before close() runs.
+    index_file_name = panzer_file_name(file_id);
+    if (!panzer_object_token(index_dset, index_token)) index_token = H5O_TOKEN_UNDEF;
+    adoptIndexHandoff();
     restoreTimeContext();
 }
 
@@ -1193,6 +1278,10 @@ void PanzerDB::close() {
     if (file_id < 0) return;
 
     flush();
+    // Park the decoded index before the handles go away: the next engine opened on
+    // this file resumes from it instead of re-reading the whole table. Uses the
+    // identity noted in init(), because the AL may have closed our group already.
+    handBackIndexHandoff();
     if (list_spans_dset >= 0) H5Dclose(list_spans_dset);
     if (index_dset >= 0) H5Dclose(index_dset);
     if (data_dset_f64 >= 0) H5Dclose(data_dset_f64);
@@ -1209,6 +1298,99 @@ void PanzerDB::close() {
         H5Fclose(file_id); // It is a file
     }
     file_id = -1;
+}
+
+// ============================================================================
+// INDEX HANDOFF — the parsed /index outlives the engine that read it
+//
+// Reading the tables dominates engine opening (171k rows on core_profiles:
+// ~100 ms, a third of it inflating /index and /paths). A SLICE_OP writer builds
+// one engine per time step, so that cost was paid once per step: quadratic in the
+// number of rows already written. The parsed state is therefore parked when the
+// engine closes and taken back by the next engine on the same file, which then
+// only reads the rows appended since (see getLeaves()).
+//
+// Reuse requires the parked state to still be the head of the on-disk table:
+// same file, same /index object (a recreated dataset has a new address), an
+// extent that did not shrink, and the same (offset, count) in its last row.
+// /index is append-only by construction, so those checks are what a rewrite —
+// the one thing that does break the assumption — has to fail.
+// ============================================================================
+
+PanzerDB::IndexHandoff& PanzerDB::indexHandoff() {
+    // Per thread: two threads each driving a write session must not park their
+    // state into each other's slot. One slot rather than a map on purpose: it
+    // holds the last file touched, so a session walking many IDS files replaces
+    // it instead of keeping one decoded table per file.
+    static thread_local IndexHandoff parked;
+    return parked;
+}
+
+void PanzerDB::adoptIndexHandoff() {
+    if (!cached_leaves.empty() || index_rows_loaded > 0) return;  // already loaded here
+    IndexHandoff& parked = indexHandoff();
+    if (!parked.valid || parked.rows == 0 || parked.generation == 0) return;
+    if (parked.key != index_file_name) return;
+    if (!panzer_same_object(index_dset, parked.index_token)) return;  // /index recreated
+    if (panzer_index_rows(index_dset) < parked.rows) return;            // table shrank
+    uint64_t off = 0, cnt = 0;
+    if (!panzer_index_row(index_dset, parked.rows - 1, off, cnt)) return;
+    if (off != parked.last_offset || cnt != parked.last_count) return;  // prefix rewritten
+
+    std::swap(cached_leaves, parked.leaves);
+    std::swap(cached_paths_blocks, parked.paths_blocks);
+    std::swap(cached_parent_paths_blocks, parked.parent_paths_blocks);
+    std::swap(leaf_lookup, parked.leaf_lookup);
+    std::swap(parent_lookup, parked.parent_lookup);
+    std::swap(metadata_by_schema, parked.metadata_by_schema);
+    std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
+    std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
+    std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    leaf_cache_gen = parked.generation;
+    index_rows_loaded = parked.rows;
+    index_paths_loaded = parked.paths;
+    index_last_offset = parked.last_offset;
+    index_last_count = parked.last_count;
+    parked = IndexHandoff{};
+}
+
+void PanzerDB::handBackIndexHandoff() {
+    // Not gated on leaves_cache_valid: flush() invalidates the cache precisely because
+    // it appended rows, and what is parked is only the prefix that was decoded — the
+    // rows written after it are read by the next engine, not carried over.
+    if (index_rows_loaded == 0) return;
+    // The state is parked under the identity recorded in init(): by close() time the
+    // AL may already have closed the group this engine hangs on, and an engine can
+    // outlive its handles (the writer drops it when building the next one).
+    if (index_file_name.empty() || H5O_IS_TOKEN_UNDEF(index_token)) return;
+
+    IndexHandoff& parked = indexHandoff();
+    parked = IndexHandoff{};  // whatever another engine parked is replaced by this, newer, decode
+
+    std::swap(cached_leaves, parked.leaves);
+    std::swap(cached_paths_blocks, parked.paths_blocks);
+    std::swap(cached_parent_paths_blocks, parked.parent_paths_blocks);
+    std::swap(leaf_lookup, parked.leaf_lookup);
+    std::swap(parent_lookup, parked.parent_lookup);
+    std::swap(metadata_by_schema, parked.metadata_by_schema);
+    std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
+    std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
+    std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    parked.key = index_file_name;
+    parked.index_token = index_token;
+    parked.rows = index_rows_loaded;
+    parked.paths = index_paths_loaded;
+    parked.last_offset = index_last_offset;
+    parked.last_count = index_last_count;
+    parked.generation = leaf_cache_gen;
+    parked.valid = true;
+
+    // The containers this engine held now belong to the parked state.
+    leaves_cache_valid = false;
+    index_rows_loaded = 0;
+    index_paths_loaded = 0;
+    index_last_offset = 0;
+    index_last_count = 0;
 }
 
 
@@ -1481,18 +1663,30 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     // The generation is bumped HERE (not at invalidation): this is the exact point
     // where the Leaf objects and the path text blocks die, so every consumer holding
     // Leaf*/string_view into them sees the change and rebuilds its own caches first.
-    ++leaf_cache_gen;
-    cached_leaves.clear();
-    leaf_lookup.clear();
-    time_lookup_unsafe_paths.clear();
-    parent_lookup.clear();
-    metadata_by_schema.clear();
-    max_time_at_dynamic_root.clear();
+    auto drop_decoded_index = [&] {
+        ++leaf_cache_gen;
+        cached_leaves.clear();
+        leaf_lookup.clear();
+        time_lookup_unsafe_paths.clear();
+        parent_lookup.clear();
+        metadata_by_schema.clear();
+        max_time_at_dynamic_root.clear();
+        cached_dynamic_aos_roots.clear();
+        cached_paths_blocks.clear();
+        cached_parent_paths_blocks.clear();
+        // index_rows_loaded > 0 means "the containers above hold that many decoded
+        // rows" — the handoff relies on it, so dropping the decode drops the counter.
+        index_rows_loaded = 0;
+        index_paths_loaded = 0;
+        index_last_offset = 0;
+        index_last_count = 0;
+    };
 
     // 1. Read size of /index
     hsize_t dims[2];
     hid_t space = H5Dget_space(index_dset);
     if (space < 0) {
+        drop_decoded_index();
         leaves_cache_valid = true; // Le cache est maintenant valide (mais vide).
         return cached_leaves;
     }
@@ -1512,17 +1706,27 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     const unsigned flags_c  = legacy_layout ? 11 : 10;
     const unsigned parent_c = legacy_layout ? 12 : 11;
 
+    // /index and /paths only ever grow, so when this engine took over the decode
+    // parked by the engine that last read this file (adoptIndexHandoff), what is
+    // already decoded is a valid prefix of the table: read only the rows appended
+    // since. That is what turns a writer doing one SLICE_OP per time step from
+    // quadratic back into linear, and it saves a SWMR reader a full re-decode.
+    const bool handoff = (index_rows_loaded > 0 && index_rows_loaded <= n_rows);
+    if (handoff && index_rows_loaded == n_rows) {
+        leaves_cache_valid = true;  // nothing was appended since the handoff
+        return cached_leaves;
+    }
+    const uint64_t start_row = handoff ? index_rows_loaded : 0;
+    if (start_row == 0) drop_decoded_index();
+    else ++leaf_cache_gen;  // cached_leaves grows, so its buffer may move
+
     if (n_rows == 0) {
         max_time_at_dynamic_root.clear();
         leaves_cache_valid = true; // Cache is now valid (but empty).
         return cached_leaves;
     }
 
-    uint64_t read_count = n_rows;
-
-    cached_dynamic_aos_roots.clear();
-    cached_paths_blocks.clear();
-    cached_parent_paths_blocks.clear();
+    const uint64_t read_count = n_rows - start_row;
 
     // ------------------------------------------------------------------
     // v3 branch: 7 packed u64 columns + interned path texts in /path_table.
@@ -1537,18 +1741,63 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             n_paths = pt_dims[0];
         }
 
-        cached_paths_blocks.emplace_back((size_t)n_paths * PATH_MAX_LEN);
+        // Path ids are handed out in increasing order, so the text of a path
+        // interned by an earlier engine sits in a block pushed by an earlier
+        // reload; only the ids from path_base on are read now.
+        const uint64_t path_base = start_row > 0 ? index_paths_loaded : 0;
+        const uint64_t new_paths = n_paths > path_base ? n_paths - path_base : 0;
+
+        cached_paths_blocks.emplace_back((size_t)new_paths * PATH_MAX_LEN);
         std::vector<char>& pt_data = cached_paths_blocks.back();
-        if (n_paths > 0) {
+        if (new_paths > 0) {
             hid_t str_type = H5Tcopy(H5T_C_S1);
             H5Tset_size(str_type, PATH_MAX_LEN);
             H5Tset_strpad(str_type, H5T_STR_NULLPAD);
-            H5Dread(path_table_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, pt_data.data());
+            if (path_base > 0) {
+                const hsize_t pstart[1] = {path_base};
+                const hsize_t pblock[1] = {new_paths};
+                hid_t pt_space = H5Dget_space(path_table_dset);
+                H5Sselect_hyperslab(pt_space, H5S_SELECT_SET, pstart, nullptr, pblock, nullptr);
+                hid_t pt_mem = H5Screate_simple(1, pblock, nullptr);
+                H5Dread(path_table_dset, str_type, pt_mem, pt_space, H5P_DEFAULT, pt_data.data());
+                H5Sclose(pt_mem);
+                H5Sclose(pt_space);
+            } else {
+                H5Dread(path_table_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, pt_data.data());
+            }
             H5Tclose(str_type);
         }
 
         std::vector<uint64_t> idx(read_count * PANZER_INDEX_COLUMNS_V3);
-        H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+        if (start_row > 0) {
+            const hsize_t istart[2] = {start_row, 0};
+            const hsize_t iblock[2] = {read_count, PANZER_INDEX_COLUMNS_V3};
+            hid_t idx_space = H5Dget_space(index_dset);
+            H5Sselect_hyperslab(idx_space, H5S_SELECT_SET, istart, nullptr, iblock, nullptr);
+            hid_t idx_mem = H5Screate_simple(2, iblock, nullptr);
+            H5Dread(index_dset, H5T_NATIVE_UINT64, idx_mem, idx_space, H5P_DEFAULT, idx.data());
+            H5Sclose(idx_mem);
+            H5Sclose(idx_space);
+        } else {
+            H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+        }
+
+        // First id covered by each text block, in order; ids are contiguous and
+        // increasing, so the newest blocks are scanned first.
+        std::vector<std::pair<uint64_t, const char*>> path_slots;
+        path_slots.reserve(cached_paths_blocks.size());
+        uint64_t slot_first = 0;
+        for (const std::vector<char>& block: cached_paths_blocks) {
+            path_slots.emplace_back(slot_first, block.data());
+            slot_first += block.size() / PATH_MAX_LEN;
+        }
+        auto path_slot = [&](uint64_t path_id) -> const char* {
+            for (size_t b = path_slots.size(); b-- > 0;) {
+                if (path_id >= path_slots[b].first)
+                    return path_slots[b].second + (size_t)(path_id - path_slots[b].first) * PATH_MAX_LEN;
+            }
+            return nullptr;
+        };
 
         auto dset_extent = [](hid_t dset_id) -> uint64_t {
             if (dset_id < 0) return 0;
@@ -1566,8 +1815,8 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
 
         if (cached_leaves.capacity() < n_rows) cached_leaves.reserve(n_rows);
 
-        for (uint64_t i = 0; i < read_count; ++i) {
-            const uint64_t* row = &idx[i * PANZER_INDEX_COLUMNS_V3];
+        for (uint64_t i = start_row; i < n_rows; ++i) {
+            const uint64_t* row = &idx[(i - start_row) * PANZER_INDEX_COLUMNS_V3];
             const uint64_t offset = row[0];
             const uint64_t count  = row[1];
             const uint32_t path_id   = (uint32_t)(row[2] & 0xFFFFFFFFULL);
@@ -1591,10 +1840,12 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             }
             if (path_id >= n_paths) continue;   // corrupt: no text for that id
 
+            const char* slot = path_slot(path_id);
+            if (!slot) continue;   // corrupt: id outside every text block
+
             cached_leaves.emplace_back();
             Leaf& leaf = cached_leaves.back();
 
-            const char* slot = pt_data.data() + (size_t)path_id * PATH_MAX_LEN;
             leaf.path = std::string_view(slot);
 
             // M1 rule on the path text: parent = full path minus 1 segment (data)
@@ -1640,6 +1891,14 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             }
         }
 
+        // What a later engine may resume from: the prefix now decoded, plus the
+        // last row read from disk (skipped or not) as its signature.
+        const uint64_t* tail = &idx[(read_count - 1) * PANZER_INDEX_COLUMNS_V3];
+        index_rows_loaded = n_rows;
+        index_paths_loaded = n_paths;
+        index_last_offset = tail[0];
+        index_last_count = tail[1];
+
         rebuildDynamicRootTimeIndex();
         leaves_cache_valid = true;
         return cached_leaves;
@@ -1648,10 +1907,22 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     // v2 / legacy branch (12 or 14 u64 columns + row-aligned /paths).
     // ------------------------------------------------------------------
 
-    // 2. Read index and paths (full reload)
+    // 2. Read the index rows and paths added since the prefix already decoded
     std::vector<uint64_t> idx(read_count * ncols);
-    H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+    if (start_row > 0) {
+        const hsize_t istart[2] = {start_row, 0};
+        const hsize_t iblock[2] = {read_count, ncols};
+        hid_t idx_space = H5Dget_space(index_dset);
+        H5Sselect_hyperslab(idx_space, H5S_SELECT_SET, istart, nullptr, iblock, nullptr);
+        hid_t idx_mem = H5Screate_simple(2, iblock, nullptr);
+        H5Dread(index_dset, H5T_NATIVE_UINT64, idx_mem, idx_space, H5P_DEFAULT, idx.data());
+        H5Sclose(idx_mem);
+        H5Sclose(idx_space);
+    } else {
+        H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+    }
 
+    // /paths is row-aligned with /index, so its tail block covers exactly these rows.
     cached_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
     cached_parent_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
     std::vector<char>& paths_data = cached_paths_blocks.back();
@@ -1664,14 +1935,22 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         hid_t paths_space = H5Dget_space(paths_dset);
         hsize_t paths_dims[1];
         H5Sget_simple_extent_dims(paths_space, paths_dims, nullptr);
-        
+
         if (paths_dims[0] >= n_rows) { // Ensure data exists
-            H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
+            if (start_row > 0) {
+                const hsize_t pstart[1] = {start_row};
+                const hsize_t pblock[1] = {read_count};
+                H5Sselect_hyperslab(paths_space, H5S_SELECT_SET, pstart, nullptr, pblock, nullptr);
+                hid_t paths_mem = H5Screate_simple(1, pblock, nullptr);
+                H5Dread(paths_dset, str_type, paths_mem, paths_space, H5P_DEFAULT, paths_data.data());
+                H5Sclose(paths_mem);
+            } else {
+                H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
+            }
         }
         H5Sclose(paths_space);
     }
     H5Tclose(str_type);
-
     // M1: /parent_paths is no longer read.  parent_paths_data (already allocated and
     // zero-initialised above) simply backs the reconstructed parent paths, which the
     // loop below fills from each row's (parent_id, kind, full path).
@@ -1692,9 +1971,10 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     //   - full_path minus  1 segment (last name)             for a data leaf (kind 0/1)
     //   - full_path minus  2 segments (instance + name)      for an AoS meta (kind 2/3)
     auto parent_path_of = [&](uint64_t i) -> std::string {
-        if (idx[i * ncols + parent_c] == PANZER_NO_PARENT_ROW) return std::string();
-        const uint64_t leaf_kind = idx[i * ncols + flags_c] & 0xFULL;
-        const std::string full(static_cast<const char*>(paths_data.data() + i * PATH_MAX_LEN));
+        const uint64_t* row = &idx[(i - start_row) * ncols];
+        if (row[parent_c] == PANZER_NO_PARENT_ROW) return std::string();
+        const uint64_t leaf_kind = row[flags_c] & 0xFULL;
+        const std::string full(static_cast<const char*>(paths_data.data() + (i - start_row) * PATH_MAX_LEN));
         const size_t n_strip = (leaf_kind == 2 || leaf_kind == 3) ? 2 : 1;
         size_t end = full.size();
         for (size_t k = 0; k < n_strip && end > 0; ++k) {
@@ -1725,8 +2005,8 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     const uint64_t ext_str  = dset_extent(data_dset_str);
     // -----------------------------------------------------------------------
 
-    for (uint64_t i = 0; i < read_count; ++i) {
-        const uint64_t* row = &idx[i * ncols];
+    for (uint64_t i = start_row; i < n_rows; ++i) {
+        const uint64_t* row = &idx[(i - start_row) * ncols];
 
         // --- Crash-safe guardrail (per row, before emplace) -----------------
         // A DATA row (kind 0) whose payload extends past the materialised
@@ -1753,12 +2033,13 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         cached_leaves.emplace_back();
         Leaf& leaf = cached_leaves.back();
 
-        leaf.path         = std::string_view(paths_data.data() + i * PATH_MAX_LEN);
+        const size_t slot = (size_t)(i - start_row) * PATH_MAX_LEN;
+        leaf.path         = std::string_view(paths_data.data() + slot);
 
         // Materialise the reconstructed parent path into the persistent backing
         // buffer so the std::string_view stays valid for the life of the leaf cache.
         const std::string recon_parent = parent_path_of(i);
-        char* pp_slot = parent_paths_data.data() + i * PATH_MAX_LEN;
+        char* pp_slot = parent_paths_data.data() + slot;
         const size_t copy_len = std::min(recon_parent.size(), (size_t)(PATH_MAX_LEN - 1));
         std::memcpy(pp_slot, recon_parent.data(), copy_len);
         pp_slot[copy_len] = '\0';
@@ -1794,6 +2075,15 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             cached_dynamic_aos_roots.emplace_back(leaf.path);
         }
     }
+
+    // What a later engine may resume from: the prefix now decoded — /paths being
+    // row-aligned, its extent is the row count — plus the last disk row (skipped
+    // or not) as the signature of that prefix.
+    const uint64_t* tail = &idx[(read_count - 1) * ncols];
+    index_rows_loaded = n_rows;
+    index_paths_loaded = n_rows;
+    index_last_offset = tail[off_c];
+    index_last_count = tail[cnt_c];
 
     rebuildDynamicRootTimeIndex();
 

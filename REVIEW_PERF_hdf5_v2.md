@@ -19,13 +19,24 @@ traités). Voici ce qui reste, par ordre d'impact.
      (`H5Sselect_hyperslab` à partir de l'ancien extent), en pushant un nouveau bloc
      dans `cached_paths_blocks` (le `std::list` est déjà fait pour ça). Bénéficie aussi
      au **lecteur SWMR** (`invalidateLeafCache` → refresh O(delta) au lieu de O(N)).
+   — *fait (2026-10-11, A1, cf. to_improve.md point 21)* : l'état décodé survit au moteur qui
+   l'a produit (`PanzerDB::adoptIndexHandoff` à l'`init()`, `handBackIndexHandoff` à la
+   `close()`), et la reprise n'est acceptée que si le préfixe est toujours la tête de la table
+   disque (même fichier, même jeton `H5Otoken_cmp` de `/index`, extent non rétréci, même
+   `(offset, count)` sur la dernière ligne). La boucle d'ouverture n'est plus quadratique :
+   SLICE_OP 104,5 → **20,8 ms** par pas établi, chrono d'ouverture chaud 91–116 → **6–7 ms**
+   (cp) et 42–59 → **7–8 ms** (eq), refresh après 500 lignes ajoutées 4,53 ms au lieu de ~90 ms.
+   La première idée ci-dessus (garder l'APPEND engine ouvert entre opérations) n'est pas faite —
+   le handoff s'en passe, et le cycle de vie AL n'est pas touché.
 2. **`restoreTimeContext` (panzerdb.cpp:691-755)** : alloue `aos_path + "/"` par
    (leaf × root) dans la boucle interne, et copie chaque `leaf.path` en `std::string`
    pour la map. Pré-calculer les préfixes racine une fois, comparer en `string_view`,
    et incrémenter seulement sur les nouvelles lignes si A1 est fait.
    — *fait en partie (2026-10-11, cf. E6)* : plus d'allocation par feuille ni par root,
    comparaison en préfixe, snapshot `file_time_base` réservé à APPEND. Le reliquat
-   (« incrémenter seulement sur les nouvelles lignes ») dépend de A1.
+   (« incrémenter seulement sur les nouvelles lignes ») n'est pas pris : depuis A1 la table
+   décodée est incrémentale, mais `rebuildDynamicRootTimeIndex()` reste une reconstruction
+   complète — ses clés sont des `string_view` dans `cached_dynamic_aos_roots`, qui grossit.
 3. **`flush()` (panzerdb.cpp:759)** refait un `H5Dget_space` par dataset pour connaître
    l'extent courant alors que `disk_size_*` est déjà caché — réutiliser les compteurs
    (gagner 6 appels méta HDF5/flush).

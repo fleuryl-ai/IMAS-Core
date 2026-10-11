@@ -129,6 +129,9 @@ al_add_hdf5_test(test_engine_index_v3)
 # Counters table that restoreTimeContext() rebuilds at open (aos_time_counters):
 # what getDynamicAOSSize / getAOSShape answer in READ, and where APPEND resumes.
 al_add_hdf5_test(test_engine_time_context)
+# Index handoff: the decoded /index outlives its engine and the next engine on the
+# same file only reads the rows appended since (PanzerDB::adoptIndexHandoff).
+al_add_hdf5_test(test_engine_index_handoff)
 target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +
