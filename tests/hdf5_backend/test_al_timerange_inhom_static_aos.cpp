@@ -25,7 +25,8 @@
 
 namespace fs = std::filesystem;
 
-static const std::string URI = "imas:hdf5?path=./test_db_timerange_inhom_static_aos";
+static const char* DB = "./test_db_timerange_inhom_static_aos";
+static const std::string URI = std::string("imas:hdf5?path=") + DB;
 static const char* IDS = "test_ids";
 static const int NCH = 2;
 
@@ -134,7 +135,7 @@ static void read_window(double tmin, double tmax) {
 }
 
 int main() {
-    fs::remove_all(URI.substr(7));
+    fs::remove_all(DB);
     std::printf("=== TEST TIMERANGE_OP on a static AoS with per-element time base ===\n");
     try {
         write_pulse();
@@ -146,7 +147,7 @@ int main() {
         std::printf("[FAIL] exception: %s\n", e.what());
         ++failures;
     }
-    fs::remove_all(URI.substr(7));
+    fs::remove_all(DB);
     if (failures) {
         std::printf("%d FAILURE(S)\n", failures);
         return 1;
