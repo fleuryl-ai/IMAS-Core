@@ -23,6 +23,9 @@ traités). Voici ce qui reste, par ordre d'impact.
    (leaf × root) dans la boucle interne, et copie chaque `leaf.path` en `std::string`
    pour la map. Pré-calculer les préfixes racine une fois, comparer en `string_view`,
    et incrémenter seulement sur les nouvelles lignes si A1 est fait.
+   — *fait en partie (2026-10-11, cf. E6)* : plus d'allocation par feuille ni par root,
+   comparaison en préfixe, snapshot `file_time_base` réservé à APPEND. Le reliquat
+   (« incrémenter seulement sur les nouvelles lignes ») dépend de A1.
 3. **`flush()` (panzerdb.cpp:759)** refait un `H5Dget_space` par dataset pour connaître
    l'extent courant alors que `disk_size_*` est déjà caché — réutiliser les compteurs
    (gagner 6 appels méta HDF5/flush).
@@ -170,6 +173,21 @@ E6. **`restoreTimeContext()` s'exécute aussi en mode READ** — appelé à la f
 après le if/else de mode (`panzerdb.cpp:408`) ; alloue `aos_path + "/"` par
 (feuille × root) plus une copie `std::string` par feuille. Mesuré **1,65 %** de la
 marche SLICE cp (le moteur étant recréé à chaque opération, cf. A1).
+— **TRAITÉ (2026-10-11)**, et la mesure de la revue était **trop basse** : la boucle coûte
+**11,3 ms par ouverture** sur cp (sonde chrono, 171 165 feuilles), soit ~4,7 % d'une marche
+SLICE à 20 get — pas 1,65 %. La **prémisse est en revanche fausse** : la table n'est pas
+inutile en READ, `getDynamicAOSSize()` y est chargé (`iread_strategy.h:429`,
+`direct_reader.cpp:49`). Corrigé : clé `std::string` réutilisée, parent AoS trouvé par
+préfixe sur `leaf.path` (plus de concaténation par root), snapshot `file_time_base` réservé
+à APPEND. Équivalence prouvable sur les trois formats d'index : **131 598 entrées de
+compteurs comparées, 0 écart** ; test goupille `test_engine_time_context` (passe aussi sur
+HEAD). Gain le plus reproductible, sur le chrono d'ouverture (`index`) en paires A/C
+alternées : **−4 à −5 ms/ouverture sur cp** (95 → 92 ms en régime chaud), **−5 à −7 ms sur
+eq** (40 → 34 ms) — la boucle passant de 11,3 à 6,2 ms sur cp. Temps mural : cp SLICE
+−4,7 % (gain de la boucle), eq SLICE −3,0 % et eq TIMERANGE −3,5 % (gain du snapshot
+supprimé, la carte de eq comptant 43 598 entrées) ; **GLOBAL sous le plancher de bruit
+±4 %** dans les deux sens — ne pas chercher de signal GLOBAL sur ce poste. Empreintes
+inchangées ; suite 88/88. Détails : `to_improve.md` point 20.
 E7. **Buffers de chaînes zero-initialisés pour rien** : `panzerdb.cpp:1917` et `:1962`
 (`std::vector<char> buf(n * STRING_MAX_LEN, 0)` puis `H5Dread` qui écrase tout).
 E8. **Métadonnées lues puis jetées** : `slice_read_strategy.cpp:111`,

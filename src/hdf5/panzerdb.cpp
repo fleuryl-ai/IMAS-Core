@@ -782,7 +782,7 @@ void PanzerDB::restoreTimeContext() {
     // const& on purpose: this table is the cached index (one Leaf per /index row,
     // each with its own shape vector); copying it per APPEND/READ open was O(N).
     const auto& leaves = getLeaves();
-    
+
     // 1. Initialize counters for explicit Dynamic AoS
     for (const auto& leaf : leaves) {
         if (leaf.flags == 3) {
@@ -791,6 +791,14 @@ void PanzerDB::restoreTimeContext() {
     }
     
     // 2. Iterate over DATA leaves
+    //
+    // Per-leaf allocation is what made this loop expensive (measured 11,3 ms for
+    // 171 165 leaves on the cp fixture, for a table that ends up holding 29
+    // entries): the prefix test built "aos + \"/\"" per (leaf x root) and the
+    // counter update built a key string per leaf. Both are avoided here — the
+    // scratch key below keeps its capacity between iterations, so assign() does
+    // not allocate once the longest path has been seen.
+    std::string key;
     for (const auto& leaf : leaves) {
         if (leaf.flags == 2 || leaf.flags == 3) continue;
 
@@ -799,7 +807,7 @@ void PanzerDB::restoreTimeContext() {
         for (auto dim : leaf.shape_span()) {
             if (dim > 0) slice_volume *= dim;
         }
-        
+
         if (slice_volume == 0) slice_volume = 1;
 
         uint64_t n_steps_in_leaf = leaf.count / slice_volume;
@@ -808,38 +816,40 @@ void PanzerDB::restoreTimeContext() {
         uint64_t next_time = leaf.time_index + n_steps_in_leaf;
 
         // Find dynamic AOS parent
-        std::string parent_aos = "";
+        const std::string* parent_aos = nullptr;
         // OPTIMIZATION: Iterate over cached roots instead of all counters to avoid O(N^2)
         for (const auto& aos_path : cached_dynamic_aos_roots) {
             // Check if leaf path starts with AOS path + "/"
             // e.g. leaf="profiles_1d/0/ion/...", aos="profiles_1d"
-            std::string prefix = aos_path + "/";
-            if (leaf.path.rfind(prefix, 0) == 0) {
+            if (leaf.path.size() > aos_path.size() && leaf.path[aos_path.size()] == '/' &&
+                leaf.path.compare(0, aos_path.size(), aos_path) == 0) {
                 // Take the longest match (most nested)
-                if (aos_path.length() > parent_aos.length()) {
-                    parent_aos = aos_path;
+                if (!parent_aos || aos_path.length() > parent_aos->length()) {
+                    parent_aos = &aos_path;
                 }
             }
         }
 
         // Update counter for standalone data
-        std::string leaf_path_str(leaf.path);
-        if (next_time > aos_time_counters[leaf_path_str]) {
-            aos_time_counters[leaf_path_str] = next_time;
-        }
+        key.assign(leaf.path.data(), leaf.path.size());
+        uint64_t& own = aos_time_counters[key];
+        if (next_time > own) own = next_time;
 
         // Update counter for parent AOS
-        if (!parent_aos.empty()) {
-            if (next_time > aos_time_counters[parent_aos]) {
-                aos_time_counters[parent_aos] = next_time;
-            }
+        if (parent_aos) {
+            uint64_t& parent = aos_time_counters[*parent_aos];
+            if (next_time > parent) parent = next_time;
         }
     }
 
     // Snapshot the file-derived counters (before this session writes anything) so
     // the writer can tell a FRESH signal from a CONTINUING one when deciding
     // whether the timebase catch-up anchor (time_next - n_slices) should apply.
-    file_time_base = aos_time_counters;
+    // APPEND only. The snapshot is read exclusively through hasFileData(), called only
+    // from the signal write paths: in READ it is dead weight (43 598 entries copied on
+    // the equilibrium fixture), and in WRITE it is always empty anyway — init() deletes
+    // /index before this runs, so the counters it would copy are none.
+    if (mode == OpenMode::APPEND) file_time_base = aos_time_counters;
 }
 
 PanzerDB::~PanzerDB() { close(); }

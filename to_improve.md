@@ -578,3 +578,85 @@ globale (fenêtre ignorée). Inatteignable par l'AL — tout nœud `dynamic` a u
 au dictionnaire (`channel/n_e/data` : `timebasepath="n_e/time"`, vérifié dans IDSDef.xml) —
 donc pas de correctif sans reproducteur.
 
+## 20. `restoreTimeContext()` : ~11 ms par ouverture perdus en allocations par feuille — TRAITÉ (2026-10-11)
+
+**Coût réel (mesuré, sonde chrono temporaire dans `restoreTimeContext`, pilotée par
+`E6_PROBE=1`)** : sur cp (171 165 feuilles, 29 compteurs, 1 root AoS dynamique) la boucle
+coûte **11,3 ms par ouverture** (78,8 ms sur 7 ouvertures), à côté de `getLeaves()`
+**90 ms** — c'est le second poste du coût d'ouverture, pas les 1,65 % annoncés par la revue.
+Sur une marche SLICE à 20 get (1 ouverture), 11,3 ms ≈ **4,7 % du total** ; c'est bien ce
+que donne l'A/B ci-dessous.
+
+**La prémisse de la revue est fausse** : la table n'est *pas* inutile en READ.
+`getDynamicAOSSize()` lit `aos_time_counters` et est chargé sur le chemin de lecture
+(`iread_strategy.h:429`, `direct_reader.cpp:49`). Ce qui est supprimable, c'est le coût par
+feuille, pas l'appel.
+
+**Ce qui coûtait** : par feuille, `aos_path + "/"` (allocation) × chaque root AoS dynamique,
+plus une `std::string` clé par feuille (allocation + copie), pour une table qui finit à
+29 entrées sur cp.
+
+**Correction** (`panzerdb.cpp`, boucle 2 de `restoreTimeContext`) :
+1. clé `std::string` **réutilisée** (`key.assign(leaf.path...)`) — une seule capacité
+   amortie pour toute la boucle ;
+2. plus de concaténation par root : le parent AoS est trouvé par comparaison de préfixe sur
+   `leaf.path` (`leaf.path[aos_size] == '/'` + `compare`), le plus imbriqué gagnant ;
+3. `file_time_base` n'est plus copié qu'en mode **APPEND** — `hasFileData()` (son seul
+   consommateur, lignes 2260/2292/2402/2422) n'est appelé que depuis
+   `writeDataSlicesImpl`/`writeDataSlices`, donc la copie est morte en READ ; et en WRITE
+   elle serait vide de toute façon, `init()` supprimant `/index` (lignes 196-204) avant
+   l'appel à `restoreTimeContext()` (ligne 408). En eq cela évite la copie d'une carte de
+   43 598 entrées à chaque ouverture.
+
+**Preuve d'équivalence** : différentiel old/new (`/tmp/time_ctx_diff`, deux implémentations
+sur les mêmes feuilles) sur 9 groupes d'IDS couvrant les trois formats d'index — 14 colonnes
+legacy, 12 colonnes v2, 7 colonnes v3 (core_profiles_3, equilibrium_1, magnetics_FAT,
+reflectometer v1/v2, /tmp/bench cp+eq, test_equilibrium_v2, test_reflectometer_profile_v2) :
+**131 598 entrées de compteurs comparées, 0 écart**. L'ancienne table concordait aussi avec
+`getDynamicAOSSize` vivant pour chaque root.
+
+**Test goupille** : `tests/hdf5_backend/test_engine_time_context.cpp` — fige la table
+reconstruite à l'ouverture (`A/0/B` = 5, `A/1/B` = 2, compteurs par chemin 3 / 5, feuille en
+mode bulk = **1** pas de temps quelle que soit sa taille, `getAOSShape().front()` = 5) et
+vérifie qu'APPEND repart de cette table (2 tranches de plus → taille 7, tranche 6 relisible).
+Il passe **aussi sur HEAD** : les valeurs figées sont le comportement préexistant, pas
+celui inventé par la réécriture.
+
+**A/B — coût d'ouverture** (le chrono `index` de `bench_read`, qui encadre la construction
+du moteur : relecture de `/index` + table de compteurs ; A = HEAD, B = boucle réécrite seule,
+C = B + snapshot réservé à APPEND ; paires A/C strictement alternées, 4 reps chacune) :
+
+| fichier | A (ms/ouverture) | C (ms/ouverture) | écart |
+|---|---|---|---|
+| cp (171 165 feuilles, 29 compteurs) | 113,6 / 108,1 / 95,9 / 95,2 | 108,8 / 102,5 / 91,9 / 91,1 | **−4 à −5 ms**, chaque rep de C sous son rep de A |
+| eq (58 162 feuilles, 43 598 compteurs) | 60,0 / 49,1 / 41,4 / 40,5 / 40,2 | 53,9 / 46,2 / 37,0 / 34,8 / 35,0 | **−5 à −7 ms**, même ordre |
+
+Concordant avec la sonde : la boucle passe de 11,3 à **6,2 ms** par ouverture sur cp.
+
+**A/B — temps mural** (médiane de 3 séries de `--reps 3`) et décomposition des deux
+sous-corrections :
+
+| fichier | opération | A | B (boucle) | C (+ APPEND-only) |
+|---|---|---|---|---|
+| cp | SLICE (20 get) | 119,59 ms | 114,06 ms (−4,7 %) | 114,07 ms |
+| cp | TIMERANGE | 1572,1 ms | 1558,3 ms (−0,9 %) | 1560,3 ms |
+| cp | GLOBAL | 1037–1099 ms | 1056–1058 ms | 1036–1145 ms — dans le bruit |
+| eq | SLICE (20 get) | 427,36 ms | 427,05 ms | **414,72 ms** (−3,0 %) |
+| eq | TIMERANGE | 918,0 ms | 907,4 ms | **886,1 ms** (−3,5 %) |
+| eq | GLOBAL | 1333–1395 ms | 1332–1378 ms | 1351–1456 ms — dans le bruit |
+
+Lecture : sur cp la table ne compte que 29 entrées, donc tout le gain vient de la boucle ;
+sur eq la boucle est noyée par les 43 598 entrées et le gain vient de la copie de carte
+supprimée. GLOBAL (une seule ouverture par rep, lecture dominateur) reste sous le **plancher
+de bruit de ±4 %** de cette machine : un premier bloc A/C sur eq GLOBAL annonçait +4 % de
+ralentissement ; l'alternance stricte A-C-A-C le réfute (C ≈ A sur la partie lecture, et C
+gagne nettement sur le chrono d'ouverture).
+
+Empreintes de contenu inchangées sur les trois opérations et les deux fichiers
+(`cc02212c7c86c329` / `f91016520c33243d` / `d92537f55c5f2e4b` / `eb9093018cb67253`).
+Suite : **88/88**. Sonde chrono retirée du source.
+
+**Ce qui reste** : la table de compteurs est encore reconstruite entièrement à chaque
+ouverture (eq : 43 598 entrées de `std::unordered_map`). Le vrai gain d'ouverture reste A1
+(rechargement incrémental de `/index`) : en régime chaud le chrono d'ouverture est de
+95→92 ms sur cp et 40→34 ms sur eq, c'est donc ~92 ms / ~34 ms par ouverture qui subsistent.
