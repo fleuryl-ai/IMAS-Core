@@ -748,8 +748,91 @@ qui repart à 1). Suite : **89/89**.
 **Ce qui reste** : l'autre idée du poste A1 — garder l'APPEND engine ouvert entre opérations —
 n'est pas faite (le handoff obtient le même effet sans toucher au cycle de vie AL) ; les
 ~6 ms par ouverture encore debout sont `restoreTimeContext()` + l'ouverture HDF5 du fichier ;
-`endAction` de l'écrivain coûte encore ~9,4 ms par pas. Et un défaut indépendant, non corrigé :
-ouvertures APPEND répétées ⇒ segfault à la sortie du processus dans `H5_term_library`
-(`H5F_term_package → H5I_clear_type → H5VL_file_close → H5I_find_id`), reproduit ici encore
-après 10 ouvertures sur cp — les mesures ci-dessus restent valides (le crash est après le
-dernier chrono).
+`endAction` de l'écrivain coûte encore ~9,4 ms par pas. Et un défaut indépendant, **repris et
+corrigé au point 22** : ouvertures APPEND répétées ⇒ segfault à la sortie du processus dans
+`H5_term_library` (`H5F_term_package → H5I_clear_type → H5VL_file_close → H5I_find_id`),
+reproduit ici encore après 10 ouvertures sur cp — les mesures ci-dessus restent valides (le
+crash est après le dernier chrono).
+
+---
+
+## 22. Un moteur ouvert par nom de fichier ne ferme jamais son fichier — CORRIGÉ (2026-10-12)
+
+**Le symptôme.** Ouvertures APPEND répétées d'un même fichier ⇒ **segfault à la sortie du
+processus**, dans le nettoyage HDF5 : `H5_term_library → H5F_term_package → H5I_clear_type →
+H5VL_file_close → H5I_find_id`. Reproduit sans l'AL ni `HDF5Writer_v2` : une boucle
+`{ PanzerDB db(path, APPEND); }` suffit. Les données sur disque étaient justes (`flush()`
+commite), ce qui explique que rien d'autre ne l'ait attrapé.
+
+**La mesure avant, pas l'intuition.** Compteur d'objets vivants (`H5Fget_obj_count(H5F_OBJ_ALL, …)`),
+12 cycles APPEND sur une copie de cp (171 165 feuilles) :
+
+| après le cycle n° | 0 | 1 | 2 | 3 | … | 9 |
+|---|---|---|---|---|---|---|
+| `FILE` | 1 | 2 | 3 | 4 | … | 10 |
+| `DATASET` / `GROUP` | 0 | 0 | 0 | 0 | … | 0 |
+
+Un `hid_t` de fichier survit par moteur — et par lui seul. Le **READ fuit pareil** (6 cycles ⇒
+6 ids fichier) mais HDF5 referme sans bruit des fichiers lecture seule : `exit=0`. En APPEND le
+fichier est ouvert `RDWR` et modifié, et HDF5 plante en le refermant. C'est aussi pourquoi
+`bench_read` (qui lit) n'a jamais crashé, alors que la boucle d'écriture, si.
+
+**Revérifié le 2026-10-13** sur un fichier minimal à tables dans un groupe enfant (la fixture cp
+de la table ci-dessus est partie avec `/tmp`, vide entre deux journées de travail) : 6 cycles
+APPEND sans le correctif ⇒ `FILE=1,2,3,4,5,6` après chaque cycle, `DATASET`/`GROUP` à 0, et
+**`exit=139` sur les trois runs** (le gestionnaire `atexit` de la sonde ne s'imprime même pas :
+HDF5 meurt dans son propre nettoyage, qui passe donc *avant* lui). Avec le correctif : `FILE=0`
+partout, à chaque cycle comme à la terminaison, **`exit=0` sur les trois runs**. En READ sans le
+correctif, même fuite (6 ids) puis `FILE=0` à la terminaison et `exit=0` : c'est HDF5 qui les a
+fermés lui-même, sans bruit — la nuance qui explique l'absence de crash côté lecture.
+
+**La cause.** `should_close_loc_id` vaut `false` par défaut (`panzerdb.h:330`) et le
+constructeur par nom de fichier ne le met jamais à `true` alors que c'est lui qui fait le
+`H5Fopen`/`H5Fcreate`. Quand `/index` n'est pas à la racine — le cas de **tous** les fichiers
+IMAS réels, où les tables vivent dans le groupe `<ids>` — `init()` descend (panzerdb.cpp:245-250) :
+il remplace `file_id` par le groupe enfant et passe `should_close_loc_id` à `true`. `close()`
+fait alors `H5Gclose(file_id)` sur le groupe et **ne ferme jamais le fichier**. Si `/index` est
+à la racine, la branche `else if (H5Iget_type(file_id) == H5I_FILE)` rattrape le coup — d'où un
+défaut invisible sur les petits fichiers plats des tests.
+
+**Le correctif.** Le moteur qui a ouvert le fichier le possède : membre `owned_file_id`
+(`panzerdb.h:270-274`), pris dans le constructeur par nom (panzerdb.cpp:204-208), fermé dans
+`close()` quand `init()` est allé travailler dans un groupe (panzerdb.cpp:1299-1310). Rien
+d'autre ne change de main : le constructeur par `loc_id` garde `owned_file_id = -1` et la
+sémantique de `close_loc_id_on_exit` est inchangée.
+
+**Après**, mêmes compteurs, mêmes cycles : `FILE=0 DATASET=0 GROUP=0 …` après chaque cycle **et**
+au moment de la terminaison HDF5, `exit=0`. En READ aussi (6 cycles ⇒ 0).
+
+**Test goupille** : `tests/hdf5_backend/test_engine_handle_lifecycle.cpp` — fichier posé comme un
+fichier pulse (`/index` dans un groupe enfant), cinq moteurs APPEND sur le chemin du fichier, et
+la variation du nombre d'ids vivants doit être nulle ; le même contrôle sur un fichier plat, qui
+déjà marchait, garde la branche de rattrapage sous verrou. Sur les sources HEAD : **3 échecs et
+segfault à la sortie** ; après : `ALL PASSED`, `exit=0`. Suite : **90/90**.
+
+**Ce que ça coûte.** Fermer le fichier est du travail qui n'était simplement jamais fait. Sur la
+boucle d'ouverture cp, paires strictement alternées (3 runs de 12 ouvertures chacun, moyenne des
+ouvertures établies) : **6,15 / 6,23 / 6,26 ms → 6,41 / 7,45 / 7,74 ms**, soit +0,2 à +1,5 ms par
+ouverture (~+20 % du socle de ~6,2 ms). Le chrono `index` de `bench_read` passe de 11,5 à 16,1 ms
+sur cp et 16,4 à 18,9 ms sur eq (mesure unique, à prendre comme ordre de grandeur). Le temps mural
+des marches n'en porte pas la trace dans la limite de bruit : cp SLICE 554,9 → 520,9 ms,
+cp TIMERANGE 1 490,0 → 1 492,8 ms, cp GLOBAL 989,2 → 974,4 ms, eq SLICE 7 838,8 → 7 640,8 ms,
+eq TIMERANGE 920,3 → 920,4 ms, eq GLOBAL 1 494,1 → 1 448,1 ms. La boucle d'écriture AL est
+inchangée (19,5–22,7 ms par pas établi, contre 20,8 ms au point 21) et sort proprement.
+**Empreintes de contenu identiques** avant/après sur les six marches (`cc02212c7c86c329`,
+`f91016520c33243d`, `d92537f55c5f2e4b`, `eb9093018cb67253`, `c46c2d515f8dba31`,
+`a381e258df2800b0`).
+
+**Ce qui reste** dans le même coin : rien de mesuré. Le soupçon était que `close()` appelle
+`H5Gclose(file_id)` sur un id que l'AL a déjà fermé (`H5Iget_type(file_id) == -1`, observé en
+traçant A1) et aille fermer un handle **vivant** dont le numéro aurait été recyclé. Sonde (moteur
+sur un groupe qu'il ne possède pas, `close_loc_id_on_exit = false`, groupe fermé par le
+propriétaire pendant que le moteur vit, nouveau groupe ouvert avant la destruction du moteur) :
+`close()` n'y ferme **rien du tout** — `should_close_loc_id` est `false` et
+`H5Iget_type(file_id) == -1`, donc aucune des deux branches ne part. Compteurs : le groupe du
+propriétaire se ferme (`H5Gclose → 0`), moteur détruit il reste 1 groupe vivant (le nouveau), qui
+reste utilisable (`H5Gopen2 → 2`) ; les ids ne sont d'ailleurs pas des petits entiers séquentiels
+ici (`gA=144115188075855872`, `gB=144115188075855873`). Le moteur ne ferme que ce qu'il possède :
+le groupe enfant ouvert par `init()`, le `loc_id` si on le lui a confié, ou le fichier qu'il a
+ouvert (`owned_file_id`).
+

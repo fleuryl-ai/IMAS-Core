@@ -267,6 +267,11 @@ public:
 private:
     
     hid_t file_id = -1;
+    /// The file THIS engine opened (filename constructor), kept open for its whole
+    /// lifetime even when init() descends into the group holding /index: closing it
+    /// is this engine's job, and leaving it registered makes HDF5 segfault at
+    /// library termination (see close()).
+    hid_t owned_file_id = -1;
     hid_t index_dset = -1;
     hid_t paths_dset = -1;          // v2/legacy only (row-aligned full path text)
     hid_t parent_paths_dset = -1;   // gone since M1; kept as an invalid handle

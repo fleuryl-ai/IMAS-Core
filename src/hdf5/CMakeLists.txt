@@ -132,6 +132,9 @@ al_add_hdf5_test(test_engine_time_context)
 # Index handoff: the decoded /index outlives its engine and the next engine on the
 # same file only reads the rows appended since (PanzerDB::adoptIndexHandoff).
 al_add_hdf5_test(test_engine_index_handoff)
+# Handle ownership: an engine that opened the file itself must close it, or HDF5
+# segfaults at library termination (PanzerDB::close).
+al_add_hdf5_test(test_engine_handle_lifecycle)
 target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +

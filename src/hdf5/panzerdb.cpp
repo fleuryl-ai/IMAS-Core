@@ -202,6 +202,10 @@ PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_emp
     H5Pclose(fapl);
 
     if (file_id < 0) throw std::runtime_error("Failed to open or create file: " + filename);
+    // This constructor opened the file, so it owns it: init() may descend into the
+    // group holding /index and work there, but the file handle stays open — and has
+    // to be closed — until close(). See close().
+    owned_file_id = file_id;
     init(mode);
 }
 
@@ -1293,10 +1297,17 @@ void PanzerDB::close() {
     if (parent_paths_dset >= 0) H5Dclose(parent_paths_dset);
 
     if (should_close_loc_id) {
-        H5Gclose(file_id); // It is a group
+        H5Gclose(file_id); // It is a group (init() descended into the one holding /index)
     } else if (H5Iget_type(file_id) == H5I_FILE) {
         H5Fclose(file_id); // It is a file
     }
+    // The file this engine opened in its constructor: still open whenever init() went
+    // to work in a group inside it. Closing it is not cosmetic — a file left
+    // registered here is cleaned up by HDF5 at library termination, which crashes
+    // doing so (H5_term_library -> H5F_term_package -> H5I_clear_type ->
+    // H5VL_file_close -> H5I_find_id).
+    if (owned_file_id >= 0 && owned_file_id != file_id) H5Fclose(owned_file_id);
+    owned_file_id = -1;
     file_id = -1;
 }
 
