@@ -135,6 +135,9 @@ al_add_hdf5_test(test_engine_index_handoff)
 # Handle ownership: an engine that opened the file itself must close it, or HDF5
 # segfaults at library termination (PanzerDB::close).
 al_add_hdf5_test(test_engine_handle_lifecycle)
+# Handle ownership, other direction: a commit must not leave dataspaces registered
+# (PanzerDB::flush).
+al_add_hdf5_test(test_engine_flush_dataspace_handles)
 target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
 
 # Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +

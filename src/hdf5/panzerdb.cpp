@@ -1099,6 +1099,7 @@ void PanzerDB::flush() {
         hsize_t current_dims[2];
         filespace = H5Dget_space(index_dset);
         H5Sget_simple_extent_dims(filespace, current_dims, NULL);
+        H5Sclose(filespace);
 
         hsize_t new_dims[2] = {current_dims[0] + n_new_rows, (hsize_t)index_cols};
         H5Dset_extent(index_dset, new_dims);
