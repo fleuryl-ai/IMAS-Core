@@ -836,3 +836,158 @@ ici (`gA=144115188075855872`, `gB=144115188075855873`). Le moteur ne ferme que c
 le groupe enfant ouvert par `init()`, le `loc_id` si on le lui a confié, ou le fichier qu'il a
 ouvert (`owned_file_id`).
 
+## 23. A3 (supprimer les `H5Dget_space` redondants de `flush()`) — MESURÉ, ABANDONNÉ ; le vrai coût est la recompression du chunk de queue (2026-10-13)
+
+**La question.** `flush()` pose le même motif six fois (une fois par table, plus
+`flushPathTable` et `flushListSpans`) : `H5Dget_space` → lire l'extent → `H5Sclose` →
+`H5Dset_extent` → **second** `H5Dget_space` → hyperslab → `H5Dwrite`. A3 proposait de remplacer
+le premier appel par un extent mis en cache (`disk_size_*` existe déjà et porte les offsets des
+lignes d'index). Avant d'implémenter : mesurer la part de ces appels. Porte fixée avec l'utilisateur :
+si c'est sous le bruit, on s'arrête là et on rapporte.
+
+**Comment j'ai attribué.** Sonde `.qwen/tmp/flush_bench.cpp` (hors dépôt) : un seul moteur APPEND,
+`T` fois `{ writeData("sig<k>", {2}, v, 2); flush(); }`, `flush()` chronométré à chaque tour.
+En l'absence de symboles exploitables côté HDF5, instrumentation *temporaire* dans `flush()`
+(RAII accumulant `first_get_space` / `set_extent` / `H5Fflush` / total, imprimée à la sortie du
+processus), annulée par `git checkout` avant toute implémentation. Toutes les mesures avec
+`IMAS_AL_DISABLE_VALIDATE=1` (l'AL valide l'IDS à chaque `put`/`put_slice`, ce qui met du CPU dans
+la fenêtre mesurée — `common/doc_common/use_ids.rst:241`).
+
+**Décomposition, 400 commits sur une copie de cp** (`/index` 171 165 × 14) :
+
+| poste | cumulé 400 commits | par commit | part |
+|---|---|---|---|
+| premier `H5Dget_space` (6 sites) | 4,7 ms | 0,012 ms | 0,14 % |
+| `H5Dset_extent` | 3,6 ms | 0,009 ms | 0,11 % |
+| `H5Fflush(GLOBAL)` | **3 289,8 ms** | **8,22 ms** | **99,3 %** |
+| `flush()` total | 3 311,4 ms | 8,28 ms | 100 % |
+
+Sur eq (103 Mo, `/index` 58 162 × 12) : `H5Fflush` 4 518,0 / total 4 545,7 = **99,4 %**, flush
+médian 11,12 ms ; `first_get_space` 7,3 ms, `set_extent` 4,0 ms sur les 400 commits. Sur
+magnetics_THIN (178 Ko, 542 lignes d'index) : flush médian **3,51 ms**, `H5Fflush` 1 411,7 /
+1 419,8 = 99,4 % ; sur magnetics_FAT (4,2 Mo, **mêmes** 542 lignes) : 3,51 ms — le coût ne suit
+donc pas le volume de données.
+
+**Verdict A3 : 0,25 % du commit.** Rien d'implémenté, rien de committé. Le cache d'extent aurait
+gagné ~20 µs par commit et aurait introduit un invariant risqué (`H5Dset_extent` plus petit
+**tronque** : il n'aurait plus fallu se tromper sur qui détient la vérité de l'extent).
+
+**Ce que la mesure a livré à la place.** `H5Fflush` n'est **pas** de l'E/S : sur 200 commits de cp,
+`strace` compte 1 781 `pwrite64` pour **7,41 ms** et 7,7 ms de syscalls au total, quand `H5Fflush`
+coûte 1 663,8 ms ; `/usr/bin/time -v` donne **user 1,93 s / sys 0,12 s**. C'est du CPU utilisateur
+dans HDF5. Or `H5Fflush` est aussi le moment où HDF5 écrit les **chunks sales** des datasets
+chunkés — donc où il les **recompresse**. Les tables sont chunkées avec `shuffle` + `deflate` :
+dans les fixtures réelles, chunk index 4096×14 (458 Ko), paths 4096 (1 Mo), f64 65536 (512 Ko),
+i32 131072 (512 Ko), deflate **niveau 1** ; un commit salit le chunk de queue de chaque table
+touchée, soit ~2 Mo à recompresser à chaque pas. Sonde de confirmation (`.qwen/tmp/dcpl.cpp` pour
+lire les dcpl ; mode `fresh` de `flush_bench` pour créer un fichier neuf avec
+`PanzerDB::setDefaultChunkingConfig`, 400 commits, fichier frais donc sans contenu déjà en place) :
+
+| compression / chunks (index · path_table · f64) | flush médian | taille du fichier |
+|---|---|---|
+| L6 / 8192 · 8192 · 131072 (défaut) | **11,32 ms** | 2 107 180 |
+| L1 / 8192 · 8192 · 131072 | 6,24 ms | 8 398 772 |
+| aucune / 8192 · 8192 · 131072 | 1,02 ms | 14 680 064 |
+| **L6 / 512 · 512 · 8192** | **1,05 ms** | **2 100 379** |
+| L1 / 512 · 512 · 8192 | 0,59 ms | 2 100 863 |
+| L6 / 1024 · 1024 · 16384 | 1,71 ms | 2 100 722 |
+
+Tout est constant sauf la politique de chunk/compression : **passer les chunks de 8192 à 512
+divise le coût du commit par ~10 à taille de fichier identique** sur cette charge (11,32 → 1,05 ms).
+Le plancher restant (~0,6–1,0 ms) est le prix du mécanisme HDF5 lui-même : `H5Fflush(GLOBAL)` est
+la barrière de visibilité SWMR, il reste nécessaire.
+
+**Ce que cette table ne dit pas.** Le fichier frais ne contient que 400 lignes : le coût de
+compression caché dans la taille est donc sous-estimé, et c'est justement là que se joue l'arbitrage
+(chunk plus petit ⇒ moins de recompression par commit, moins bon ratio sur les fichiers à millions
+de lignes). Avant toute décision de format, il faut la même matrice sur un volume réel (∼10⁵–10⁶
+lignes) : temps total d'écriture **et** taille finale. Les chunks étant figés à la création, un
+tel choix ne touche que les fichiers neufs.
+
+**Bonus trouvé en instrumentant — un dataspace laissé ouvert par commit (corrigé depuis).** Dans le
+bloc `/index` de `flush()`, le premier `filespace` (panzerdb.cpp:1100, HEAD `f9d58ea`) est écrasé par
+le second `H5Dget_space` (panzerdb.cpp:1106) sans passer par `H5Sclose` : les cinq autres blocs le
+ferment, celui qui écrit le marqueur de commit — donc le seul qui tourne à chaque pas — non.
+
+Comptable, contrairement à ce que j'avais conclu sur le moment : `H5Fget_obj_count` ne suit pas les
+spaces (pas de `H5F_OBJ_DATASPACE`) et `H5Inmembers(H5I_DATASPACE, …)` est en effet refusé
+(`H5I.c:206 cannot call public function on library type`), mais **`H5Iiterate(H5I_DATASPACE, …)`
+marche** et rend le compte exact (20 000 espaces laissés ouverts par erreur = 20 000 comptés). Rien
+n'est signalé par la bibliothèque, ni au commit ni à la sortie du processus.
+
+Coût mesuré sur un seul moteur, 5 000 commits d'un signal de 5 valeurs (`.qwen/tmp/idrss.cpp`,
+RSS via `/proc/self/statm`, pente entre 1 000 et 5 000 commits) : **0,88 ko/commit avant, 0,07 ko/
+commit après**. Le nombre de pas d'écriture n'étant pas borné, la croissance ne l'était pas non
+plus. Correctif : un `H5Sclose(filespace)` avant `H5Dset_extent`, comme dans les cinq autres blocs.
+Goupille : `test_engine_flush_dataspace_handles` — 200 commits, delta du compteur attendu à 0
+(200 avant le correctif, 0 après), plus le chemin de lecture, déjà propre. Indépendant de A3.
+
+### Prolongement : la même question à volume réel, et l'alignement 4 Mo (2026-10-13)
+
+La table ci-dessus venait d'un fichier de 400 lignes et salissait la table de chemins à chaque
+commit (un signal neuf par pas), ce que l'AL ne fait pas. Nouveau harnais
+(`.qwen/tmp/volume_bench.cpp`) : **S signaux créés une fois, puis T commits qui appendent V valeurs
+sur les signaux déjà écrits** — donc seules `index` et `data_raw_*` sont salies à chaque pas.
+`T=2000`, `S=20`, `V=60` ⇒ 40 000 lignes d'index, 2,4 M de doubles (19,2 Mo bruts), valeurs
+identiques dans toutes les configs (tendance lisse + bruit quantifié, même tirage), donc tailles
+comparables ; l'empreinte de lecture (`check=72608414.4`) est la même partout.
+
+Le réglage d'alignement (`H5Pset_alignment(fapl, 4096, 4 Mo)`, posé par `b26c1c8` 2026-03-04 «
+Alignment on file system blocks (e.g., Lustre stripe size = 4MB) ») a été rendu temporairement
+réglable par variable d'environnement pour la mesure, puis annulé (`git checkout`).
+
+| config | flush médian | écriture totale | lecture complète | taille fichier | blocs alloués |
+|---|---|---|---|---|---|
+| L1, chunks défaut, **align 4 Mo** (état du code) | 8,65 ms | 17,9 s | 84 ms | 105 109 364 | 14 471 168 |
+| L1, chunks défaut, align 64 Ko | 8,64 ms | 17,8 s | 88 ms | **16 963 444** | — |
+| L6, chunks défaut, align 64 Ko | 11,29 ms | 23,6 s | 87 ms | 16 895 152 | — |
+| aucune compression, chunks défaut, align 64 Ko | 0,43 ms | 0,93 s | 66 ms | 26 411 008 | — |
+| L1, index 2048 · f64 32768, align 64 Ko | 2,30 ms | 4,79 s | 83 ms | 18 744 933 | — |
+| L1, index 512 · f64 8192, align 64 Ko | 0,63 ms | 1,38 s | 89 ms | 21 347 779 | — |
+| L1, index 512 · f64 8192, **align 4 Mo** | **0,62 ms** | 1,45 s | 89 ms | **1 233 173 955** | 15 433 728 |
+| L1, index 2048 · f64 32768, **align 4 Mo** | 2,30 ms | 4,87 s | 84 ms | 398 462 982 | 14 663 680 |
+| L6, index 512 · f64 8192, **align 4 Mo** | 0,84 ms | 2,02 s | 92 ms | 1 228 979 502 | 14 942 208 |
+
+Quatre choses à en retenir :
+
+1. **L'alignement 4 Mo gonfle l'espace d'adresses, pas les blocs disque** — c'est la correction
+ d'une affirmation écrite plus tôt dans cette section, qui parlait de « ×6,2 en taille ». Sur ce
+ Lustre, le trou laissé entre deux objets alignés n'est jamais écrit : c'est un **trou** (`du` le
+ voit). La dernière colonne l'établit : à alignement 4 Mo, `index 512 · f64 8192` occupe
+ **1,23 Go apparents pour 15,4 Mo alloués**, et les chunks défaut **105 Mo apparents pour 14,5 Mo
+ alloués** — donc ~14,5 Mo dans toutes les configs, quel que soit l'alignement. Coût réel du
+ padding : ce que voit `stat`, `ls -l`, `H5Fget_filesize`, et tout outil non *sparse-aware* (cp,
+ tar, rsync, transfert GT1 → 1,23 Go déplacés au lieu de 15 Mo). Attention : sur les fixtures déjà
+ en place, le padding lui **est matérialisé** (`magnetics_FAT.h5` : 4 237 197 apparents pour
+ 4 239 360 alloués, pour 170 355 d'payload) — le trou n'est donc pas garanti selon la façon dont
+ le fichier a été écrit. Le mécanisme exact n'est pas établi : l'inflation ne suit pas le nombre de
+ chunks (la table « fichier frais » ci-dessus, mêmes chunks de 8192 mais 400 commits, reste à
+ 2,1 Mo apparents alors que la charge à 2000 commits atteint 1,23 Go), elle semble suivre le nombre
+ d'événements d'allocation dans le gestionnaire d'espace du fichier. À caractériser avant d'en
+ tirer une règle.
+2. **Sans toucher l'alignement, des chunks plus petits divisent le commit par 14** : 8,65 → 0,62 ms,
+ écriture totale 17,9 s → 1,45 s, et la lecture reste identique (84 → 89 ms). Le prix n'est pas du
+ disque mais de l'espace d'adresses (105 Mo → 1,23 Go apparents). Avec alignement 64 Ko et mêmes
+ chunks, la taille apparente retombe à 21,3 Mo pour le même gain de commit (0,63 ms).
+3. **L'alignement en lui-même ne coûte rien en temps** : 8,65 vs 8,64 ms de commit et 84 vs 88 ms de
+ lecture entre 4 Mo et 64 Ko à chunks défaut. Son seul effet mesuré ici est la taille apparente. Le
+ bénéfice supposé (bande Lustre de 4 Mo) **n'est pas mesurable sur cet hôte** : seule une campagne
+ sur le stockage cible peut statuer.
+4. **La lecture ne se dégrade pas** avec des chunks de 8192 : 88 → 89 ms pour 2,4 M valeurs lues en
+ 40 000 `readTensor` de 60 éléments (tout tient dans le cache de chunks de 64 Mo). Ce n'est pas
+ une mesure de lecture en fenêtre temporelle sur de gros fichiers : à revérifier avant d'en faire
+ un argument, mais le coût ici est dominé par le nombre d'appels par feuille, pas par la taille de
+ chunk.
+
+**Ce que ces chiffres ne couvrent pas.** Données synthétiques (peu compressibles : sur ces valeurs,
+L6 et L1 donnent la même taille à 0,4 % près, alors que `core_profiles_3.h5` compresse ses payloads
+d'un facteur ~2,2 — la compression reste donc gagnante en taille sur des données réelles) ; un seul
+processus écriveur. Le dépôt est bien sur **Lustre** (`/afs/eufus.eu` → `10.41.0.101@o2ib,…:/efgwfs/efgw`,
+type `lustre`, options `flock,lazystatfs,encrypt`) — contrairement au caveat noté ici même au départ.
+Conséquence pratique pour mesurer : avec `lazystatfs`, `du` renvoie **512 octets** juste après une
+grosse écriture ; il faut relancer (ou `stat -c%s`) pour obtenir les blocs réels. Toute décision sur
+chunks/alignement ne touche que les fichiers neufs (figés à la création) et demande une validation
+sur le stockage cible.
+
+
+
