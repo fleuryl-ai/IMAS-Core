@@ -11,7 +11,11 @@
 //     The enclosing AoS levels come first, outermost to innermost; a leading
 //     time dimension is added when one logical path is stored as several index
 //     rows (one row per time slice).  Singleton levels (size 1) are squeezed
-//     out, so `grids_ggd/0/grid/0/...` reads as `grids_ggd/grid/...`.
+//     out, so `grids_ggd/0/grid/0/...` reads as `grids_ggd/grid/...` and the
+//     printed shape stays short ({3} instead of {1,1,1,3}).  Pass
+//     keep_singletons (CLI --keep-singletons) to keep every AoS level in the
+//     dims, so `h5ls` — which prints no attribute at all — still shows each
+//     level's size in the shape.
 //     Unmapped cells (ragged slices, sparse AoS instances) keep the HDF5 fill
 //     value, set to the IMAS invalid value: -9E+40 for reals (both components
 //     of a complex), -999999 for integers, empty string for text.
@@ -64,6 +68,9 @@ struct PublishOptions {
     // Safety valve: when a dataset would need more mappings than this, publish
     // only its first slice and flag it (@mapping_cap=1).  0 == unlimited.
     uint64_t max_mappings_per_dataset = 0;
+    // Collapse mode only: keep AoS levels whose size is 1 as leading dims
+    // ({1,1,1,3} instead of the squeezed {3}).  No effect in --expand mode.
+    bool     keep_singletons = false;
 };
 
 // Publish (idempotent) a VDS view under <root_group> (default "imas_view").

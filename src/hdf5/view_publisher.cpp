@@ -465,7 +465,8 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
                      const TreeInfo& tree,
                      std::map<std::string, AggLeaf>& aggs,
                      std::map<std::string, uint64_t>& aosSizes,
-                     PublishStats& st)
+                     PublishStats& st,
+                     bool keepSingletons)
 {
     // 1. AoS sizes carried by the meta rows (kind 2 static / kind 3 dynamic).
     for (const auto& leaf : leaves) {
@@ -561,7 +562,7 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
         for (const auto& c : agg.cells)
             for (size_t d = 0; d < rawN; ++d) sizes[d] = std::max(sizes[d], c.lead[d + 1] + 1);
         std::vector<size_t> keep;
-        for (size_t d = 0; d < rawN; ++d) if (sizes[d] > 1) keep.push_back(d);
+        for (size_t d = 0; d < rawN; ++d) if (keepSingletons || sizes[d] > 1) keep.push_back(d);
 
         if (agg.hasTime) { agg.levelNames.push_back(agg.timeName); agg.levelSizes.push_back(agg.timeSize); }
         for (size_t d : keep) {
@@ -836,6 +837,7 @@ void processCollapsed(hid_t file_id, hid_t view_root,
                       const std::string& source_filename,
                       const std::string& raw_prefix,
                       uint64_t mappingCap,
+                      bool keepSingletons,
                       PublishStats& st)
 {
     TreeInfo tree;
@@ -843,7 +845,7 @@ void processCollapsed(hid_t file_id, hid_t view_root,
 
     std::map<std::string, AggLeaf> aggs;
     std::map<std::string, uint64_t> aosSizes;
-    buildAggregates(leaves, tree, aggs, aosSizes, st);
+    buildAggregates(leaves, tree, aggs, aosSizes, st, keepSingletons);
 
     for (auto& kv : aggs)
         createAggVDS(file_id, view_root, kv.second, source_filename, raw_prefix, mappingCap, st);
@@ -919,7 +921,7 @@ PublishStats publishImpl(const std::string& filename, const PublishOptions& opti
 
     if (options.collapse_aos)
         processCollapsed(write_h, view_root, leaves, filename, rawPrefix,
-                         options.max_mappings_per_dataset, st);
+                         options.max_mappings_per_dataset, options.keep_singletons, st);
     else
         processExpanded(write_h, view_root, leaves, filename, rawPrefix, st);
 

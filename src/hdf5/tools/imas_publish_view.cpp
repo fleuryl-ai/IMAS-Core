@@ -41,11 +41,15 @@ namespace {
 
 void usage() {
     std::cerr << "usage: imas_publish_view <file.h5> [--root <name>] [--expand]\n"
-              << "                          [--max-mappings N] [--stats]\n"
+              << "                          [--keep-singletons] [--max-mappings N] [--stats]\n"
               << "       imas_publish_view <file.h5> --list [--root <name>]\n"
               << "  --root <name>       view group name (default: imas_view)\n"
               << "  --expand            historical view: one VDS per index row, every\n"
               << "                        AoS instance listed under its own subgroup\n"
+              << "  --keep-singletons   collapse mode: keep AoS levels of size 1 as leading\n"
+              << "                        dims, so h5ls shows each level's size in the shape\n"
+              << "                        ({1,1,1,3} instead of the squeezed {3});\n"
+              << "                        no effect with --expand\n"
               << "  --max-mappings N    safety valve: above N virtual mappings a dataset\n"
               << "                        is reduced to its first slices and flagged\n"
               << "                        @mapping_cap=1 (default: 0 == unlimited)\n"
@@ -104,6 +108,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--expand") {
             options.collapse_aos = false;
+        } else if (a == "--keep-singletons") {
+            options.keep_singletons = true;
         } else if (a == "--max-mappings") {
             std::string v;
             needValue("--max-mappings", v);
