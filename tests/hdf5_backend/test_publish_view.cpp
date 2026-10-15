@@ -484,6 +484,71 @@ int main() {
     std::cout << "[idempotency/collapse] OK\n";
 
     // =====================================================================
+    // 2h. keep_singletons: singleton AoS levels stay as leading dims, so the
+    //     size of every level is visible in the shape h5ls prints (it shows no
+    //     attribute, hence this option).
+    // =====================================================================
+    {
+        imas::view::PublishOptions o;
+        o.root_group      = V;
+        o.keep_singletons = true;
+        const auto stk = imas::view::publish(filename, o);
+        check(stk.n_errors == 0, "keep_singletons publish produced 0 errors");
+        check(stk.n_aggregated_datasets == 6, "keep_singletons publishes the same 6 datasets");
+
+        hid_t fid = openFile(filename);
+        hsize_t d[8];
+        char buf[128];
+
+        // C==1 kept: dims [1,5] instead of the squeezed [5]
+        check(dimsOf(fid, "imas_view/C/vec5", d, 8) == 2 && d[0] == 1 && d[1] == 5,
+              "keep_singletons: C/vec5 dims [1,5]");
+        check(attrOf(fid, "imas_view/C/vec5", "dims_label", buf, sizeof(buf))
+                  && std::strcmp(buf, "C|vec5") == 0, "keep_singletons: C/vec5 @dims_label == C|vec5");
+        check(readDoubleAttr(fid, "imas_view/C/vec5", "aos_ndim") == 1.0,
+              "keep_singletons: C/vec5 @aos_ndim == 1");
+        double v5[5] = {0};
+        readDoubles(fid, "imas_view/C/vec5", v5, 5);
+        for (int i = 0; i < 5; ++i) check(v5[i] == vec5[i], "keep_singletons: C/vec5 values still match");
+
+        // equilibrium==1 kept in front of the ragged dims: [1,2,5] not [2,5]
+        check(dimsOf(fid, "imas_view/equilibrium/time_slice/r", d, 8) == 3
+                  && d[0] == 1 && d[1] == 2 && d[2] == 5,
+              "keep_singletons: ragged node dims [1,2,5]");
+        double rv[10] = {0};
+        readDoubles(fid, "imas_view/equilibrium/time_slice/r", rv, 10);
+        check(rv[0] == 1 && rv[1] == 2 && rv[2] == 3, "keep_singletons: ragged slice 0 values");
+        check(rv[3] == INVALID_F64 && rv[4] == INVALID_F64, "keep_singletons: ragged hole still invalid");
+        for (int i = 0; i < 5; ++i) check(rv[5 + i] == r5[i], "keep_singletons: ragged slice 1 values");
+
+        // Levels whose size is >1 are unaffected by the option
+        check(dimsOf(fid, "imas_view/A/B/val", d, 8) == 2 && d[0] == 2 && d[1] == 2,
+              "keep_singletons: A/B/val dims unchanged [2,2]");
+
+        // The annotated listing reflects the un-squeezed dims
+        {
+            const auto lv = imas::view::listView(filename, V);
+            std::string line;
+            check(findLine(lv.lines, "/imas_view/C/vec5", line)
+                      && line.find("Dataset {1, 5}") != std::string::npos,
+                  "keep_singletons: C/vec5 listed with dims {1, 5}");
+            check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/r", line)
+                      && line.find("Dataset {1, 2, 5}") != std::string::npos,
+                  "keep_singletons: ragged node listed with dims {1, 2, 5}");
+        }
+        H5Fclose(fid);
+
+        // Reverse idempotency: a plain re-publish squeezes again
+        const auto stback = imas::view::publish(filename, V);
+        check(stback.n_errors == 0, "default re-publish after keep_singletons: 0 errors");
+        hid_t fid2 = openFile(filename);
+        check(dimsOf(fid2, "imas_view/C/vec5", d, 8) == 1 && d[0] == 5,
+              "default re-publish squeezes C/vec5 back to [5]");
+        H5Fclose(fid2);
+        std::cout << "[keep_singletons] OK\n";
+    }
+
+    // =====================================================================
     // 3. Expand mode: the historical per-instance view
     // =====================================================================
     {
