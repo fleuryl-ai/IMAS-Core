@@ -131,9 +131,13 @@ static void readStrings(hid_t fid, const char* path, std::vector<std::string>& o
     if (dset < 0) throw std::runtime_error(std::string("cannot open dataset: ") + path);
     hid_t sp   = H5Dget_space(dset);
     const int rank = H5Sget_simple_extent_ndims(sp);
-    hsize_t d[4] = {0};
+    hsize_t d[8] = {0};
     if (rank > 0) H5Sget_simple_extent_dims(sp, d, nullptr);
-    const size_t n = (rank == 0) ? 1 : (size_t)d[0] * (rank > 1 ? (size_t)d[1] : 1);
+    // Every dim counts: a view whose leading dims come from the AoS levels has
+    // a rank above 2, and sizing the buffer from two dims only would read past
+    // the end of it.
+    size_t n = 1;
+    for (int i = 0; i < rank; ++i) n *= (size_t)d[i];
     hid_t type = H5Dget_type(dset);
     const size_t w = H5Tget_size(type);
     std::vector<char> buf(n * w, 0);
@@ -257,6 +261,7 @@ int main() {
     double bulk3[3]  = {5.5, 6.5, 7.5};
     double r3[3] = {1, 2, 3};
     double r5[5] = {4, 5, 6, 7, 8};
+    double d0 = 77.0, d3 = 88.0;
 
     // =====================================================================
     // 1. Write the PanzerDB snapshot
@@ -282,6 +287,16 @@ int main() {
         // C[1] holding a 5-point vector
         db.beginArray("C", (size_t)1);
         db.writeData("vec5", std::vector<size_t>{5}, vec5, 5);     // C/0/vec5
+        db.endArray();
+
+        // D[5] declared, but only instances 0 and 3 carry data.  The view must
+        // publish the DECLARED length 5 and leave the other three as holes --
+        // the shape equilibrium_1.h5 needs, where `object` is declared at 15 402
+        // while only 7 968 instances hold a geometry.
+        db.beginArray("D", (size_t)5);
+        db.writeData("s", std::vector<size_t>{}, &d0, 1);          // D/0/s
+        db.setCurrentArrayIndex(3);
+        db.writeData("s", std::vector<size_t>{}, &d3, 1);          // D/3/s
         db.endArray();
 
         // One logical node stored as one row per time slice (the legacy per-slice
@@ -339,7 +354,7 @@ int main() {
               << " holes=" << st.n_fill_holes
               << " errors=" << st.n_errors << '\n';
     check(st.n_errors == 0, "collapse publish produced 0 errors");
-    check(st.n_aggregated_datasets == 6, "6 aggregated datasets (A/B/val, C/vec5, series, bulk, equilibrium/time_slice/{r,label})");
+    check(st.n_aggregated_datasets == 7, "7 aggregated datasets (A/B/val, C/vec5, D/s, series, bulk, equilibrium/time_slice/{r,label})");
 
     {
         hid_t fid = openFile(filename);
@@ -366,14 +381,31 @@ int main() {
         // contiguously, so B coalesces into a single strided mapping per A.
         check(readDoubleAttr(fid, "imas_view/A/B/val", "n_mappings") == 2.0, "A/B/val uses 2 mappings (one per A)");
 
-        // 2b. C[1] singleton level squeezed out: dims [5], not [1,5]
-        check(dimsOf(fid, "imas_view/C/vec5", d, 8) == 1 && d[0] == 5, "C/vec5 dims [5] (C==1 squeezed)");
+        // 2b. C[1]: a level of size 1 is a dim like any other, so the shape a
+        // plain h5ls prints carries it.
+        check(dimsOf(fid, "imas_view/C/vec5", d, 8) == 2 && d[0] == 1 && d[1] == 5,
+              "C/vec5 dims [1,5] (a level of size 1 stays visible)");
         double v5[5] = {0};
         readDoubles(fid, "imas_view/C/vec5", v5, 5);
         for (int i = 0; i < 5; ++i) check(v5[i] == vec5[i], "C/vec5 values match");
-        check(readDoubleAttr(fid, "imas_view/C/vec5", "aos_ndim") == 0.0, "C/vec5 has no leading dim");
+        check(readDoubleAttr(fid, "imas_view/C/vec5", "aos_ndim") == 1.0, "C/vec5 @aos_ndim == 1");
         check(attrOf(fid, "imas_view/C/vec5", "dims_label", buf, sizeof(buf))
-                  && std::strcmp(buf, "vec5") == 0, "C/vec5 @dims_label == vec5");
+                  && std::strcmp(buf, "C|vec5") == 0, "C/vec5 @dims_label == C|vec5");
+
+        // 2b-bis. D[5] declared, only instances 0 and 3 written: the dim takes
+        // the DECLARED size, so the same AoS gives the same length everywhere,
+        // and the unwritten instances read back as the fill value.
+        check(dimsOf(fid, "imas_view/D/s", d, 8) == 1 && d[0] == 5,
+              "D/s dims [5] == the declared AoS size, not the largest instance (3)");
+        double dv[5] = {0};
+        readDoubles(fid, "imas_view/D/s", dv, 5);
+        check(dv[0] == d0 && dv[3] == d3, "D/s values sit at their declared instances");
+        check(dv[1] == INVALID_F64 && dv[2] == INVALID_F64 && dv[4] == INVALID_F64,
+              "D/s unwritten instances read as the invalid value");
+        // D/0 and D/3 are adjacent in data_raw, so they coalesce into ONE
+        // strided mapping onto the target positions 0 and 3.
+        check(readDoubleAttr(fid, "imas_view/D/s", "n_mappings") == 1.0,
+              "D/s publishes the 2 written instances as a single strided mapping");
 
         // 2c. Repeated identical path -> leading time dimension
         check(dimsOf(fid, "imas_view/series", d, 8) == 1 && d[0] == 4, "series folded to dims [4]");
@@ -394,9 +426,10 @@ int main() {
         check(readDoubleAttr(fid, "imas_view/bulk", "n_mappings") == 1.0, "bulk row needs a single mapping");
         check(readDoubleAttr(fid, "imas_view/bulk", "time_dim") == 3.0, "bulk @time_dim == 3");
 
-        // 2d. Ragged slices: [2,5], the short slice padded with the invalid value
-        check(dimsOf(fid, "imas_view/equilibrium/time_slice/r", d, 8) == 2 && d[0] == 2 && d[1] == 5,
-              "ragged node aggregated to dims [2,5]");
+        // 2d. Ragged slices: [1,2,5], the short slice padded with the invalid value
+        check(dimsOf(fid, "imas_view/equilibrium/time_slice/r", d, 8) == 3
+                  && d[0] == 1 && d[1] == 2 && d[2] == 5,
+              "ragged node aggregated to dims [1,2,5] (every level is a dim)");
         double rv[10] = {0};
         readDoubles(fid, "imas_view/equilibrium/time_slice/r", rv, 10);
         check(rv[0] == 1 && rv[1] == 2 && rv[2] == 3, "ragged slice 0 values");
@@ -404,12 +437,14 @@ int main() {
         for (int i = 0; i < 5; ++i) check(rv[5 + i] == r5[i], "ragged slice 1 values");
         check(hasAttr(fid, "imas_view/equilibrium/time_slice/r", "ragged"), "ragged node carries @ragged");
         check(attrOf(fid, "imas_view/equilibrium/time_slice/r", "dims_label", buf, sizeof(buf))
-                  && std::strcmp(buf, "time_slice|r") == 0, "ragged @dims_label == time_slice|r");
+                  && std::strcmp(buf, "equilibrium|time_slice|r") == 0,
+              "ragged @dims_label == equilibrium|time_slice|r");
 
         // 2d-bis. Same ragged pattern in text form: the hole must read as the
         // empty string (the decided fill for text).
-        check(dimsOf(fid, "imas_view/equilibrium/time_slice/label", d, 8) == 2 && d[0] == 2 && d[1] == 2,
-              "ragged text node aggregated to dims [2,2]");
+        check(dimsOf(fid, "imas_view/equilibrium/time_slice/label", d, 8) == 3
+                  && d[0] == 1 && d[1] == 2 && d[2] == 2,
+              "ragged text node aggregated to dims [1,2,2]");
         std::vector<std::string> labels;
         readStrings(fid, "imas_view/equilibrium/time_slice/label", labels);
         check(labels.size() == 4, "ragged text node has 2x2 cells");
@@ -423,6 +458,7 @@ int main() {
         check(readDoubleAttr(fid, "imas_view/A", "aos_size") == 2.0, "@aos_size(A) == 2");
         check(readDoubleAttr(fid, "imas_view/A/B", "aos_size") == 2.0, "@aos_size(A/B) == 2");
         check(readDoubleAttr(fid, "imas_view/C", "aos_size") == 1.0, "@aos_size(C) == 1");
+        check(readDoubleAttr(fid, "imas_view/D", "aos_size") == 5.0, "@aos_size(D) == 5 (declared)");
         check(readDoubleAttr(fid, "imas_view/equilibrium/time_slice", "aos_size") == 2.0,
               "@aos_size(equilibrium/time_slice) == 2");
 
@@ -434,7 +470,7 @@ int main() {
         {
             const auto lv = imas::view::listView(filename, V);
             check(lv.found, "listView finds the published view");
-            check(lv.lines.size() == 11, "listView lists 5 AoS groups + 6 aggregated datasets");
+            check(lv.lines.size() == 13, "listView lists 6 AoS groups + 7 aggregated datasets");
             for (const auto& l : lv.lines) std::cout << "    " << l << '\n';
 
             std::string line;
@@ -444,16 +480,20 @@ int main() {
                       && line.find("holes") == std::string::npos,
                   "A/B/val listed with dims, dim labels, and no hole");
             check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/r", line)
-                      && line.find("Dataset {2, 5}") != std::string::npos
+                      && line.find("Dataset {1, 2, | 5}") != std::string::npos
                       && line.find("@ragged") != std::string::npos
                       && line.find("holes=2") != std::string::npos,
-                  "ragged node listed with @ragged and holes=2 (10 cells, 8 stored)");
+                  "ragged node lists the AoS dims then the leaf shape after the bar");
             check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/label", line)
                       && line.find("holes=1") != std::string::npos,
                   "ragged text node lists holes=1 (4 cells, 3 stored)");
             check(findLine(lv.lines, "/imas_view/C/vec5", line)
-                      && line.find("Dataset {5}") != std::string::npos,
-                  "C/vec5 listed squeezed to dims {5}");
+                      && line.find("Dataset {1, | 5}") != std::string::npos,
+                  "C/vec5 lists its singleton level, then the leaf shape");
+            check(findLine(lv.lines, "/imas_view/D/s", line)
+                      && line.find("Dataset {5}") != std::string::npos
+                      && line.find("holes=3") != std::string::npos,
+                  "D/s listed at the declared length with holes=3 (5 cells, 2 stored)");
             check(findLine(lv.lines, "/imas_view/series", line)
                       && line.find("Dataset {4}") != std::string::npos
                       && line.find("@dims_label=time") != std::string::npos,
@@ -484,68 +524,80 @@ int main() {
     std::cout << "[idempotency/collapse] OK\n";
 
     // =====================================================================
-    // 2h. keep_singletons: singleton AoS levels stay as leading dims, so the
-    //     size of every level is visible in the shape h5ls prints (it shows no
-    //     attribute, hence this option).
+    // 2h. Flat view (--no-aos-groups): no AoS group is created at all, every
+    //     dataset sits directly under the view root with ':' joining its path,
+    //     so a recursive h5ls lists the datasets and nothing else.
     // =====================================================================
     {
         imas::view::PublishOptions o;
-        o.root_group      = V;
-        o.keep_singletons = true;
-        const auto stk = imas::view::publish(filename, o);
-        check(stk.n_errors == 0, "keep_singletons publish produced 0 errors");
-        check(stk.n_aggregated_datasets == 6, "keep_singletons publishes the same 6 datasets");
+        o.root_group    = V;
+        o.no_aos_groups = true;
+        const auto stf = imas::view::publish(filename, o);
+        check(stf.n_errors == 0, "flat publish produced 0 errors");
+        check(stf.n_aggregated_datasets == 7, "flat publishes the same 7 datasets");
+        check(stf.n_aos_groups == 0, "flat publishes no AoS group");
 
         hid_t fid = openFile(filename);
         hsize_t d[8];
         char buf[128];
 
-        // C==1 kept: dims [1,5] instead of the squeezed [5]
-        check(dimsOf(fid, "imas_view/C/vec5", d, 8) == 2 && d[0] == 1 && d[1] == 5,
-              "keep_singletons: C/vec5 dims [1,5]");
-        check(attrOf(fid, "imas_view/C/vec5", "dims_label", buf, sizeof(buf))
-                  && std::strcmp(buf, "C|vec5") == 0, "keep_singletons: C/vec5 @dims_label == C|vec5");
-        check(readDoubleAttr(fid, "imas_view/C/vec5", "aos_ndim") == 1.0,
-              "keep_singletons: C/vec5 @aos_ndim == 1");
-        double v5[5] = {0};
-        readDoubles(fid, "imas_view/C/vec5", v5, 5);
-        for (int i = 0; i < 5; ++i) check(v5[i] == vec5[i], "keep_singletons: C/vec5 values still match");
+        // One object per logical node, its path folded into the object name.
+        check(exists(fid, "imas_view/A:B:val"), "flat: A:B:val sits at the view root");
+        check(exists(fid, "imas_view/C:vec5"),  "flat: C:vec5 sits at the view root");
+        check(exists(fid, "imas_view/D:s"),     "flat: D:s sits at the view root");
+        check(exists(fid, "imas_view/equilibrium:time_slice:r"),
+              "flat: the ragged node keeps its whole path in the object name");
+        check(!exists(fid, "imas_view/A"), "flat: no AoS group is created");
+        check(!exists(fid, "imas_view/A/B/val"), "flat: no nested path either");
 
-        // equilibrium==1 kept in front of the ragged dims: [1,2,5] not [2,5]
-        check(dimsOf(fid, "imas_view/equilibrium/time_slice/r", d, 8) == 3
-                  && d[0] == 1 && d[1] == 2 && d[2] == 5,
-              "keep_singletons: ragged node dims [1,2,5]");
+        // The option changes where the dataset lives, not what it holds: same
+        // dims, same values, same holes.
+        check(dimsOf(fid, "imas_view/A:B:val", d, 8) == 2 && d[0] == 2 && d[1] == 2,
+              "flat: A:B:val dims [2,2]");
+        double v4[4] = {0};
+        readDoubles(fid, "imas_view/A:B:val", v4, 4);
+        check(v4[0] == 11 && v4[3] == 22, "flat: A:B:val values still match");
+        check(attrOf(fid, "imas_view/A:B:val", "dims_label", buf, sizeof(buf))
+                  && std::strcmp(buf, "A|B") == 0, "flat: @dims_label unchanged");
+        check(dimsOf(fid, "imas_view/C:vec5", d, 8) == 2 && d[0] == 1 && d[1] == 5,
+              "flat: C:vec5 dims [1,5]");
+        check(dimsOf(fid, "imas_view/D:s", d, 8) == 1 && d[0] == 5,
+              "flat: D:s keeps the declared length 5");
+        double dv[5] = {0};
+        readDoubles(fid, "imas_view/D:s", dv, 5);
+        check(dv[0] == d0 && dv[3] == d3 && dv[1] == INVALID_F64 && dv[4] == INVALID_F64,
+              "flat: D:s values and holes unchanged");
         double rv[10] = {0};
-        readDoubles(fid, "imas_view/equilibrium/time_slice/r", rv, 10);
-        check(rv[0] == 1 && rv[1] == 2 && rv[2] == 3, "keep_singletons: ragged slice 0 values");
-        check(rv[3] == INVALID_F64 && rv[4] == INVALID_F64, "keep_singletons: ragged hole still invalid");
-        for (int i = 0; i < 5; ++i) check(rv[5 + i] == r5[i], "keep_singletons: ragged slice 1 values");
+        check(dimsOf(fid, "imas_view/equilibrium:time_slice:r", d, 8) == 3
+                  && d[0] == 1 && d[1] == 2 && d[2] == 5, "flat: ragged dims [1,2,5]");
+        readDoubles(fid, "imas_view/equilibrium:time_slice:r", rv, 10);
+        check(rv[0] == 1 && rv[3] == INVALID_F64 && rv[5] == r5[0], "flat: ragged values and hole");
 
-        // Levels whose size is >1 are unaffected by the option
-        check(dimsOf(fid, "imas_view/A/B/val", d, 8) == 2 && d[0] == 2 && d[1] == 2,
-              "keep_singletons: A/B/val dims unchanged [2,2]");
-
-        // The annotated listing reflects the un-squeezed dims
+        // The listing then holds datasets only, annotated exactly as before.
         {
             const auto lv = imas::view::listView(filename, V);
+            check(lv.lines.size() == 7, "flat listing: 7 datasets, no group line");
             std::string line;
-            check(findLine(lv.lines, "/imas_view/C/vec5", line)
-                      && line.find("Dataset {1, 5}") != std::string::npos,
-                  "keep_singletons: C/vec5 listed with dims {1, 5}");
-            check(findLine(lv.lines, "/imas_view/equilibrium/time_slice/r", line)
-                      && line.find("Dataset {1, 2, 5}") != std::string::npos,
-                  "keep_singletons: ragged node listed with dims {1, 2, 5}");
+            check(findLine(lv.lines, "/imas_view/C:vec5", line)
+                      && line.find("Dataset {1, | 5}") != std::string::npos,
+                  "flat listing annotates the folded name the same way");
+            check(findLine(lv.lines, "/imas_view/D:s", line)
+                      && line.find("holes=3") != std::string::npos,
+                  "flat listing keeps the holes count");
+            check(!findLine(lv.lines, "/imas_view/A", line), "flat listing shows no AoS group");
         }
         H5Fclose(fid);
 
-        // Reverse idempotency: a plain re-publish squeezes again
+        // Back to the grouped view: the flat objects are gone, the tree is back.
         const auto stback = imas::view::publish(filename, V);
-        check(stback.n_errors == 0, "default re-publish after keep_singletons: 0 errors");
+        check(stback.n_errors == 0, "re-publish back to the grouped view: 0 errors");
         hid_t fid2 = openFile(filename);
-        check(dimsOf(fid2, "imas_view/C/vec5", d, 8) == 1 && d[0] == 5,
-              "default re-publish squeezes C/vec5 back to [5]");
+        check(exists(fid2, "imas_view/A/B/val") && !exists(fid2, "imas_view/A:B:val"),
+              "the grouped view replaces the flat one");
+        check(readDoubleAttr(fid2, "imas_view/C", "aos_size") == 1.0,
+              "the grouped view writes @aos_size again");
         H5Fclose(fid2);
-        std::cout << "[keep_singletons] OK\n";
+        std::cout << "[flat view] OK\n";
     }
 
     // =====================================================================
@@ -560,7 +612,7 @@ int main() {
         // sharing the path `series` collide: 3 of them are lost. That is exactly
         // the defect the collapse mode fixes (equilibrium_1.h5 loses 12 998 rows
         // this way), so it is asserted rather than hidden.
-        check(ste.n_data_leaves == 11, "expand: 14 rows -> 11 VDS (the 4 duplicate `series` paths collapse to 1)");
+        check(ste.n_data_leaves == 13, "expand: 16 rows -> 13 VDS (the 4 duplicate `series` paths collapse to 1)");
         check(ste.n_errors == 3, "expand: 3 duplicate-path rows cannot be published");
 
         hid_t fid = openFile(filename);
@@ -585,7 +637,7 @@ int main() {
     // Back to the default view, and check idempotency across a mode switch.
     {
         const auto st3 = imas::view::publish(filename, V);
-        check(st3.n_errors == 0 && st3.n_aggregated_datasets == 6, "mode switch rebuilds cleanly");
+        check(st3.n_errors == 0 && st3.n_aggregated_datasets == 7, "mode switch rebuilds cleanly");
         hid_t fid = openFile(filename);
         check(exists(fid, "imas_view/A/B/val") && !exists(fid, "imas_view/A/0/B/0/val"),
               "collapse view replaces the expanded one");
