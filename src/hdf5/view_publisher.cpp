@@ -441,14 +441,16 @@ struct AggLeaf {
     PanzerDB::DataType       dt = PanzerDB::DataType::UNKNOWN;
     std::string              schema;
 
-    // Before the singleton squeeze: one slot per AoS level of the instance path,
-    // preceded by slot 0 holding the folded time position.
+    // One slot per AoS level of the instance path, preceded by slot 0 holding
+    // the folded time position.  rawLevelPaths is the same list keyed like the
+    // @aos_size map, so a level can be padded to its DECLARED size.
     std::vector<std::string> rawLevelNames;
+    std::vector<std::string> rawLevelPaths;
     bool     hasTime = false;
     uint64_t timeSize = 0;
     std::string timeName;
 
-    // After the squeeze: the dataset's leading dimensions.
+    // The dataset's leading dimensions.
     std::vector<std::string> levelNames;
     std::vector<uint64_t>    levelSizes;
 
@@ -465,8 +467,7 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
                      const TreeInfo& tree,
                      std::map<std::string, AggLeaf>& aggs,
                      std::map<std::string, uint64_t>& aosSizes,
-                     PublishStats& st,
-                     bool keepSingletons)
+                     PublishStats& st)
 {
     // 1. AoS sizes carried by the meta rows (kind 2 static / kind 3 dynamic).
     for (const auto& leaf : leaves) {
@@ -518,7 +519,10 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
             agg.dt        = dt;
             agg.schema    = PanzerDB::stripIndices(fullPath);
             agg.timeName  = ps.groupSegs.empty() ? std::string("time") : ps.groupSegs.back();
-            for (const auto& lv : ps.levels) agg.rawLevelNames.push_back(lv.name);
+            for (const auto& lv : ps.levels) {
+                agg.rawLevelNames.push_back(lv.name);
+                agg.rawLevelPaths.push_back(lv.groupPath);
+            }
         }
         for (const auto& lv : ps.levels) bumpMax(aosSizes, lv.groupPath, lv.index + 1);
 
@@ -545,8 +549,7 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
         agg.timeSize = std::max(agg.timeSize, timePos);
     }
 
-    // 3. Leading dimensions = folded time axis (when relevant) + AoS levels,
-    //    minus the singletons, which carry no information and only inflate shapes.
+    // 3. Leading dimensions = folded time axis (when relevant) + AoS levels.
     for (auto& kv : aggs) {
         AggLeaf& agg = kv.second;
         if (agg.cells.empty()) continue;
@@ -561,8 +564,17 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
         std::vector<uint64_t> sizes(rawN, 1);
         for (const auto& c : agg.cells)
             for (size_t d = 0; d < rawN; ++d) sizes[d] = std::max(sizes[d], c.lead[d + 1] + 1);
+        // A level is as long as it is DECLARED (@aos_size), not as long as the
+        // largest instance that happens to carry data in THIS dataset: otherwise
+        // two nodes under the same AoS print different lengths for the same
+        // level, and @aos_size stops matching the shape h5ls shows.  Instances
+        // with no data stay unmapped and read back as the fill value.
+        for (size_t d = 0; d < rawN; ++d) {
+            const auto it = aosSizes.find(agg.rawLevelPaths[d]);
+            if (it != aosSizes.end()) sizes[d] = std::max(sizes[d], it->second);
+        }
         std::vector<size_t> keep;
-        for (size_t d = 0; d < rawN; ++d) if (keepSingletons || sizes[d] > 1) keep.push_back(d);
+        for (size_t d = 0; d < rawN; ++d) keep.push_back(d);
 
         if (agg.hasTime) { agg.levelNames.push_back(agg.timeName); agg.levelSizes.push_back(agg.timeSize); }
         for (size_t d : keep) {
@@ -700,6 +712,7 @@ bool createAggVDS(hid_t file_id, hid_t view_root, const AggLeaf& agg,
                   const std::string& source_filename,
                   const std::string& raw_prefix,
                   uint64_t mappingCap,
+                  bool noAosGroups,
                   PublishStats& st)
 {
     const char* raw = dataRawName(agg.dt);
@@ -715,8 +728,22 @@ bool createAggVDS(hid_t file_id, hid_t view_root, const AggLeaf& agg,
     const int runDim    = (leadN > 0) ? (int)leadN - 1 : -1;
     if (rank > H5S_MAX_RANK) { st.n_rank_overflow++; return false; }
 
-    hid_t parent = ensureGroups(view_root, agg.groupSegs);
-    const bool parent_is_loc = (parent == view_root);
+    // Grouped mode: one HDF5 group per AoS level.  Flat mode: the dataset sits
+    // directly under the view root and its path is folded into a single name
+    // joined with ':' -- ':' is not an HDF5 path separator and never appears in
+    // an IMAS name, so the object stays reachable by h5dump -d / h5py.
+    std::string objName = agg.leafName;
+    hid_t parent = view_root;
+    bool parent_is_loc = true;
+    if (noAosGroups) {
+        // groupSegs is outermost-first; prepending each in that order would
+        // reverse the path, so walk it backwards.
+        for (auto it = agg.groupSegs.rbegin(); it != agg.groupSegs.rend(); ++it)
+            objName = *it + ":" + objName;
+    } else {
+        parent = ensureGroups(view_root, agg.groupSegs);
+        parent_is_loc = (parent == view_root);
+    }
 
     const std::string full_raw = raw_prefix + raw;
     hid_t src = H5Dopen2(file_id, full_raw.c_str(), H5P_DEFAULT);
@@ -796,7 +823,7 @@ bool createAggVDS(hid_t file_id, hid_t view_root, const AggLeaf& agg,
         return false;
     }
 
-    hid_t vds = H5Dcreate2(parent, agg.leafName.c_str(), src_type, vspace,
+    hid_t vds = H5Dcreate2(parent, objName.c_str(), src_type, vspace,
                            H5P_DEFAULT, dcpl, H5P_DEFAULT);
     const bool created = (vds >= 0);
     if (created) {
@@ -837,7 +864,7 @@ void processCollapsed(hid_t file_id, hid_t view_root,
                       const std::string& source_filename,
                       const std::string& raw_prefix,
                       uint64_t mappingCap,
-                      bool keepSingletons,
+                      bool noAosGroups,
                       PublishStats& st)
 {
     TreeInfo tree;
@@ -845,12 +872,15 @@ void processCollapsed(hid_t file_id, hid_t view_root,
 
     std::map<std::string, AggLeaf> aggs;
     std::map<std::string, uint64_t> aosSizes;
-    buildAggregates(leaves, tree, aggs, aosSizes, st, keepSingletons);
+    buildAggregates(leaves, tree, aggs, aosSizes, st);
 
     for (auto& kv : aggs)
-        createAggVDS(file_id, view_root, kv.second, source_filename, raw_prefix, mappingCap, st);
+        createAggVDS(file_id, view_root, kv.second, source_filename, raw_prefix,
+                     mappingCap, noAosGroups, st);
 
-    // @aos_size / @aos_dynamic on every AoS group of the collapsed tree.
+    // @aos_size / @aos_dynamic on every AoS group of the collapsed tree.  The
+    // flat view creates no AoS group, so there is nothing to annotate.
+    if (noAosGroups) return;
     for (const auto& kv : aosSizes) {
         auto segs = splitPath(kv.first);
         if (segs.empty()) continue;
@@ -921,7 +951,7 @@ PublishStats publishImpl(const std::string& filename, const PublishOptions& opti
 
     if (options.collapse_aos)
         processCollapsed(write_h, view_root, leaves, filename, rawPrefix,
-                         options.max_mappings_per_dataset, options.keep_singletons, st);
+                         options.max_mappings_per_dataset, options.no_aos_groups, st);
     else
         processExpanded(write_h, view_root, leaves, filename, rawPrefix, st);
 
@@ -958,8 +988,15 @@ bool describeObject(hid_t file, const std::string& path, std::string& body, bool
         H5Sclose(space);
 
         body = "Dataset {";
+        // @aos_ndim counts the leading dims that come from the structure (the
+        // folded time axis plus the AoS levels); what follows it is the leaf's
+        // own shape.  The bar marks that boundary, since the listing is the only
+        // place where a shape is shown together with its meaning.
+        uint64_t leadN = 0;
+        const bool hasLead = attrU64(obj, "aos_ndim", leadN) && leadN > 0;
         for (size_t d = 0; d < dims.size(); ++d) {
             if (d) body += ", ";
+            if (hasLead && d == (size_t)leadN) body += "| ";
             body += std::to_string((long long)dims[d]);
         }
         body += "}";

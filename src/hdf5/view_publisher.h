@@ -10,24 +10,33 @@
 //       dims = [n_time?, n_aos_0, ..., n_aos_k-1, *leaf_slice_shape]
 //     The enclosing AoS levels come first, outermost to innermost; a leading
 //     time dimension is added when one logical path is stored as several index
-//     rows (one row per time slice).  Singleton levels (size 1) are squeezed
-//     out, so `grids_ggd/0/grid/0/...` reads as `grids_ggd/grid/...` and the
-//     printed shape stays short ({3} instead of {1,1,1,3}).  Pass
-//     keep_singletons (CLI --keep-singletons) to keep every AoS level in the
-//     dims, so `h5ls` — which prints no attribute at all — still shows each
-//     level's size in the shape.
+//     rows (one row per time slice).  Every level is a dim, including one of
+//     size 1, and a level's length is its DECLARED AoS size (@aos_size) rather
+//     than the largest instance index that happens to carry data: a level
+//     declared at 15 402 yields a dim of 15 402 even where only 7 968 instances
+//     hold a value.  `h5ls` prints no attribute, so the shape it shows is what
+//     makes each level's size visible, and it agrees with @aos_size by
+//     construction.
 //     Unmapped cells (ragged slices, sparse AoS instances) keep the HDF5 fill
 //     value, set to the IMAS invalid value: -9E+40 for reals (both components
 //     of a complex), -999999 for integers, empty string for text.
 //     Each AoS group carries @aos_size (@aos_dynamic=1 when it grows with
 //     time); each dataset carries @datatype, @n_elements, @schema, @aos_ndim
 //     (how many leading dims are AoS/time) and @dims_label (the name of every
-//     dim, so [195,10] can be read as time_slice|constraints&faraday_angle).
+//     dim, the leaf's own dims named last, so [195,10] reads as
+//     time_slice|constraints&faraday_angle and @aos_ndim=1 says the leaf shape
+//     starts at dim 1).  listView prints the split itself: {195 | 10}.
 //     Object names never contain '[' — the HDF5 command line parses brackets
 //     as a selection, which makes such an object unreachable by h5dump -d.
 //   * --expand (collapse_aos=false) restores the historical view: one VDS per
 //     index row, every AoS instance listed under its own subgroup.
-//   * Intermediate groups are auto-created along each path.
+//   * Intermediate groups are auto-created along each path — unless
+//     no_aos_groups (CLI --no-aos-groups) is set, which publishes every dataset
+//     flat under <view_root> under one name whose path segments are joined with
+//     ':' (imas_view/grids_ggd:grid:space:objects_per_dimension:object:geometry).
+//     A recursive h5ls then shows no AoS group at all, while each level's size
+//     stays visible in the shape.  @aos_size/@aos_dynamic belong to the groups,
+//     so they are not written in that mode (n_aos_groups stays 0).
 //   * listView() reads a published view back and prints one annotated line per
 //     object — needed because `h5ls -r` prints NO attribute at all, so the
 //     annotations above are invisible in a plain listing.
@@ -68,9 +77,10 @@ struct PublishOptions {
     // Safety valve: when a dataset would need more mappings than this, publish
     // only its first slice and flag it (@mapping_cap=1).  0 == unlimited.
     uint64_t max_mappings_per_dataset = 0;
-    // Collapse mode only: keep AoS levels whose size is 1 as leading dims
-    // ({1,1,1,3} instead of the squeezed {3}).  No effect in --expand mode.
-    bool     keep_singletons = false;
+    // Collapse mode only: publish the datasets flat under <view_root> with ':'
+    // joining the path segments, instead of creating one HDF5 group per AoS
+    // level.  No effect in --expand mode.
+    bool     no_aos_groups = false;
 };
 
 // Publish (idempotent) a VDS view under <root_group> (default "imas_view").
