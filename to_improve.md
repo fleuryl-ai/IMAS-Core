@@ -989,5 +989,126 @@ grosse écriture ; il faut relancer (ou `stat -c%s`) pour obtenir les blocs rée
 chunks/alignement ne touche que les fichiers neufs (figés à la création) et demande une validation
 sur le stockage cible.
 
+## 24. `get_slice` en V2 : la base de temps est relue sur toute la plage de `data_raw_f64` à chaque appel — mesuré (2026-10-18)
+
+**Le symptôme** (`rapport_slices.html`) : le coût *par appel* de `getSlice` en V2 croît avec le
+nombre de tranches du fichier — 9,1 ms à 100 tranches, 204 ms à 1000 tranches × 1000 points — alors
+que `putSlice` reste plat (~3-7 ms). V1 est plat à ~3,5-4,2 ms sur les mêmes fichiers.
+
+**Dispositif.** Harnais de `../IMAS-Cpp` : `examples/benchmark.cpp` + `test_slices.sh`, binaire
+`build/examples/example-cpp-benchmark`, `IMAS_AL_DISABLE_VALIDATE=1`. Le harnais compilait
+`build/_deps/al-core-src` (FetchContent, `AL_CORE_VERSION=main`) ; ce checkout est à `bc002f5` et son
+`src/hdf5/panzerdb.cpp` est **identique octet à octet** à l'arbre local → les chiffres du rapport
+mesurent bien le code courant. Harnais depuis repointé sur l'arbre local via
+`-DFETCHCONTENT_SOURCE_DIR_AL-CORE=<IMAS-Core>`.
+
+**Fixtures** (dernière configuration du balayage `sp` arrivée à terme, 1000 tranches × 3000 points
+× 8 quantités) : `test_slices_sp_v2_slice/core_profiles.h5` md5 `730eb7a3c3d0e8f2cfe59cea5e1774b2`
+(17 082 277 o) ; `test_slices_sp_v1_slice/core_profiles.h5` md5 `310275fa968eef7249e8ba7659ceaf17`
+(19 622 396 o).
+
+**Base mesurée, même fichier, par appel de `getSlice` :**
+
+| backend | mesure | µs/appel |
+|---|---|---|
+| V2 | 100 appels, fichier juste écrit | 764 652 |
+| V2 | 100 appels, passe suivante (cache chaud) | 756 453 |
+| V1 | 100 appels | 3 964 puis 3 759 |
+
+Soit **×195 V2/V1**, et le fait que les deux passes V2 concordent écarte l'effet de page cache.
+Rapprochement avec le balayage du jour : à 1000×1000, un appel de tranche coûte 204 122 µs alors
+qu'un `get` de l'IDS entier coûte 477 547 µs en une seule fois — une tranche ≈ 43 % d'une lecture
+complète.
+
+**`perf record -g` (20 appels)** : `adler32_z` 29,78 % self + `inflate_fast` 26,15 % = **55,9 % en
+décompression zlib** ; `__memmove_avx512_unaligned_erms` 3,79 % ; `std::_Hash_bytes` 1,44 % ; le reste
+en adresses non résolues de libhdf5 (limite connue de l'outil sur ce host).
+**`strace` (3 appels)** : 4914 `pread64` pour 91 714 600 o, soit **29 MB relus par appel** pour un
+fichier de 17 MB, en lectures unitaires de ~21 KB (des chunks compressés).
+
+**Compteurs temporaires dans `panzerdb.cpp` (2 appels)** :
+
+```
+sliceDirect=24 elems=54 006          → 12 appels/appel, 27 003 éléments/appel : l'hyperslab de la
+                                        tranche elle-même est correcte et petite
+[PZU] first=time rows=1000 range_elems=26 975 998 sum_counts=1000 span=26 975 998
+tensorCalls=6 002 elems=6 002        → 3 001 readTensor d'un seul élément par appel
+leavesRebuilds=4                     → 2 par appel
+rowsForTime=1 485 032 (742 516/appel) ; availableProbes=563 148 (281 574/appel)
+```
+
+**Cause.** `iread_strategy.h:340/352/379/384` résout la base de temps à chaque lecture par
+`PanzerDB::getWholeDynamicSignal("time")`, qui assemble toutes les lignes du chemin puis appelle
+`readLeavesUnion` — celle-ci fait **un seul `H5Dread` sur la plage englobante** `[min(offset),
+max(offset+count))`. Or `putSlice` écrit le `time` en **une ligne d'un élément par pas**, entrelacée
+avec les 8 signaux : 1000 lignes dont la plage fait 26 975 998 doubles. On lit donc **215,8 MB pour
+récupérer 8 KB**, à chaque appel — d'où la linéarité en nombre de tranches (cette plage vaut ~la
+taille totale du payload) et les 56 % de zlib.
+
+**Ce n'est pas corrigeable par le choix de la sélection.** Chunk `data_raw_f64` = 65 536 doubles ;
+les lignes de `time` sont espacées de ~24 001 éléments (un pas = 8×3000 points + 1 temps), donc
+26 975 998 / 65 536 = **412 chunks, et chaque chunk contient au moins une valeur de temps** : toute
+lecture complète de la base de temps décompresse les 412 chunks, en hyperslab contigu ou en
+stridé. Le levier est donc de **ne la lire qu'une fois**, pas de la relire mieux. (Relire le point 12
+de ce fichier : le passage à `readLeavesUnion` avait supprimé un `H5Dread` par feuille ; sur cette
+forme — beaucoup de lignes d'un élément éparpillées — il remplace N petites lectures par une lecture
+de toute la plage.)
+
+**Coûts secondaires** : 2 reconstructions du cache de leaves par appel, 742 516 `rowsForTime` et
+281 574 sondes de disponibilité dans `nearestAvailableSliceIndex` (dont les boucles de recherche
+linéaire sont commentées « few slices expected »).
+
+### Lecture erronée à corriger ici même : la cause dominante n'était pas la lecture du `time` racine
+
+Première lecture, cohérente avec `perf` (56 % de zlib) et avec la trace `[PZU]` : la plage de
+26 975 998 éléments lue pour reconstituer `time` semblait être le gouffre. **Faux** : la mémoisation
+de cette lecture n'a rendu que 165 ms sur 764. En traçant `readTensor`, les 3 001 lectures d'un seul
+élément par appel (que les compteurs annonçaient déjà) apparaissent sur un **autre** chemin :
+`PanzerDB::getTimeIndex` (appelé par `slice_read_strategy.cpp:27` à chaque `getSlice`) assemblait la
+base de temps du AoS dynamique — `profiles_1d/time`, et non le `time` racine — **avec un `readTensor`
+par leaf** : 1000 leaves d'un élément, espacées de 27 003 éléments dans `data_raw_f64`, donc 1000
+décompressions de chunk de 512 KB par appel, cache de chunks en thrashing permanent. C'est ça qui
+rend le coût par appel proportionnel au nombre de tranches.
+
+### Correctif appliqué (2026-10-18) et mesure avant/après
+
+Deux changements, aucun touchant au format (`HDF5_BACKEND_VERSION` reste 2.0) :
+
+1. **`getWholeDynamicSignal` mémoïse le signal lu** (`whole_signals`, valable tant que
+   `leaf_cache_gen` et `index_rows_loaded` n'ont pas bougé) et **garde ce cache avec l'index décodé**
+   dans `IndexHandoff`, donc d'un moteur à l'autre de la même session de lecture — le même mécanisme
+   que l'item 21 pour `/index`.
+2. **`getTimeIndex` passe par cette lecture groupée** au lieu d'assembler la base de temps leaf par
+   leaf (une décompression de chunk par pas → une passe sur le dataset, une fois par session).
+
+`getWholeDynamicSignal` devient `const` (elle ne remplit qu'un cache) ; ses membres sont `mutable`.
+
+Coût **par appel** de `getSlice` en V2, même harnais, mêmes fichiers, Q=8 :
+
+| tranches × points | avant | après |
+|---|---|---|
+| 100 × 100 | 9 098 µs | 8 560 µs |
+| 100 × 1000 | 16 507 µs | 7 661 µs |
+| 100 × 3000 | 27 947 µs | 8 352 µs |
+| 100 × 5000 | 61 629 µs | 9 979 µs |
+| 1000 × 100 | 61 374 µs | 52 441 µs |
+| 1000 × 1000 | 204 122 µs | 53 012 µs |
+| 1000 × 3000 | 764 652 µs | **57 714 µs** (×13,2) |
+
+La dépendance à la taille de tranche a **disparu** : à 1000 tranches l'appel coûte 52-58 ms quel que
+soit P (avant : 61 → 764 ms), et à 100 tranches 8,5-10 ms quel que soit P (avant : 9 → 62 ms). Il
+reste un facteur ~6 entre 100 et 1000 tranches (8,5 → 52 ms), qui n'est plus de la décompression.
+
+V1 sur le même fichier 1000×3000 : 3 950 µs, inchangé (chemin non touché).
+Correctitude : `ctest` **91/91** (dont le sous-ensemble `slice|append|dynamic|time_slice` 35/35),
+après rebuild complet de `build` avec le `CPLUS_INCLUDE_PATH`/`LD_LIBRARY_PATH` et l'`IMAS_PREFIX`
+(documentés ailleurs) ; `putSlice` et `get` global inchangés sur les configs mesurées.
+
+**Ce qui reste ouvert.** La croissance en nombre de tranches n'a pas disparu : à 1000×100 (payload
+de 6,4 MB seulement) l'appel coûte encore 52 ms contre 8,5 ms à 100×100, alors que V1 est plat à
+~3,8 ms. Le résiduel n'est plus de la décompression mais du parcours d'index par appel — les
+281 574 sondes de `nearestAvailableSliceIndex` et les 2 reconstructions du cache de leaves. C'est le
+prochain objet, à traiter séparément.
+
 
 

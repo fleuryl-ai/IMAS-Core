@@ -417,6 +417,24 @@ private:
     // caches went stale instead of dereferencing them (to_improve.md point 6).
     mutable uint64_t leaf_cache_gen = 0;
 
+    /**
+     * @brief Whole dynamic signals this engine already read, keyed by path.
+     *
+     * A time base written slice by slice is stored as one row per time step,
+     * interleaved with the payloads that separate those steps, so reading it once
+     * touches every chunk of the raw dataset: a session reading N slices would pay
+     * that full pass N times (to_improve.md point 24). The payload is therefore kept
+     * here, and parked with the decoded index (IndexHandoff) so it survives the
+     * per-operation engines of one read session.
+     *
+     * Validity is the index state it was derived from: `whole_signals_gen` must match
+     * leaf_cache_gen (a rebuild drops the leaves) and `whole_signals_rows` must match
+     * index_rows_loaded (an append adds rows this map has never seen).
+     */
+    mutable std::unordered_map<std::string, std::vector<double>> whole_signals;
+    mutable uint64_t whole_signals_gen = 0;
+    mutable uint64_t whole_signals_rows = 0;
+
     mutable std::list<std::vector<char>> cached_paths_blocks;
     mutable std::list<std::vector<char>> cached_parent_paths_blocks;
     mutable std::unordered_map<std::string_view, std::vector<size_t>> leaf_lookup;
@@ -518,6 +536,10 @@ private:
         std::unordered_map<std::string_view, uint64_t> max_time_at_dynamic_root;
         std::unordered_set<std::string_view> time_lookup_unsafe_paths;
         std::vector<std::string> dynamic_aos_roots;
+        // Whole dynamic signals this engine had already read (the time bases). They are
+        // derived from the same decoded state, so they inherit this slot's identity guard
+        // and travel with it; see whole_signals below.
+        std::unordered_map<std::string, std::vector<double>> whole_signals;
     };
 
     /// The single parked state this thread owns (replaced when another file opens).
@@ -1178,8 +1200,12 @@ public:
       * @brief Reads a whole dynamic (time-evolving) double signal into memory.
       * @param dataset_name The full path of the signal (outside an AoS instance).
       * @return The concatenated time series, or an empty vector if not found.
+      * @note Memoised for as long as the decoded index state is unchanged, because
+      *       reading such a signal touches every chunk of the raw dataset when it was
+      *       written slice by slice (see whole_signals). Const for that reason only:
+      *       it fills a cache, it changes nothing on the file.
       */
-    std::vector<double> getWholeDynamicSignal(const std::string& dataset_name);
+    std::vector<double> getWholeDynamicSignal(const std::string& dataset_name) const;
 
 
 

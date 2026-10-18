@@ -1358,11 +1358,16 @@ void PanzerDB::adoptIndexHandoff() {
     std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    std::swap(parked.whole_signals, whole_signals);
     leaf_cache_gen = parked.generation;
     index_rows_loaded = parked.rows;
     index_paths_loaded = parked.paths;
     index_last_offset = parked.last_offset;
     index_last_count = parked.last_count;
+    // The parked signals were read from exactly this index state, which the checks
+    // above just re-validated against the file.
+    whole_signals_gen = leaf_cache_gen;
+    whole_signals_rows = index_rows_loaded;
     parked = IndexHandoff{};
 }
 
@@ -1388,6 +1393,7 @@ void PanzerDB::handBackIndexHandoff() {
     std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    std::swap(whole_signals, parked.whole_signals);
     parked.key = index_file_name;
     parked.index_token = index_token;
     parked.rows = index_rows_loaded;
@@ -1403,6 +1409,8 @@ void PanzerDB::handBackIndexHandoff() {
     index_paths_loaded = 0;
     index_last_offset = 0;
     index_last_count = 0;
+    whole_signals_gen = 0;
+    whole_signals_rows = 0;
 }
 
 
@@ -3160,43 +3168,15 @@ size_t PanzerDB::getDynamicAOSSize(const std::string& aos_path) const {
 }
 
 int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const {
-    // 1. Retrieve all index leaves.
-    const auto& leaves = getLeaves();
-
-    // 2. Filter to keep only leaves of requested timebase.
-    //    Path can be complex (e.g. "A/0/B/time").
-    std::vector<const Leaf*> timebase_leaves;
-    
-    // OPTIMIZATION: Use leaf_lookup
-    auto it = leaf_lookup.find(timebase_path);
-    if (it != leaf_lookup.end()) {
-        for (size_t idx : it->second) {
-            timebase_leaves.push_back(&leaves[idx]);
-        }
-    }
-
-    // 3. Ensure leaves are sorted by time_index.
-    std::sort(timebase_leaves.begin(), timebase_leaves.end(), 
-              [](const Leaf* a, const Leaf* b) {
-                  return a->time_index < b->time_index;
-              });
-
-    if (timebase_leaves.empty()) {
-        return -1; // Timebase not found.
-    }
-
-    // 4. Read all time values into a single vector.
-    std::vector<double> time_values;
-    for (const auto* leaf : timebase_leaves) {
-        if (leaf->count > 0) {
-            size_t current_size = time_values.size();
-            time_values.resize(current_size + leaf->count);
-            readTensor(*leaf, time_values.data() + current_size);
-        }
-    }
+    // Read the whole time base through the batched, memoised path. The path can be
+    // complex (e.g. "A/0/B/time"). Assembling it leaf by leaf — which is what it looks
+    // like when a slice-wise write left one row per time step — decompresses a whole
+    // chunk per step: the cost of one getSlice then grows with the number of slices in
+    // the file, which is the defect measured in to_improve.md point 24.
+    std::vector<double> time_values = getWholeDynamicSignal(timebase_path);
 
     if (time_values.empty()) {
-        return -1; // Timebase exists but is empty.
+        return -1; // Timebase not found, or found but empty.
     }
 
     // 5. Use DataInterpolation to get the correct index based on interpolation mode.
@@ -4254,11 +4234,25 @@ void PanzerDB::advanceTimebase(const std::string& timebase_name, uint64_t n_step
 
 
 // Retrieve a whole dynamic signal that is not inside an AoS
-std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) {
-    
+std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) const {
+
     // 1. Access the in-memory index
     const auto& leaves = getLeaves();
-    
+
+    // When this signal was written slice by slice it occupies one row per time step,
+    // interleaved with the payloads separating those steps, so the read below touches
+    // every chunk of the raw dataset: doing it once per slice read costs O(total
+    // payload) per call (to_improve.md point 24). Keep the payload while the index
+    // state it was derived from is still what this engine sees.
+    if (whole_signals_gen == leaf_cache_gen && whole_signals_rows == index_rows_loaded) {
+        const auto cached = whole_signals.find(dataset_name);
+        if (cached != whole_signals.end()) return cached->second;
+    } else {
+        whole_signals.clear();
+        whole_signals_gen = leaf_cache_gen;
+        whole_signals_rows = index_rows_loaded;
+    }
+
     // 2. Filtrer les feuilles correspondant au dataset
     std::vector<const PanzerDB::Leaf*> target_leaves;
     size_t total_elements = 0;
@@ -4300,6 +4294,7 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
         }
     }
 
+    whole_signals[dataset_name] = full_signal;
     return full_signal;
 }
 
