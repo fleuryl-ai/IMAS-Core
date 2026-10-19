@@ -944,6 +944,27 @@ public:
     void close();
 
     /**
+      * @brief Moves this engine onto another group id of the same file, keeping what it
+      *        already holds: the decoded /index, the memoised signals, and the handles of
+      *        every dataset it opened.
+      * @param new_loc_id Group id the caller has just opened. The AL closes the group an
+      *                   engine was opened on at the end of every read operation and
+      *                   opens a new one for the next, which is what makes this needed.
+      * @return true when the engine now reads through @p new_loc_id and nothing has to be
+      *         re-read; false when the caller has to build another engine instead.
+      * @note HDF5 object ids outlive the group they were opened through, so the dataset
+      *       handles stay usable across the AL's H5Gclose — close() already relies on
+      *       that when it closes them after the group is gone. Only file_id is stale.
+      * @note Refuses unless it is the same file, the same /index object, and a table that
+      *       has not grown since this engine decoded it. That check is made through
+      *       @p new_loc_id, never through our own handles: a write elsewhere cannot
+      *       update the file struct ours belongs to, and rows appended between two reads
+      *       have to be seen as new rows, not as the rows already cached (the append path
+      *       adds a row per time step, so growth is how any write shows up here).
+      */
+    bool reanchor(hid_t new_loc_id);
+
+    /**
       * @brief Dumps the cached index table (leaves) to standard output, for debugging.
       */
     void dumpLeafIndex() const;

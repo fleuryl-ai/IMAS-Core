@@ -1437,6 +1437,37 @@ void PanzerDB::handBackIndexHandoff() {
     no_slice_rows = 0;
 }
 
+bool PanzerDB::reanchor(hid_t new_loc_id) {
+    // An engine that opened the file itself is not hanging on a borrowed group, and an
+    // engine that is not read-only may still hold rows to flush: neither is re-anchored.
+    if (mode != OpenMode::READ || owned_file_id >= 0) return false;
+    if (file_id < 0 || new_loc_id < 0 || index_dset < 0 || index_file_name.empty()) return false;
+    if (panzer_file_name(new_loc_id) != index_file_name) return false;
+
+    // What the table looks like NOW is asked through the caller's handle, never through
+    // ours: our handles belong to the file struct we opened them on, which a write in
+    // this process or in another one cannot update. Asking ourselves would answer with
+    // what we already believe and keep serving a table that has moved on.
+    hid_t fresh = H5Dopen2(new_loc_id, "index", H5P_DEFAULT);
+    if (fresh < 0) return false;
+    const bool same_index_object = panzer_same_object(fresh, index_token);
+    const uint64_t rows_now = panzer_index_rows(fresh);
+    H5Dclose(fresh);
+    if (!same_index_object) return false;                       // /index recreated
+    if (index_rows_loaded > 0 && rows_now != index_rows_loaded) return false;  // rows appended
+
+    if (should_close_loc_id && new_loc_id != file_id) {
+        // The group here is one this engine opened (init() descended into it), so it is
+        // ours to close. The AL case never reaches this: it owns its group and we only
+        // borrowed the id, which is why should_close_loc_id is false for it.
+        if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
+        else H5Gclose(file_id);
+    }
+    file_id = new_loc_id;
+    should_close_loc_id = false;  // the caller owns this id and closes it at end of operation
+    return true;
+}
+
 
 // DIRECT HYPERSLAB READ (no intermediate buffer)
 // ============================================================================

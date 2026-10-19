@@ -39,15 +39,11 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
 {
     HDF5Reader::open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path);
 
-    // New read session: drop the previous session's engine/index (their
-    // destructors flush + close the HDF5 handles they own).
-    session_gid = -1;
-    session_db.reset();
-    session_index.reset();
-    global_strategy.reset();
-    slice_strategy.reset();
-    timerange_strategy.reset();
-    read_strategy = nullptr;
+    // The session engine is deliberately NOT dropped here. The AL closes the IDS group
+    // at the end of every operation and opens a fresh one for the next, which used to
+    // throw the engine and its shared index away and rebuild both (twice per getSlice).
+    // select_strategy moves the engine onto the new group id instead, and drops it there
+    // only when that move is impossible.
 }
 
 void HDF5Reader_v2::close_group(OperationContext *ctx)
@@ -75,7 +71,12 @@ void HDF5Reader_v2::endAction(Context *ctx)
 void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
     // One shared engine + index per group: built on the first read that needs it,
     // adopted by every strategy of the session (3x /index load -> 1x).
-    if (gid != session_gid) {
+    // The group id changes at every operation, so an existing engine is moved onto it
+    // rather than rebuilt: rebuilding threw away the decoded /index, the memoised
+    // signals and the dataset handles with their chunk caches, twice per getSlice.
+    if (session_db && session_db->reanchor(gid)) {
+        session_gid = gid;
+    } else {
         session_gid = gid;
         session_db.reset();
         session_index.reset();
@@ -83,8 +84,6 @@ void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
         slice_strategy.reset();
         timerange_strategy.reset();
         read_strategy = nullptr;
-    }
-    if (!session_db) {
         session_db = std::make_shared<PanzerDB>(gid, PanzerDB::OpenMode::READ);
         session_index = std::make_shared<ReadIndex>(session_db);
     }

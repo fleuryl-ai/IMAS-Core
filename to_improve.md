@@ -1218,5 +1218,68 @@ rouvrir/re-rattacher ces handles à chaque opération — à traiter séparémen
 
 V1 sur 1000×3000 : 4 120 µs (chemin non touché). Correctitude : `ctest` **91/91** après rebuild complet.
 
+### Quatrième passe (2026-10-19) : le moteur survit aux opérations
+
+**Ce que coûtait vraiment une reconstruction, mesure par phase** (build instrumenté, 1000 tranches,
+2 000 moteurs = 2 par appel, coût **par moteur**) :
+
+| phase | µs/moteur |
+|---|---|
+| `ReadIndex` (re-parcours des leaves) | **807** |
+| adoption de l'handoff | 246 |
+| `configureReadCache` | 78 |
+| handles (`H5Lexists` + `H5Dopen2`) | 65 |
+| `readChunkingConfig` | 6,7 |
+| auto-détection du groupe racine | 2,8 |
+| `restoreTimeContext` (déjà sauté) | 2,7 |
+| **constructeur `PanzerDB` complet** | **416** |
+
+Donc ~1,22 ms par moteur, **2,45 ms par `getSlice`** — soit 11 % seulement des 22 ms de l'appel. La
+reconstruction n'était donc pas le gros morceau : le reste à corriger était ailleurs.
+
+**La vraie découverte : le cache de chunks vit avec le handle de dataset.** Un moteur neuf rouvre
+`data_raw_*` avec son propre DAPL, donc son propre cache de chunks : chaque `getSlice` re-décompressait
+les mêmes chunks de 512 Ko que l'appel précédent avait déjà vus. Les 2,45 ms évités n'expliquent pas un
+facteur 9 ; ce qui rend l'appel bon, c'est le cache qui reste chaud d'un appel sur l'autre.
+
+**Correction.** `PanzerDB::reanchor(hid_t)` déplace le moteur sur le nouvel id de groupe sans rien jeter :
+les handles de datasets (et leurs caches), l'`/index` décodé, les signaux mémoïsés. Ça marche parce
+qu'un id d'objet HDF5 survit à la fermeture du groupe à travers lequel il a été ouvert — c'est déjà ce
+sur quoi `close()` s'appuie, qui ferme ces handles alors que l'AL a fermé le groupe. Seul `file_id` est
+périmé. `HDF5Reader_v2::open_IDS_group` ne jette plus la session ; `select_strategy` ré-ancre, et ne
+reconstruit que si l'ancrage est refusé.
+
+**Validité de l'ancrage** — refusé (donc reconstruction) sauf si : même fichier, même objet `/index`
+(token), et **table qui n'a pas grandi**. Ce contrôle passe par le handle frais de l'AL (`H5Dopen2` sur
+le nouveau gid), jamais par les nôtres : nos handles appartiennent à un `H5F_t` qu'une écriture ne peut
+pas rafraîchir, donc s'interroger nous-mêmes répondrait « rien n'a changé ». Le nombre de lignes suffit
+comme signal d'invalidation parce qu'un append **ajoute une ligne** à `/index` (jamais il n'en réécrit
+une) : c'est comme ça que toute écriture se voit ici.
+
+**A/B propre** (3 reps, médianes, µs par appel, `build` reparti de `HEAD` des deux côtés) :
+
+| tranches × points | avant | après | facteur |
+|---|---|---|---|
+| 100 × 100 | 5 506 | 2 623 | ×2,1 |
+| 1000 × 100 | 20 977 | **2 030** | ×10,3 |
+| 1000 × 3000 | 22 166 | **2 517** | ×8,8 |
+| V1 1000 × 3000 | 4 289 | 4 382 | bruit (chemin non touché) |
+
+Cumul des quatre passes sur 1000 × 3000 : **764 652 → 2 517 µs (×304)**, et le V2 passe **sous** le V1
+(2 517 contre 4 382). Compteur de session : 1 moteur construit pour 1 000 appels, 352 ré-ancrages par
+appel (l'AL appelle `select_strategy` à chaque entrée de lecture).
+
+**Test de garde ajouté** : `test_al_slice_read_after_append_between_reads` — un même `HDF5Backend` lit
+(t=0,2), puis un append ajoute t=0,3, puis on relit t=0,3. Vérifié non vide en sabotant le contrôle de
+croissance : la relecture rend alors **120** (la dernière tranche que la session périmée connaissait) au
+lieu de **130** (la tranche ajoutée). Les tests existants écrivent puis lisent, donc construisent la
+session après l'append et ne couvrent pas ce cas. `ctest` **92/92**.
+
+**Reste mesuré, non corrigé.** ~2,5 ms par appel à 1000 tranches. Le ré-ancrage est devenu la taxe
+d'entrée par opération (352 par appel : `H5Fget_name` + `H5Dopen2` + `H5Oget_info3` + `H5Dget_space` +
+`H5Dclose`) — bornée par les 2,03 ms de l'appel à 100×1000 points mais **pas encore mesurée
+directement** : c'est la prochaine sonde raisonnable. Ensuite le résidu déjà cartographié au `perf`
+(décompression, surcoût d'appels HDF5, hachage de clés).
+
 
 
