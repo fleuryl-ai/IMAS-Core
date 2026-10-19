@@ -493,8 +493,15 @@ void PanzerDB::init(OpenMode mode) {
     // may close the group we hang on before close() runs.
     index_file_name = panzer_file_name(file_id);
     if (!panzer_object_token(index_dset, index_token)) index_token = H5O_TOKEN_UNDEF;
-    adoptIndexHandoff();
-    restoreTimeContext();
+    // The AL drops and rebuilds this engine around every operation, so on a read
+    // session the parked state is normally adopted whole. When it covers every row
+    // the table has, the counters restoreTimeContext() walks the full leaf table to
+    // rebuild came across with it, and that walk is pure rework.
+    // An APPEND engine runs it anyway: that function also takes the file_time_base
+    // snapshot the writer uses to tell a fresh signal from a continuing one, and the
+    // handoff does not carry that snapshot.
+    const bool adopted_whole_table = adoptIndexHandoff();
+    if (!adopted_whole_table || mode == OpenMode::APPEND) restoreTimeContext();
 }
 
 void PanzerDB::updateDiskSizes() {
@@ -1338,16 +1345,20 @@ PanzerDB::IndexHandoff& PanzerDB::indexHandoff() {
     return parked;
 }
 
-void PanzerDB::adoptIndexHandoff() {
-    if (!cached_leaves.empty() || index_rows_loaded > 0) return;  // already loaded here
+// Returns true when the parked state covers every row the table has now, which is the
+// only case in which the caller may skip restoreTimeContext(): the per-root time
+// counters that function rebuilds are handed over with the rest of the state.
+bool PanzerDB::adoptIndexHandoff() {
+    if (!cached_leaves.empty() || index_rows_loaded > 0) return false;  // already loaded here
     IndexHandoff& parked = indexHandoff();
-    if (!parked.valid || parked.rows == 0 || parked.generation == 0) return;
-    if (parked.key != index_file_name) return;
-    if (!panzer_same_object(index_dset, parked.index_token)) return;  // /index recreated
-    if (panzer_index_rows(index_dset) < parked.rows) return;            // table shrank
+    if (!parked.valid || parked.rows == 0 || parked.generation == 0) return false;
+    if (parked.key != index_file_name) return false;
+    if (!panzer_same_object(index_dset, parked.index_token)) return false;  // /index recreated
+    const long long current_rows = panzer_index_rows(index_dset);
+    if (current_rows < parked.rows) return false;                            // table shrank
     uint64_t off = 0, cnt = 0;
-    if (!panzer_index_row(index_dset, parked.rows - 1, off, cnt)) return;
-    if (off != parked.last_offset || cnt != parked.last_count) return;  // prefix rewritten
+    if (!panzer_index_row(index_dset, parked.rows - 1, off, cnt)) return false;
+    if (off != parked.last_offset || cnt != parked.last_count) return false;  // prefix rewritten
 
     std::swap(cached_leaves, parked.leaves);
     std::swap(cached_paths_blocks, parked.paths_blocks);
@@ -1358,6 +1369,10 @@ void PanzerDB::adoptIndexHandoff() {
     std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    // READ only: an APPEND engine must rebuild these counters from the rows in the file,
+    // so that the file_time_base snapshot stays "what the file held", never what an
+    // earlier engine of this process wrote.
+    if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
     std::swap(parked.whole_signals, whole_signals);
     std::swap(parked.no_slice_paths, no_slice_at_any_index);
     leaf_cache_gen = parked.generation;
@@ -1371,7 +1386,9 @@ void PanzerDB::adoptIndexHandoff() {
     whole_signals_rows = index_rows_loaded;
     no_slice_gen = leaf_cache_gen;
     no_slice_rows = index_rows_loaded;
+    const bool covers_whole_table = (current_rows == parked.rows);
     parked = IndexHandoff{};
+    return covers_whole_table;
 }
 
 void PanzerDB::handBackIndexHandoff() {
@@ -1396,6 +1413,7 @@ void PanzerDB::handBackIndexHandoff() {
     std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
     std::swap(whole_signals, parked.whole_signals);
     std::swap(no_slice_at_any_index, parked.no_slice_paths);
     parked.key = index_file_name;

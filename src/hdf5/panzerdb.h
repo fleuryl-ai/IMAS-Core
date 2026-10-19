@@ -559,13 +559,19 @@ private:
         // the length that was covered; same reasoning as whole_signals, and the same
         // work would otherwise be redone for every slice read of the session.
         std::unordered_map<std::string, long long> no_slice_paths;
+        // Per-root "how many time steps so far" counters, which restoreTimeContext()
+        // would otherwise rebuild from every leaf of the table at each open.
+        std::unordered_map<std::string, uint64_t> aos_time_counters;
     };
 
     /// The single parked state this thread owns (replaced when another file opens).
     static IndexHandoff& indexHandoff();
     /// Takes the parked state back if it belongs to this file and to this /index.
-    /// Called by init() before the index is read.
-    void adoptIndexHandoff();
+    /// Called by init() before the index is read. Returns true when what was adopted
+    /// covers every row the table holds now, so nothing has to be recomputed from the
+    /// rows (restoreTimeContext can be skipped); false when nothing was adopted or the
+    /// table grew since.
+    bool adoptIndexHandoff();
     /// Parks the parsed state so the next engine on this file can reuse it.
     /// Called by close(), while the file handle is still usable.
     void handBackIndexHandoff();

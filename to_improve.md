@@ -1159,5 +1159,64 @@ que V1 est plat à ~3,9 ms : le coût restant suit la taille de l'index et le no
 lecture, pas une boucle unique. Piste suivante : le moteur recréé à chaque opération et l'ouverture /
 fermeture de handles HDF5 qui l'accompagne.
 
+### Troisième passe (2026-10-19) : le moteur recréé autour de chaque opération
+
+Mesuré avec des compteurs chrono temporaires posés dans `hdf5_reader_v2.cpp` (retirés depuis) :
+`HDF5Reader_v2::open_IDS_group` jette `session_db` / `session_index` **à chaque opération**, et
+`select_strategy` les reconstruit juste après. Un `getSlice` fait donc **deux constructions de
+`PanzerDB(READ)` + deux `ReadIndex`**, pas une.
+
+Coût de ces constructions, par appel de `getSlice` :
+
+| tranches | avant cette passe | après |
+|---|---|---|
+| 100 | 1,30 ms (dont 1,14 de construction) | 0,94 ms (0,47) |
+| 1000 | 3,85 ms (dont 3,72 de construction) | 2,58 ms (2,44) |
+
+C'est bien une dépendance à la taille de l'index (×3 entre 100 et 1000 tranches), donc une part de la
+pente résiduelle : ~2,6 ms sur les 22 ms d'un appel à 1000 tranches.
+
+**Ce qui coûtait : `restoreTimeContext()`.** Le constructeur READ finit par
+`adoptIndexHandoff(); restoreTimeContext();`. L'handoff garait déjà `leaf_lookup`,
+`max_time_at_dynamic_root`, `dynamic_aos_roots`, `whole_signals`, `no_slice_paths` — **mais pas
+`aos_time_counters`** (`panzerdb.h:314`), que `restoreTimeContext()` (`panzerdb.cpp:868`) reconstruit
+en O(leaves × racines AoS dynamiques) : 11,3 ms mesurés sur 171 165 leaves, soit ici ~0,6 ms par
+moteur × 2 moteurs par appel. Comme l'état garaé couvrait déjà toute la table, cette promenade était
+du pur re-travail.
+
+**Correctif.** `aos_time_counters` voyage avec l'handoff, **uniquement en mode READ** (swap dans les
+deux sens, gardé par `mode == OpenMode::READ`), et `adoptIndexHandoff()` renvoie maintenant si l'état
+garaé couvre **toutes** les lignes présentes (`panzer_index_rows == parked.rows`). Le constructeur ne
+saute `restoreTimeContext()` que sur ce `true`, **et jamais en mode APPEND** : cette fonction prend
+aussi l'instantané `file_time_base` (`panzerdb.cpp:944`) dont l'écritureur a besoin pour distinguer un
+signal frais d'un signal qui continue, et cet instantané ne voyage pas. La garde sur le swap vise le
+même point par l'autre bout : un moteur APPEND doit reconstruire ses compteurs à partir des lignes du
+fichier, jamais hériter de celles qu'un moteur précédent de ce même processus a écrites. Si des lignes
+ont été ajoutées depuis, on retombe sur la recomposition complète — comportement inchangé.
+
+**A/B propre** (même harnais, mêmes fichiers, Q=8, 3 répétitions par cellule, médiane ; `build`
+reconstruit de part et d'autre en repartant de `HEAD`) :
+
+| tranches × points | avant | après | écart |
+|---|---|---|---|
+| 100 × 100 | 4 691 µs | 4 494 µs | −4 % |
+| 1000 × 100 | 22 688 µs | 21 765 µs | −4 % |
+| 1000 × 3000 | 24 723 µs | 23 278 µs | −6 % |
+
+Nouvelle série après la garde READ (3 reps, médianes) : 4 904 / 21 004 / 23 194 µs — à 1000 tranches le
+gain se confirme (−7 % et −6 % face aux médianes « avant »), à 100 tranches on est dans le bruit.
+Écart global plus petit que ne le laissait attendre la seule mesure de churn (−1,28 ms sur 22 ms) : à
+ce niveau le bruit inter-run est de l'ordre du ms. Gain honnête mais qui ne referme pas la pente : il
+reste **2 moteurs par appel** et ~2,4 ms de construction (8 H5Lexists + 7 H5Dopen2 + attribut +
+`readChunkingConfig` + `configureReadCache` + `ReadIndex`).
+
+**Pourquoi le moteur n'est simplement pas gardé en vie.** `PanzerDB(hid_t loc_id, ...)` stocke
+`file_id(loc_id)`, et `panzerdb.cpp:216` prévient : « in this case file_id is actually a loc_id
+(group) ». Allonger la durée de vie du moteur reviendrait à conserver des handles ouverts sur un groupe
+que l'AL ferme (`H5Gclose`) entre deux opérations. C'est la vraie correction, mais elle suppose de
+rouvrir/re-rattacher ces handles à chaque opération — à traiter séparément, pas en douceur.
+
+V1 sur 1000×3000 : 4 120 µs (chemin non touché). Correctitude : `ctest` **91/91** après rebuild complet.
+
 
 
