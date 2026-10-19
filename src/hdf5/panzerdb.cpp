@@ -1359,15 +1359,18 @@ void PanzerDB::adoptIndexHandoff() {
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
     std::swap(parked.whole_signals, whole_signals);
+    std::swap(parked.no_slice_paths, no_slice_at_any_index);
     leaf_cache_gen = parked.generation;
     index_rows_loaded = parked.rows;
     index_paths_loaded = parked.paths;
     index_last_offset = parked.last_offset;
     index_last_count = parked.last_count;
-    // The parked signals were read from exactly this index state, which the checks
-    // above just re-validated against the file.
+    // The parked signals and the parked "no slice here" answers were both derived from
+    // exactly this index state, which the checks above just re-validated against the file.
     whole_signals_gen = leaf_cache_gen;
     whole_signals_rows = index_rows_loaded;
+    no_slice_gen = leaf_cache_gen;
+    no_slice_rows = index_rows_loaded;
     parked = IndexHandoff{};
 }
 
@@ -1394,6 +1397,7 @@ void PanzerDB::handBackIndexHandoff() {
     std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
     std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
     std::swap(whole_signals, parked.whole_signals);
+    std::swap(no_slice_at_any_index, parked.no_slice_paths);
     parked.key = index_file_name;
     parked.index_token = index_token;
     parked.rows = index_rows_loaded;
@@ -1411,6 +1415,8 @@ void PanzerDB::handBackIndexHandoff() {
     index_last_count = 0;
     whole_signals_gen = 0;
     whole_signals_rows = 0;
+    no_slice_gen = 0;
+    no_slice_rows = 0;
 }
 
 
@@ -3261,6 +3267,34 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
         }
     }
 
+    // A path holding no /index row cannot cover any index. Deciding that once, here,
+    // is what keeps a request for a signal this file does not carry from walking the
+    // whole time base to conclude nothing exists: the two scans below then cost
+    // 2 x slices probes, three path lookups each (to_improve.md point 24).
+    const long long nb = static_cast<long long>(time_basis.size());
+    const int64_t lo = 0;
+    const int64_t hi = (nb > 0) ? nb - 1 : 0;
+
+    if (no_slice_gen != leaf_cache_gen || no_slice_rows != index_rows_loaded) {
+        no_slice_at_any_index.clear();
+        no_slice_gen = leaf_cache_gen;
+        no_slice_rows = index_rows_loaded;
+    }
+    {
+        const auto dead = no_slice_at_any_index.find(target_path);
+        if (dead != no_slice_at_any_index.end() && dead->second == nb) return -1;
+    }
+
+    auto path_has_rows = [this](const std::string& path) -> bool {
+        const auto it = leaf_lookup.find(std::string_view(path));
+        return it != leaf_lookup.end() && !it->second.empty();
+    };
+    const std::string generic_path = dynamic_aos.empty() ? std::string()
+                                                         : dynamic_aos + remainder_suffix;
+    const bool target_live = path_has_rows(target_path);
+    const bool generic_live = !generic_path.empty() && path_has_rows(generic_path);
+    if (!target_live && !generic_live && dynamic_aos.empty()) return -1;
+
     auto path_covers = [&](const std::string& path, int64_t idx) -> bool {
         for (size_t lidx : rowsForTime(path, idx)) {
             if (isTimeInLeaf(getLeaves()[lidx], idx)) return true;
@@ -3269,9 +3303,9 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
     };
 
     auto available = [&](int64_t idx) -> bool {
-        if (path_covers(target_path, idx)) return true;
+        if (target_live && path_covers(target_path, idx)) return true;
         if (dynamic_aos.empty()) return false;
-        if (path_covers(dynamic_aos + remainder_suffix, idx)) return true; // generic
+        if (generic_live && path_covers(generic_path, idx)) return true; // generic
         std::string substituted;
         substituted.reserve(dynamic_aos.size() + remainder_suffix.size() + 12);
         substituted.append(dynamic_aos);
@@ -3280,10 +3314,6 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
         substituted.append(remainder_suffix);
         return path_covers(substituted, idx);
     };
-
-    long long nb = static_cast<long long>(time_basis.size());
-    int64_t lo = 0;
-    int64_t hi = (nb > 0) ? nb - 1 : 0;
 
     if (available(requested_idx)) return requested_idx;
 
@@ -3298,6 +3328,17 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
         for (int64_t i = requested_idx; i <= hi; ++i) {
             if (available(i)) { lowest_above = i; break; }
         }
+    }
+
+    // Both scans together covered every index of this time base and found nothing, so
+    // the answer does not depend on which index was asked for. Keyed on the time-base
+    // length too: that is the bound the scans covered, so a later read whose time base
+    // reaches further has to re-probe rather than inherit this -1. Recorded because the
+    // AL re-asks the same absent signals on each read (to_improve.md point 24).
+    if (highest_below == -1 && lowest_above == -1) {
+        if (nb > 0 && requested_idx >= 0 && requested_idx <= hi)
+            no_slice_at_any_index[target_path] = nb;
+        return -1;
     }
 
     if (prefer_direction < 0) {

@@ -435,6 +435,21 @@ private:
     mutable uint64_t whole_signals_gen = 0;
     mutable uint64_t whole_signals_rows = 0;
 
+    /**
+     * @brief Paths found to hold no slice at any index of a given time base.
+     *
+     * A read of an optional signal this IDS does not carry has to scan the whole time
+     * base before it can say so, and the AL re-asks the same signals on every slice
+     * read: that made one getSlice cost a pass over the time base per absent signal
+     * (to_improve.md point 24). Within one pair of scans the answer does not depend on
+     * which index was asked for, so the entry is path -> the time-base length that was
+     * covered; a later read whose time base reaches further re-probes instead of
+     * inheriting the -1. Validity follows whole_signals (same decoded state).
+     */
+    mutable std::unordered_map<std::string, long long> no_slice_at_any_index;
+    mutable uint64_t no_slice_gen = 0;
+    mutable uint64_t no_slice_rows = 0;
+
     mutable std::list<std::vector<char>> cached_paths_blocks;
     mutable std::list<std::vector<char>> cached_parent_paths_blocks;
     mutable std::unordered_map<std::string_view, std::vector<size_t>> leaf_lookup;
@@ -540,6 +555,10 @@ private:
         // derived from the same decoded state, so they inherit this slot's identity guard
         // and travel with it; see whole_signals below.
         std::unordered_map<std::string, std::vector<double>> whole_signals;
+        // Paths already found to hold no slice at any index of a given time base, with
+        // the length that was covered; same reasoning as whole_signals, and the same
+        // work would otherwise be redone for every slice read of the session.
+        std::unordered_map<std::string, long long> no_slice_paths;
     };
 
     /// The single parked state this thread owns (replaced when another file opens).

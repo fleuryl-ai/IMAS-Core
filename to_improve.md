@@ -1104,11 +1104,60 @@ Correctitude : `ctest` **91/91** (dont le sous-ensemble `slice|append|dynamic|ti
 après rebuild complet de `build` avec le `CPLUS_INCLUDE_PATH`/`LD_LIBRARY_PATH` et l'`IMAS_PREFIX`
 (documentés ailleurs) ; `putSlice` et `get` global inchangés sur les configs mesurées.
 
-**Ce qui reste ouvert.** La croissance en nombre de tranches n'a pas disparu : à 1000×100 (payload
-de 6,4 MB seulement) l'appel coûte encore 52 ms contre 8,5 ms à 100×100, alors que V1 est plat à
-~3,8 ms. Le résiduel n'est plus de la décompression mais du parcours d'index par appel — les
-281 574 sondes de `nearestAvailableSliceIndex` et les 2 reconstructions du cache de leaves. C'est le
-prochain objet, à traiter séparément.
+**Ce qui restait ouvert, traité dans la foulée (2026-10-18, même session).** La croissance en nombre
+de tranches venait aussi de `nearestAvailableSliceIndex`. Compteurs posés sur place (2 configs) :
+
+| | 100 tranches | 1000 tranches |
+|---|---|---|
+| sondes `available()` par appel | 23 472 | 230 472 |
+| dont `path_covers` (3 formes par sonde) | 75 604 | 742 504 |
+| touches réussies par appel | 12 | 12 |
+
+Donc ~12 sondes utiles et **~116 appels parcourent toute la base de temps** (2 × tranches sondes)
+pour ne rien trouver : la trace des chemins montre que ce sont des signaux optionnels absents du
+fichier (`profiles_1d/0/grid&psi`, `…&volume_error_upper`, …), que l'AL redemande à chaque lecture de
+tranche. `target_live=0` et `gen_live=0` : aucune ligne d'index pour ces chemins.
+
+Deux changements dans `nearestAvailableSliceIndex` :
+
+1. **Garde sur les formes de chemin** : une forme sans aucune ligne dans `leaf_lookup` ne peut couvrir
+   aucun index, donc on ne la sonde plus dans les deux scans (et si aucune des formes indépendantes de
+   l'indice n'a de lignes et qu'il n'y a pas d'AoS dynamique, on sort en -1 sans scanner).
+2. **Mémoïsation de la réponse négative** (`no_slice_at_any_index`, garée avec l'index dans
+   `IndexHandoff`) : la clé est `chemin -> longueur de base de temps parcourue`. La réponse ne dépend
+   pas de l'indice demandé dans un même couple de scans (les deux couvrent `[0, nb-1]`), mais elle
+   dépend de `nb` : une lecture dont la base de temps va plus loin doit re-sonder plutôt qu'hériter du
+   -1. Validité = même état décodé que `whole_signals` (`leaf_cache_gen` + `index_rows_loaded`).
+
+La mémo doit être **garée avec l'index**, sinon elle ne sert jamais : un moteur par opération la
+recréerait à zéro à chaque appel.
+
+Effet sur les sondes : 23 472 → 247 par appel à 100 tranches, 230 472 → 242 à 1000 tranches.
+
+**Coût par appel de `getSlice` en V2, après cette seconde passe** (mêmes fichiers, Q=8) :
+
+| tranches × points | avant tout | après passe 1 (time base) | après passe 2 (sondes) |
+|---|---|---|---|
+| 100 × 100 | 9 098 | 8 560 | 5 552 |
+| 1000 × 100 | 61 374 | 52 441 | 21 564 |
+| 1000 × 1000 | 204 122 | 53 012 | 22 583 |
+| 1000 × 3000 | 764 652 | 57 714 | **23 263** (×32,9 au total) |
+
+V1 sur le même fichier 1000×3000 : 3 934 µs (chemin non touché). Correctitude : `ctest` **91/91**
+après rebuild complet, avec la mémo indexée sur `nb`.
+
+**Le point « 2 reconstructions du cache de leaves par appel » était un faux positif.** Les compteurs
+comptaient les entrées dans `getLeaves()`, pas le travail : avec l'index garé, `getLeaves()` sort
+immédiatement (`leaves_cache_valid = true`, zéro ligne décodée) quand rien n'a été ajouté depuis
+l'handoff (`panzerdb.cpp:1740-1743`). Rien à corriger de ce côté.
+
+**Reste mesuré, non corrigé.** `perf` sur le binaire corrigé ne désigne plus un point unique :
+décompression 12 %, surcoût d'appels HDF5 ~20 % (`pthread_getspecific` 6 %, `H5CX_pop` 3,6 %,
+`__pthread_setcancelstate` 3,5 %, `H5I__find_id` 2,4 %, verrous ~4 %), hachage de clés ~6 %,
+`memcpy`/`memset` ~10 %. Il subsiste un facteur 3,9 entre 100 et 1000 tranches (5,5 vs 21,6 ms) alors
+que V1 est plat à ~3,9 ms : le coût restant suit la taille de l'index et le nombre d'appels HDF5 par
+lecture, pas une boucle unique. Piste suivante : le moteur recréé à chaque opération et l'ouverture /
+fermeture de handles HDF5 qui l'accompagne.
 
 
 
