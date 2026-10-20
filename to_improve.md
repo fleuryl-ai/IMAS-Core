@@ -1281,5 +1281,94 @@ d'entrée par opération (352 par appel : `H5Fget_name` + `H5Dopen2` + `H5Oget_i
 directement** : c'est la prochaine sonde raisonnable. Ensuite le résidu déjà cartographié au `perf`
 (décompression, surcoût d'appels HDF5, hachage de clés).
 
+## 25. `put_slice` en V2 : le moteur est reconstruit **et refermé** à chaque tranche — mesuré et corrigé (2026-10-20)
+
+**Le symptôme.** `putSlice` V2 coûte ~2× plus cher qu'en V1, et ce trou-là ne se voit pas dans
+`rapport_slices.html` parce que l'écriture y paraissait « plate » (le point 24 la décrivait à ~3-7 ms
+sans distinction de backend).
+
+**Dispositif.** Le même harnais que le point 24, en écriture cette fois :
+`example-cpp-benchmark -m put-slice -S <tranches> -P <points> -Q 8`, `BACKEND_DEFAULT_WRITE_VERSION=1.0`
+puis `2.0`, `BACKEND_ALLOW_AUTO_UPGRADE=false`, `IMAS_AL_DISABLE_VALIDATE=1`. Pulse frais à chaque
+lancement.
+
+**Base mesurée** (médianes de 3 reps, µs par appel de `putSlice` ; colonne « avant » = `HEAD` + sondes
+chrono, colonne « après » = code final sans sonde) :
+
+| tranches × points | V1 | V2 avant | V2 après | gain V2 | V2 vs V1 après |
+|---|---|---|---|---|---|
+| 100 × 100 | 3 487 | 4 861 | **1 157** | ×4,2 | ×3,0 sous V1 |
+| 100 × 1 000 | 3 279 | 4 426 | **1 189** | ×3,7 | ×2,8 sous V1 |
+| 1 000 × 100 | 3 368 | 6 097 | **1 909** | ×3,2 | ×1,8 sous V1 |
+| 1 000 × 1 000 | 3 581 | 6 165 | **1 943** | ×3,2 | ×1,8 sous V1 |
+
+Le V1 est mesuré dans les deux configurations (3 577 avec sondes, 3 581 sans) : l'instrumentation ne
+déplace rien, donc les deux colonnes sont comparables. Caveat identique au point 24 : `IMAS_PREFIX`
+pointe sur `IDSDef.xml` alors que `setWriteStrategy` cherche `$IMAS_PREFIX/include/IDSDef.xml`, donc
+l'extraction de métadonnées est sautée dans ces runs (des deux côtés).
+
+**Pourquoi V1 ne paye rien.** `HDF5Writer` (v1) ne fait que mémoriser `slice_mode` dans
+`setWriteStrategy` ; `hdf5_writer.cpp` ne contient ni `flush()` ni `H5Fflush`, et son
+`close_datasets()` n'ouvre aucun dataset v2. Le coût par appel du V1, c'est l'AL seul.
+
+**Ce que V2 payait** (sondes chrono dans `panzerdb.cpp` / `hdf5_writer_v2.cpp`, 1 000 × 1 000, µs par
+appel — 6 342 au total) :
+
+| poste | µs/appel | détail |
+|---|---|---|
+| construction du moteur | **1 502** | dont `restoreTimeContext` = 977 (6 006 feuilles parcourues **par moteur**, donc en `n²` sur la session) et 494 pour les handles : 7 × `H5Dopen2` + attributs + `readChunkingConfig` + `updateDiskSizes` |
+| `close()` | **1 171** | dont 1 167 dans les `H5Dclose` : c'est là que le **chunk de queue** de chaque table est réécrit (cf. point 23) |
+| `flush()` | 462 | payload 448 ; `H5Fflush` seul = 5,7 au total |
+| AL (commun avec V1) | ~3 200 | |
+
+Donc **3,13 ms sur 6,34** = le seul cycle de vie du moteur, et l'écart V2−V1 (2,5-2,7 ms) en est
+presque entièrement fait. Un `PanzerDB(APPEND)` neuf, puis `flush()`, puis `close()` à chaque tranche.
+
+**Le correctif — le point 24 appliqué au côté écriture.** Le writer v2 garde **un moteur APPEND pour
+toute la session de tranches** et le ré-ancre sur le groupe que l'AL rouvre à chaque opération (un id
+d'objet HDF5 survit à la fermeture du groupe qui l'a servi) ; `flush()` reste à chaque opération —
+c'est la barrière de commit SWMR, le « index row = commit point » — mais `close()` sort du chemin par
+opération et va dans `closePulse()` / `deleteData()`. Le layout, les chunk sizes, la compression et
+`HDF5_BACKEND_VERSION` ne bougent pas.
+
+**La garde d'ancrage n'est pas la même côté écriture.** En lecture, « la table n'a pas grandi » prouve
+que rien n'a bougé. En APPEND c'est faux : **c'est nous** qui la faisons grandir, de exactement les
+lignes dont on a attribué les `row_id`. Le test devient donc `rows_now == next_row_id` : compte égal →
+c'est notre propre travail, on garde le moteur ; compte différent → quelqu'un d'autre a écrit, l'état
+décodé (offsets de payload, compteurs de temps) est périmé, on reconstruit. Le nombre de lignes suffit
+toujours comme signal, parce qu'un append ajoute une ligne et n'en réécrit jamais une.
+
+Deux choses que la reconstruction refaisait au passage et qu'il a fallu rendre à la main :
+`file_time_base = aos_time_counters` à chaque opération — c'est ce que le writer lit par
+`hasFileData()` pour distinguer un signal **neuf** d'un signal **qui continue**, et donc l'ancre de
+rattrapage `base_time = max(base_time, time_next − n_slices)` (sans ça, un signal frais posé en cours de
+session se décalait sur la dernière index écrite) ; et la pile d'AoS vidée (`array_stack`,
+`path_prefix`, `dynamic_level`, cache AoS dynamique), invisible sur le chemin nominal mais qui évite
+qu'une opération interrompue au milieu d'un AoS nomme les chemins de la suivante avec le préfixe de la
+précédente.
+
+En GLOBAL_OP (`put()`), le moteur de slices est **libéré avant** que le moteur WRITE ne tourne : celui-ci
+supprime `/index` et les `data_raw_*`, ce qui ne doit pas arriver pendant qu'un autre moteur tient des
+handles dessus.
+
+**Test de garde ajouté** : `test_al_slice_write_after_foreign_append` — la session A écrit t=0,0 à 0,2,
+un **autre** `HDF5Backend` append t=0,3, A reprend à t=0,4 avec un signal frais ; les tranches des deux
+doivent se relire. Vérifié non vide en neutralisant la garde (`rows_now != next_row_id && false`) : le
+reprend tombe sur **130** au lieu de **140**, c'est-à-dire que le moteur périmé recalle la tranche neuve
+sur l'index de l'autre. Les tests existants n'écrivent jamais par deux backends sur la même session.
+`ctest` **93/93**.
+
+**Aller-retour revérifié** (`-m put-slice` puis `-m get-slice` sur le même fichier, 1 000 × 1 000 × 8) :
+1 000 tranches relues sans `[FAILED]` dans les deux backends ; `getSlice` V2 2 155 µs contre V1 3 004 µs
+(pas de régression de lecture) ; fichier 2,0 Mo en V2 contre 16 Mo en V1.
+
+**Reste mesuré, non corrigé.** Il se construit encore **999 moteurs READ pendant les 1 000 `putSlice`**
+(sonde : `init_ms r=457,3`, 5 999 994 feuilles parcourues, + 81 µs/appel de `H5Dclose`), soit **457 µs
+sur les 1 943**. La pile d'appel les nomme : `core_profiles_IDSBase::putSlice` → `readIdsTimeMode`
+(al-cpp) → `al_read_data` → `HDF5Reader_v2::select_strategy`. La session de lecture existe déjà (point
+24) mais sa garde refuse ici à chaque coup — la table **a** grandi, c'est l'écriture en cours qui l'a
+agrandie — donc elle reconstruit tout. La piste n'est pas de relâcher la garde mais de recharger `/index`
+en incrémental (le point 21 l'a déjà fait entre moteurs d'un même fichier) au lieu de tout redécoder.
+
 
 

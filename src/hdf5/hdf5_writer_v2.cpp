@@ -92,6 +92,11 @@ void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid
   DEBUG_PRINT("Setting write strategy to PanzerDB (mode: " << write_mode << ")");
   
   if (write_mode == GLOBAL_OP) {
+    // A put() rewrites the whole IDS: its engine owns the tables it creates, so it is
+    // not the one the slice session keeps alive. Release it BEFORE the WRITE engine
+    // runs — that engine deletes /index and the raw datasets, which must not happen
+    // while another engine still holds handles on them.
+    panzer_db_ptr.reset();
     panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::WRITE, true, false);
     metadata_by_path.clear();   // fresh per put(); only (re)populate from this IDS's XML
     const char* imas_prefix = std::getenv("IMAS_PREFIX");
@@ -115,7 +120,15 @@ void HDF5Writer_v2::setWriteStrategy(OperationContext * ctx, int write_mode, hid
     }
   } else if (write_mode == SLICE_OP) {
       DEBUG_PRINT("Write mode is SLICE_OP");
-      panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::APPEND, true, false);
+      // One engine for the whole slice session. The AL closes the IDS group at the end
+      // of every putSlice() and hands us a fresh one, but the engine's own handles —
+      // and with them the decoded table, the time counters and HDF5's write chunk cache
+      // for the tail of every table — survive that. Rebuilding cost a full init plus a
+      // close per time step (a walk of the whole leaf table for restoreTimeContext, and
+      // the dirty tail chunks written back through H5Dclose), which grows with what has
+      // already been written: quadratic over a session.
+      if (!panzer_db_ptr || !panzer_db_ptr->reanchor(loc_id))
+          panzer_db_ptr = std::make_unique<PanzerDB>(loc_id, PanzerDB::OpenMode::APPEND, true, false);
   }
 }
 
@@ -460,6 +473,35 @@ void HDF5Writer_v2::endAction(Context *ctx) {
   } else if (ctx->getType() == CTX_OPERATION_TYPE) {
 
     if (panzer_db_ptr) panzer_db_ptr->flush();
-    if (panzer_db_ptr) panzer_db_ptr->close();
+    // The commit is the operation boundary; the engine is not. Closing it here is what
+    // made every putSlice() pay an H5Dclose over the whole table (writing the dirty tail
+    // chunk of /index, /paths and every raw table back out) and then reopen it. A WRITE
+    // engine is different: a put() wrote the IDS from scratch and its file is expected
+    // to be finished here, so it does close.
+    if (panzer_db_ptr &&
+        panzer_db_ptr->getOpenMode() != PanzerDB::OpenMode::APPEND)
+        panzer_db_ptr->close();
   }
+}
+
+// The slice session's engine outlives its operations, so its end is the end of the
+// pulse, not the end of the last putSlice(): this is where its handles (and the file
+// they hold registered) are released.
+void HDF5Writer_v2::closePulse(DataEntryContext *ctx, int mode, hid_t *file_id,
+                               std::unordered_map<std::string, hid_t> &opened_IDS_files,
+                               int files_path_strategy, std::string &files_directory,
+                               std::string &relative_file_path) {
+  panzer_db_ptr.reset();
+  HDF5Writer::closePulse(ctx, mode, file_id, opened_IDS_files, files_path_strategy,
+                         files_directory, relative_file_path);
+}
+
+void HDF5Writer_v2::deleteData(OperationContext *ctx, hid_t file_id,
+                               std::unordered_map<std::string, hid_t> &opened_IDS_files,
+                               std::string &files_directory,
+                               std::string &relative_file_path) {
+  // The tables this engine holds handles on are about to be unlinked.
+  panzer_db_ptr.reset();
+  HDF5Writer::deleteData(ctx, file_id, opened_IDS_files, files_directory,
+                         relative_file_path);
 }

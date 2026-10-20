@@ -1438,9 +1438,13 @@ void PanzerDB::handBackIndexHandoff() {
 }
 
 bool PanzerDB::reanchor(hid_t new_loc_id) {
-    // An engine that opened the file itself is not hanging on a borrowed group, and an
-    // engine that is not read-only may still hold rows to flush: neither is re-anchored.
-    if (mode != OpenMode::READ || owned_file_id >= 0) return false;
+    // A read session and an APPEND write session both hang on a group the AL owns and
+    // closes at the end of every operation, while the engine and the dataset handles it
+    // opened outlive it. An engine that opened the file itself is not hanging on a
+    // borrowed group, and a WRITE engine still holds the tables it just created:
+    // neither is re-anchored.
+    if (mode != OpenMode::READ && mode != OpenMode::APPEND) return false;
+    if (owned_file_id >= 0) return false;
     if (file_id < 0 || new_loc_id < 0 || index_dset < 0 || index_file_name.empty()) return false;
     if (panzer_file_name(new_loc_id) != index_file_name) return false;
 
@@ -1454,7 +1458,33 @@ bool PanzerDB::reanchor(hid_t new_loc_id) {
     const uint64_t rows_now = panzer_index_rows(fresh);
     H5Dclose(fresh);
     if (!same_index_object) return false;                       // /index recreated
-    if (index_rows_loaded > 0 && rows_now != index_rows_loaded) return false;  // rows appended
+    if (mode == OpenMode::APPEND) {
+        // Here WE are the one that grew the table, so "it did not grow" is the wrong
+        // question: it grew by exactly the rows this engine assigned ids for, and
+        // flush() wrote every one of them. Any other count means somebody else moved
+        // the table, and this engine's decoded state is then stale: rebuild.
+        if (rows_now != next_row_id) return false;
+        // The other thing restoreTimeContext() produces is the file_time_base snapshot
+        // the writer reads through hasFileData() to tell a FRESH signal from a
+        // CONTINUING one, and before this session ran it once per operation. At an
+        // operation boundary this engine's own counters ARE that snapshot — seeded from
+        // the file, then advanced by the rows it committed — so copying the map keeps
+        // those semantics without walking the leaf table a second time.
+        file_time_base = aos_time_counters;
+        // A rebuilt engine also started every operation with an empty AoS stack. A
+        // well-behaved operation unwound it (endArray() per beginArray()), so this is a
+        // no-op on the happy path; what it covers is the AL throwing in the middle of an
+        // AoS, which a rebuilt engine used to hide — a half-open stack would name the
+        // next operation's paths with the previous operation's prefix.
+        array_stack.clear();
+        current_path.clear();
+        path_prefix.clear();
+        dynamic_level.clear();
+        last_level_had_write = false;
+        invalidateDynamicAOSCache();
+    } else if (index_rows_loaded > 0 && rows_now != index_rows_loaded) {
+        return false;                                          // rows appended
+    }
 
     if (should_close_loc_id && new_loc_id != file_id) {
         // The group here is one this engine opened (init() descended into it), so it is

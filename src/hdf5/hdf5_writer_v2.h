@@ -85,10 +85,34 @@ public:
    void read_homogeneous_time(int *homogenenous_time, hid_t gid);
 
    /**
-    * @brief Closes the current context: endArray() for AoS, flush()+close() for the operation.
+    * @brief Closes the current context: endArray() for AoS, flush() for the operation.
     * @param ctx The context being closed.
+    * @note The APPEND engine an ongoing slice session owns is NOT closed here — only
+    *       flushed, which is the SWMR commit point. It is released in closePulse()
+    *       (or deleteData()), so its handles, its decoded table and HDF5's write chunk
+    *       cache survive from one putSlice() to the next. A WRITE engine does close:
+    *       a put() leaves a finished file behind.
     */
    void endAction(Context *ctx) override;
+
+   /**
+    * @brief Ends the write session: releases the engine, then closes the pulse.
+    * @note Order matters — the engine's handles keep the file registered, so they must
+    *       go before the base class closes the pulse and master files.
+    */
+   void closePulse(DataEntryContext *ctx, int mode, hid_t *file_id,
+                   std::unordered_map<std::string, hid_t> &opened_IDS_files,
+                   int files_path_strategy, std::string &files_directory,
+                   std::string &relative_file_path) override;
+
+   /**
+    * @brief Drops an IDS' data: releases the engine first, then deletes.
+    * @note The base class unlinks the very datasets this engine holds handles on.
+    */
+   void deleteData(OperationContext *ctx, hid_t file_id,
+                   std::unordered_map<std::string, hid_t> &opened_IDS_files,
+                   std::string &files_directory,
+                   std::string &relative_file_path) override;
 };
 
 #endif

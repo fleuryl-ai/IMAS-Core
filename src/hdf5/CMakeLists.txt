@@ -217,6 +217,9 @@ al_add_hdf5_test(test_al_slice_op_code_output)
 # A read session that already read a pulse has to notice rows appended after that read:
 # the session keeps its engine across operations, so this is its invalidation gate.
 al_add_hdf5_test(test_al_slice_read_after_append_between_reads)
+# Mirror gate on the write side: a slice session keeps one APPEND engine across
+# putSlice(), so it must notice rows another writer added between its own slices.
+al_add_hdf5_test(test_al_slice_write_after_foreign_append)
 # Global read of a 1-slice scalar time series must stay 1D(1) (AL convention,
 # to_improve.md point 3); static scalars must remain 0D.
 al_add_hdf5_test(test_al_global_code_output_1slice)
