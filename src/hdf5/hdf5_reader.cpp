@@ -47,6 +47,12 @@ void HDF5Reader::closePulse(DataEntryContext *ctx, int mode, hid_t *file_id, std
     hdf5_utils.closeMasterFile(file_id);
 }
 
+void HDF5Reader::release_session()
+{
+    // The v1 reader keeps nothing across operations: close_datasets() and the group
+    // bookkeeping already release everything it holds.
+}
+
 void HDF5Reader::close_datasets()
 {
     auto it_ds = opened_data_sets.begin();

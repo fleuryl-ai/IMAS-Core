@@ -266,6 +266,17 @@ class HDF5Utils {
      */
     void writeHeader(DataEntryContext * ctx, hid_t file_id, std::string & filePath, std::string backend_version);
     /**
+     * @brief Rewrites the HDF5_BACKEND_VERSION attribute of an already-annotated file.
+     * @param file_id         File handle to re-annotate (must be open for writing).
+     * @param backend_version Version text ("1.0" / "2.0") to record on the root.
+     * @note writeHeader() cannot do this: its H5Acreate2 fails when the attribute already
+     *       exists. The attribute is rewritten in place with the same fixed-width string
+     *       type writeHeader() creates, so readers see exactly what they saw before.
+     * @note The user block is left alone -- it already carries the URI of the pulse.
+     * @throws ALBackendException when the attribute can be neither opened nor created.
+     */
+    void rewriteHeaderVersion(hid_t file_id, std::string backend_version);
+    /**
      * @brief Removes one IDS file, if it exists.
      * @param filePath File to remove.
      * @throws ALBackendException when the file is still present after remove().

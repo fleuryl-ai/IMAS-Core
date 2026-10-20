@@ -420,6 +420,44 @@ void HDF5Utils::writeHeader(DataEntryContext * ctx, hid_t file_id, std::string &
     H5Aclose(att_id);
 }
 
+void HDF5Utils::rewriteHeaderVersion(hid_t file_id, std::string backend_version)
+{
+    const char *backend_version_attribute_name = "HDF5_BACKEND_VERSION";
+
+    // Same type writeHeader() builds, so the attribute keeps the width and encoding every
+    // reader expects; only its text changes.
+    hid_t dtype_id = H5Tcopy(H5T_C_S1);
+    H5Tset_size(dtype_id, strlen(backend_version_attribute_name));
+    if (H5Tset_cset(dtype_id, H5T_CSET_UTF8) < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to set characters to UTF8 for: %s\n", backend_version_attribute_name);
+        throw ALBackendException(error_message);
+    }
+
+    hid_t att_id = H5Aopen(file_id, backend_version_attribute_name, H5P_DEFAULT);
+    if (att_id < 0) {   // never annotated: create it instead
+        hid_t dataspace_id = H5Screate(H5S_SCALAR);
+        att_id = H5Acreate2(file_id, backend_version_attribute_name, dtype_id,
+                            dataspace_id, H5P_DEFAULT, H5P_DEFAULT);
+        H5Sclose(dataspace_id);
+    }
+    if (att_id < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to open or create attribute: %s\n", backend_version_attribute_name);
+        H5Tclose(dtype_id);
+        throw ALBackendException(error_message, LOG);
+    }
+
+    herr_t status = H5Awrite(att_id, dtype_id, backend_version.c_str());
+    H5Aclose(att_id);
+    H5Tclose(dtype_id);
+    if (status < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to write attribute: %s\n", backend_version_attribute_name);
+        throw ALBackendException(error_message, LOG);
+    }
+}
+
 // WHAT SHALL WE STORE IN USERBLOCK W.R.T URI WHERE SHOT AND RUN ARE NOT MANDATORY ?
 void HDF5Utils::writeUserBlock(const std::string & filePath, DataEntryContext * ctx)
 {

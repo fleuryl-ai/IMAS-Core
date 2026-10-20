@@ -334,6 +334,16 @@ class HDF5Reader {
      */
     virtual void closePulse(DataEntryContext * ctx, int mode, hid_t *file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, int files_path_strategy, std::string & files_directory, std::string & relative_file_path);
     /**
+     * @brief Drops whatever this reader keeps alive between operations, handles included.
+     * @note The v1 reader caches nothing that outlives an operation, so it does nothing.
+     *       The v2 reader keeps one read engine + its path index + the strategies built on
+     *       it (see HDF5Reader_v2), whose dataset handles stay open across operations.
+     * @note Needed when the storage being read is about to disappear underneath: unlinking
+     *       the v2 tables of a file that a session still holds handles on would leave those
+     *       handles pointing at deleted objects.
+     */
+    virtual void release_session();
+    /**
      * @brief Reads one node's values for one AoS instance (the AL get / get_slice / get_time_range entry point).
      * @param ctx          Context of the read (an AoS context, or the operation context at top level).
      * @param att_name     IMAS path of the node ('/' is flattened to '&' in place).

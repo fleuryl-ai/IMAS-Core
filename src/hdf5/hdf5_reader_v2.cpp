@@ -35,6 +35,21 @@ void HDF5Reader_v2::closePulse(DataEntryContext *ctx, int mode, hid_t *file_id, 
     HDF5Reader::closePulse(ctx, mode, file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
 }
 
+void HDF5Reader_v2::release_session()
+{
+    // The strategies each hold a shared_ptr to the engine, so the engine is only really
+    // released when the last of them goes -- hence dropping them first. PanzerDB's
+    // destructor closes its dataset handles, which is what has to happen before /index
+    // and the raw tables are unlinked from under this session.
+    global_strategy.reset();
+    slice_strategy.reset();
+    timerange_strategy.reset();
+    read_strategy = nullptr;
+    session_index.reset();
+    session_db.reset();
+    session_gid = -1;
+}
+
 void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::unordered_map<std::string, hid_t> &opened_IDS_files, std::string &files_directory, std::string &relative_file_path)
 {
     HDF5Reader::open_IDS_group(ctx, file_id, opened_IDS_files, files_directory, relative_file_path);

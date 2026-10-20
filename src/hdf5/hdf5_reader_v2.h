@@ -74,6 +74,14 @@ class HDF5Reader_v2 : public HDF5Reader {
     void closePulse(DataEntryContext * ctx, int mode, hid_t *file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, int files_path_strategy, std::string & files_directory, std::string & relative_file_path) override;
 
     /**
+     * @brief Drops the session engine, its index and the strategies built on it.
+     * @note The session outlives each operation on purpose (see open_IDS_group); this is
+     *       the way to end it early, closing the handles this reader holds on /index and
+     *       the raw tables. Needed before those objects are unlinked from under us.
+     */
+    void release_session() override;
+
+    /**
      * @brief Reads one node, delegating to the active read strategy.
      * @param ctx          The current context.
      * @param att_name     Node path (normalized internally: '/' -> '&').

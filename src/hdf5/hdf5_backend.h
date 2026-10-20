@@ -56,6 +56,27 @@ class HDF5Backend:public Backend {
     int access_mode;   // The mode passed to openPulse(); selects reader vs writer paths.
     int files_path_strategy;   // Pulse directory layout (always MODIFIED_MDSPLUS_STRATEGY here).
 
+    // A v2 pulse opened while the target version is 1.0 is a conversion, not an edit.
+    // conversion_to_v1_ says this session was accepted as one (getVersion decides that);
+    // conversion_applied_ says its v2 storage has already been dropped, so that happens
+    // once per session and only under an actual write.
+    bool conversion_to_v1_ = false;
+    bool conversion_applied_ = false;
+
+    /**
+     * @brief Removes everything the v2 layout put in one IDS, so the v1 writer can lay it
+     *        down from scratch.
+     * @param ctx The write operation about to start (names the IDS).
+     * @note Runs before the event handler opens the IDS file for that operation: the v1
+     *       writer then creates the file, its external link and its "1.0" header itself
+     *       (HDF5Writer::create_IDS_group), instead of adding classic datasets next to the
+     *       v2 tables -- which would leave a file holding both layouts.
+     * @note Deleting the file rather than unlinking its tables is deliberate: HDF5 hands no
+     *       space back, so an emptied v2 file would keep its v2 size, which is exactly what
+     *       a conversion is meant to measure.
+     * @note Releases the v2 read session first -- it holds handles on the objects going away.
+     */
+    void dropIDSStorageForConversion(OperationContext *ctx);
     /**
      * @brief Parses a "major.minor" version string.
      * @param versionStr Text to parse.
@@ -72,6 +93,14 @@ class HDF5Backend:public Backend {
      * @return True when the environment allows the upgrade.
      */
     bool allowUpgrade();
+    /**
+     * @brief Whether a v2 file may be rewritten as v1 (BACKEND_HDF5_FORCE_CONVERSION_TO_V1 == "true").
+     * @return True when the environment asks for the conversion.
+     * @note A testing switch, not a production path: converting means deleting the v2 tables
+     *       of the pulse and re-annotating it, which is destructive and bypasses the SWMR
+     *       discipline (a reader in another process may be holding those very tables).
+     */
+    bool forceConversionToV1();
     /**
      * @brief Instantiates the writer, reader and event handler for one format version.
      * @param backend_version Version pair to build components for.
@@ -131,8 +160,12 @@ class HDF5Backend:public Backend {
      *       so a v1 file is always read with the v1 reader.
      * @note Under OPEN_PULSE/FORCE_OPEN_PULSE a file older than the target version is only
      *       accepted when BACKEND_ALLOW_AUTO_UPGRADE is true (otherwise an upgrade to 2.0 is
-     *       refused), and a file newer than the target is refused outright: a v2 file is
-     *       never written back as v1.
+     *       refused), and a file newer than the target is refused unless
+     *       BACKEND_HDF5_FORCE_CONVERSION_TO_V1 is true -- which arms this session as a
+     *       v2 to v1 conversion: the next write drops the v2 storage and closePulse()
+     *       re-annotates the pulse as 1.0.
+     * @note Reading stays on the physical version either way, so a conversion session reads
+     *       the v2 tables until it writes, and finds nothing afterwards.
      * @note The open/force-open branches fall through to the create branch, which returns the
      *       target version; the writerVersion/versionToReturn path below is therefore only
      *       reached when access_mode is none of the four pulse modes (in which case those

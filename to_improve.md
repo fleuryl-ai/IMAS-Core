@@ -1370,5 +1370,65 @@ sur les 1 943**. La pile d'appel les nomme : `core_profiles_IDSBase::putSlice` �
 agrandie — donc elle reconstruit tout. La piste n'est pas de relâcher la garde mais de recharger `/index`
 en incrémental (le point 21 l'a déjà fait entre moteurs d'un même fichier) au lieu de tout redécoder.
 
+## 26. Convertir un pulse 2.0 en 1.0 : le verrou, et ce qu'il faut démonter pour que le fichier soit vraiment v1 (2026-10-20)
+
+**L'état de départ.** `HDF5Backend::getVersion(ctx)` refusait purement et simplement la direction
+2.0 → 1.0 : un `throw ALBackendException` dès que la version physique du fichier est 2.0 et la cible
+d'écriture 1.0. Le câblage, lui, était déjà là — c'est ce que la relecture du code a montré :
+le **lecteur suit toujours la version physique** (lue dans `HDF5_BACKEND_VERSION` de `master.h5`),
+l'**écrivain suit la cible** (`BACKEND_DEFAULT_WRITE_VERSION`, sinon 2.0). « lire en v2, écrire en v1 »
+n'était donc pas à construire, seulement à autoriser — et à rendre propre.
+
+**Le verrou est levé par `BACKEND_HDF5_FORCE_CONVERSION_TO_V1=true`**, volontairement distinct de
+`BACKEND_ALLOW_AUTO_UPGRADE` (qui ne traite que le sens 1.0 → 2.0 et reste inchangé). Un `getVersion()`
+qui accepte le mélange arme le flag du backend (`conversion_to_v1_`) pour la session courante — remis à
+zéro dans `openPulse()`, sinon la conversion suivante sur le même backend en hériterait.
+
+**Ce que la permission ne suffisait pas à faire.** Sans rien démonter, l'écrivain v1 posait ses datasets
+**à côté** des tables v2 (`index`, `data_raw_*`, `paths`, `path_table`) : fichier hybride, et l'attribut
+du `master.h5` restait « 2.0 » — donc le premier open suivant renvoyait le lecteur v2 sur des datasets v1.
+Deux choses étaient nécessaires :
+
+- **Effacer avant de réécrire.** Le premier `beginAction` en `WRITE_OP` de la session appelle
+  `dropIDSStorageForConversion()` : il lâche les handles (le session reader v2 garde un moteur + son index
+  vivants entre opérations — d'où le `release_session()` ajouté à `HDF5Reader`, no-op dans la base), ferme
+  le lien externe et **supprime le fichier IDS**, puis l'écrivain v1 le recrée de zéro
+  (`HDF5Writer::create_IDS_group` refait le fichier, le lien externe et son propre en-tête « 1.0 »).
+  Le fichier part plutôt que ses tables une par une : HDF5 ne rend jamais l'espace, donc un v2 vidé de ses
+  tables pèserait encore son poids v2 — alors que comparer les tailles est justement le but.
+- **Re-étiqueter à la fermeture.** `HDF5Utils::rewriteHeaderVersion()` (nouveau : `writeHeader` utilise
+  `H5Acreate2` et ne peut pas réécrire un attribut existant) pose « 1.0 » sur le `master.h5` dans
+  `closePulse()`, et seulement si la session a réellement écrit (`conversion_applied_`) — une session de
+  conversion qui n'aurait fait que lire laisse le pulse intact.
+
+**Test ajouté** : `test_al_convert_v2_to_v1` (`ctest` **94/94**). Il écrit un pulse en v2, vérifie que
+l'ouverture en cible 1.0 est **refusée sans le flag** (et que le refus n'a rien touché), puis avec le flag
+relit les trois tranches **avant** d'écrire — c'est le lecteur v2 qui sert, puisque la version physique
+commande le lecteur — écrit en GLOBAL, et vérifie après coup : étiquettes « 1.0 » sur le master **et** sur
+le fichier IDS, réouverture **sans** le flag, aucune table v2 restante, et les datasets v1 présents avec
+leurs formes et leurs valeurs (`core_profiles/time` {3}, `core_profiles/profiles_1d[]&signal_1d` {3,10}).
+Deux sabotages distincts (ne pas relâcher l'étiquette / ne pas supprimer le fichier) le font échouer, donc
+il n'est pas vacant.
+
+**Pourquoi la dernière phase lit le HDF5 à la main et non par l'AL.** Le lecteur v1 de cette arborescence
+ne sert pas une lecture AL d'un AoS déclaré temps écrit en un seul GLOBAL put : le `getSlice` revient en
+`dim=1 size[0]=1`, et le get global rend le tampon de l'appelant tel quel pour tout élément AoS au-delà du
+premier. Un pulse écrit **nativement** en 1.0 se comporte identiquement, donc ce n'est pas la conversion :
+la suite complète en cible 1.0 échoue sur **14 `test_al_*` sur 53**, deux en SEGFAULT. Vérifier le stockage
+directement couvre malgré tout tout ce que la conversion peut rater (étiquette restée « 2.0 », table v2
+laissée à la place des datasets v1, réécriture qui perd une tranche).
+
+**Bouture réelle** (harnais de mesure, 1 000 tranches × 500 points × 8 signaux, `IMAS_AL_DISABLE_VALIDATE=1`) :
+`-m put-slice` en V2 puis conversion en place à travers l'AL (`get` global → `put` global, le mode `put`
+du harnais ne peut pas : il fait `FORCE_CREATE_PULSE`). `core_profiles.h5` **724 242 → 351 188 octets**
+(−51,5 %), `master.h5` et le fichier IDS tous deux en « 1.0 », racine du fichier IDS réduite au groupe
+`core_profiles` (plus aucune table à la racine), et `-m get-slice` relu en V1 : 20/20 appels sans `[FAILED]`
+(17 238 µs/appel — le chemin v1, pas une régression du v2).
+
+**Reste ouvert, non corrigé.** La liste des objets à supprimer en mode WRITE de `panzerdb.cpp`
+(l. 277-284) omet `list_spans`, alors que ce dataset est créé (l. 382) : un `PanzerDB(WRITE)` sur un fichier
+v2 **existant** qui en contient un échouerait dans `H5Dcreate2`. Non déclenché par les tests — qui recréent
+toujours leur fichier — et sans rapport avec la conversion, qui supprime le fichier entier.
+
 
 

@@ -7,6 +7,7 @@
 
 #define BACKEND_DEFAULT_WRITE_VERSION "BACKEND_DEFAULT_WRITE_VERSION"
 #define BACKEND_ALLOW_AUTO_UPGRADE "BACKEND_ALLOW_AUTO_UPGRADE"
+#define BACKEND_HDF5_FORCE_CONVERSION_TO_V1 "BACKEND_HDF5_FORCE_CONVERSION_TO_V1"
 
 
 HDF5Backend::HDF5Backend()
@@ -49,6 +50,11 @@ std::pair<int, int> HDF5Backend::parseVersion(const std::string& versionStr) {
 
 bool HDF5Backend::allowUpgrade() {
     char* v = std::getenv(BACKEND_ALLOW_AUTO_UPGRADE);  // Autorise-t-on la transformation physique du fichier de 1.0 vers 2.0 ?
+    return v && std::string(v) == "true";
+}
+
+bool HDF5Backend::forceConversionToV1() {
+    char* v = std::getenv(BACKEND_HDF5_FORCE_CONVERSION_TO_V1);  // Autorise-t-on la transformation physique du fichier de 2.0 vers 1.0 ?
     return v && std::string(v) == "true";
 }
 
@@ -135,10 +141,17 @@ std::pair<int,int> HDF5Backend::getVersion(DataEntryContext *ctx) {
                 versionToReturn = getTargetVersion();
             } 
             else if (physical_version  == std::make_pair(2, 0) && getTargetVersion() == std::make_pair(1, 0)){
-                //printf("physical_version larger than backend version in 1.0\n");
-                //writerVersion = std::make_pair(2, 0);
-                //versionToReturn = physical_version; //an error will be thrown by LL
-                throw ALBackendException("Not allowed to downgrade from version 2.0 to version 1.0.");
+                // Reading v2 while writing v1 is not an edit of the same storage: the v2
+                // tables have to go and the pulse re-annotated. Only allowed on purpose.
+                if (!forceConversionToV1())
+                    throw ALBackendException("Not allowed to downgrade from version 2.0 to version 1.0 "
+                                             "(set BACKEND_HDF5_FORCE_CONVERSION_TO_V1=true to convert a pulse for testing).");
+                // Nothing to install here: the reader above already follows the physical 2.0
+                // layout, and the writer is the 1.0 one this process was built with. The flag
+                // only records that this session is a conversion, so the first write drops the
+                // v2 storage and closePulse() rewrites the version header.
+                conversion_to_v1_ = true;
+                conversion_applied_ = false;
             } 
             
         case alconst::create_pulse:
@@ -165,6 +178,10 @@ void
  HDF5Backend::openPulse(DataEntryContext * ctx, int mode)
 {
     access_mode = mode;
+    // A conversion belongs to one pulse session: getVersion() arms it, and the flags must
+    // not leak into the next pulse this backend opens.
+    conversion_to_v1_ = false;
+    conversion_applied_ = false;
 
     std::pair<int,int> backend_version;
     
@@ -201,6 +218,14 @@ void HDF5Backend::closePulse(DataEntryContext * ctx, int mode)
 {
     if (ctx == nullptr)
         throw ALBackendException("HDF5Backend: unexpected null context in HDF5Backend::closePulse()", LOG);
+    // A session that converted the pulse wrote v1 into a file labelled 2.0. The IDS files
+    // were recreated by the writer and carry their own "1.0" header; the master file is the
+    // one openPulse() reads to pick a reader, so it has to follow. Only once the session
+    // really wrote something -- a conversion that only read the pulse leaves it untouched.
+    if (conversion_applied_ && file_id != -1) {
+        HDF5Utils hdf5_utils;
+        hdf5_utils.rewriteHeaderVersion(file_id, std::string("1.0"));
+    }
     if (access_mode == OPEN_PULSE || access_mode == FORCE_OPEN_PULSE) {
         hdf5Reader->closePulse(ctx, mode, &file_id, opened_IDS_files, files_path_strategy, files_directory, relative_file_path);
     } else if (access_mode == CREATE_PULSE || access_mode == FORCE_CREATE_PULSE) {
@@ -244,7 +269,46 @@ void HDF5Backend::beginReadArraystructAction(ArraystructContext * ctx, int *size
 
 void HDF5Backend::beginAction(OperationContext * ctx)
 {
+    // A conversion rewrites the IDS from scratch, and it has to happen before the event
+    // handler opens the IDS file for this operation: the v1 writer then lays the file down
+    // anew (file, external link and "1.0" header, all by HDF5Writer::create_IDS_group)
+    // instead of adding classic datasets next to the v2 tables.
+    if (conversion_to_v1_ && !conversion_applied_ && ctx && ctx->getAccessmode() == WRITE_OP)
+        dropIDSStorageForConversion(ctx);
     eventsHandler->beginAction(ctx, file_id, opened_IDS_files, *hdf5Writer, *hdf5Reader, files_directory, relative_file_path, access_mode);
+}
+
+void HDF5Backend::dropIDSStorageForConversion(OperationContext *ctx)
+{
+    conversion_applied_ = true;   // once per session, whatever the outcome below
+    if (file_id == -1) return;
+
+    // The v2 read session keeps one engine + index alive across operations, with dataset
+    // handles on /index and the raw tables; both readers and writer cache handles opened
+    // through the IDS file. All of that has to be let go before the objects go away.
+    hdf5Reader->release_session();
+    hdf5Reader->close_datasets();
+    hdf5Writer->close_datasets();
+    hdf5Reader->close_group(ctx);
+    hdf5Writer->close_group(ctx);
+
+    std::string IDS_link_name = ctx->getDataobjectName();
+    std::replace(IDS_link_name.begin(), IDS_link_name.end(), '/', '_');
+
+    HDF5Utils hdf5_utils;
+    const std::string IDS_file = hdf5_utils.getIDSPulseFilePath(files_directory, relative_file_path, IDS_link_name);
+
+    auto got = opened_IDS_files.find(IDS_link_name);
+    if (got != opened_IDS_files.end() && got->second != -1) {
+        hdf5_utils.closeIDSFile(got->second, IDS_link_name);
+        got->second = -1;   // the writer reopens -- and now creates -- it under this name
+    }
+    // The file goes away entirely rather than having its v2 tables unlinked: HDF5 never
+    // hands space back, so an emptied v2 file would still weigh its v2 size -- and the
+    // whole point of converting is to compare sizes.
+    if (H5Lexists(file_id, IDS_link_name.c_str(), H5P_DEFAULT) > 0)
+        hdf5_utils.removeLinkFromMasterPulseFile(file_id, IDS_link_name);
+    hdf5_utils.deleteIDSFile(IDS_file);
 }
 
 void HDF5Backend::endAction(Context * ctx)
