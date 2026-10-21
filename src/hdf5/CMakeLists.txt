@@ -119,6 +119,10 @@ al_add_hdf5_test(test_engine_write_read_string_512)
 # Span-table (Option B): list elements > 511B chunked across 512B slots,
 # recorded in the /list_spans dataset; backward-compatible with compact lists.
 al_add_hdf5_test(test_engine_write_read_list_spanned)
+# A WRITE engine on a file it did not create must drop /list_spans with the other tables,
+# and an APPEND into a file that never had one must create it: either way the alternative
+# is a long list element coming back wrong, silently.
+al_add_hdf5_test(test_engine_list_spans_over_write)
 al_add_hdf5_test(test_swmr_string_fixed_width)
 # Crash-safe commit ordering: reader guardrail against a dangling index row
 # (offset past the materialised data_raw_* extent — see PanzerDB::getLeaves).
@@ -165,6 +169,10 @@ al_add_hdf5_test(test_al_cic_string_slice)
 al_add_hdf5_test(test_al_dynamic_aos_nested_static_slice)
 al_add_hdf5_test(test_al_static_aos_signal_slice)
 al_add_hdf5_test(test_al_string_list_1d_slice)
+# A second ids_put() reuses the IDS file instead of truncating it, so the tables it drops have
+# to include the span table: otherwise the new list is read back with the element boundaries
+# of the previous put.
+al_add_hdf5_test(test_al_string_list_reput)
 
 # core IDS structures
 al_add_hdf5_test(test_al_core_profiles_put_get_slice)

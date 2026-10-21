@@ -1357,6 +1357,12 @@ private:
     }
 
     // ── Span-table private helpers ────────────────────────────────────────────
+    /**
+     * @brief Creates /list_spans unless this engine already holds it, throwing on failure.
+     * Called at a WRITE open and again by the first span that needs a table, so an APPEND
+     * into a file written before the table existed cannot lose its long list elements.
+     */
+    void ensureListSpansDataset();
     void appendListSpan(uint64_t row_id, uint64_t element_idx,
                         uint64_t slot_offset, uint64_t slot_span);
     void flushListSpans();

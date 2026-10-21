@@ -282,6 +282,13 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) H5Ldelete(file_id, "path_table", H5P_DEFAULT);
+        // Every dataset this branch recreates has to be in this list: a WRITE engine handed a
+        // loc_id does not truncate the file (only the by-name constructor does, H5F_ACC_TRUNC),
+        // so a name left here makes the create below fail and its rows come from the previous
+        // life of the file. For /list_spans that is silent corruption: the spans carry the
+        // element boundaries of a list, and row ids restart at 0, so the stale rows describe
+        // the new data.
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) H5Ldelete(file_id, "list_spans", H5P_DEFAULT);
 
         // A WRITE open throws the table away: anything parked for this file describes
         // rows that no longer exist, so it must not be resumed from.
@@ -372,18 +379,7 @@ void PanzerDB::init(OpenMode mode) {
         // Span-table dataset (u64, 1-D, unlimited, chunked): 4 u64s per entry
         // (row_id, element_idx, slot_offset, slot_span). Only written for list
         // elements exceeding STRING_MAX_LEN-1; empty dataset is fine.
-        {
-            hsize_t max[1]   = {H5S_UNLIMITED};
-            hsize_t init[1]  = {0};
-            hsize_t chunk[1] = {4096};   // 4096 u64 = 32 kB per chunk
-            hid_t sp  = H5Screate_simple(1, init, max);
-            hid_t pl  = H5Pcreate(H5P_DATASET_CREATE);
-            H5Pset_chunk(pl, 1, chunk);
-            list_spans_dset = H5Dcreate2(file_id, "list_spans", H5T_STD_U64LE, sp,
-                                          H5P_DEFAULT, pl, H5P_DEFAULT);
-            H5Pclose(pl);
-            H5Sclose(sp);
-        }
+        ensureListSpansDataset();
 
         // Optimized buffers
         index_buffer.reserve(chunk_config.index_chunk_rows * index_cols);
@@ -1146,8 +1142,35 @@ void PanzerDB::flush() {
 
 // ── Span-table helpers ─────────────────────────────────────────────────────────
 
+// The span table is not optional once a list element needs more than one slot: the spans ARE
+// its element boundaries. So it is created on demand rather than only at a WRITE open, which
+// leaves an APPEND into a file written before the table existed with nowhere to put them.
+// Chunked is not a tuning choice here: an unlimited extent cannot be contiguous.
+void PanzerDB::ensureListSpansDataset() {
+    if (list_spans_dset >= 0) return;
+
+    hsize_t max[1]   = {H5S_UNLIMITED};
+    hsize_t init[1]  = {0};
+    hsize_t chunk[1] = {4096};   // 4096 u64 = 32 kB per chunk
+    hid_t sp  = H5Screate_simple(1, init, max);
+    hid_t pl  = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(pl, 1, chunk);
+    list_spans_dset = H5Dcreate2(file_id, "list_spans", H5T_STD_U64LE, sp,
+                                  H5P_DEFAULT, pl, H5P_DEFAULT);
+    H5Pclose(pl);
+    H5Sclose(sp);
+
+    if (list_spans_dset < 0)
+        throw ALBackendException("Cannot create the /list_spans dataset: a list element longer "
+                                 "than one slot cannot be stored without it.", LOG);
+}
+
 void PanzerDB::appendListSpan(uint64_t row_id, uint64_t element_idx,
                                uint64_t slot_offset, uint64_t slot_span) {
+    // The producer of the buffer, and a write path that may report a failure -- unlike the
+    // flush, which can be reached from the destructor. A queued span therefore always has a
+    // table waiting for it.
+    ensureListSpansDataset();
     list_spans_buffer.push_back(row_id);
     list_spans_buffer.push_back(element_idx);
     list_spans_buffer.push_back(slot_offset);
@@ -1155,7 +1178,10 @@ void PanzerDB::appendListSpan(uint64_t row_id, uint64_t element_idx,
 }
 
 void PanzerDB::flushListSpans() {
-    if (list_spans_buffer.empty() || list_spans_dset < 0) return;
+    if (list_spans_buffer.empty()) return;
+    // Dropping them would be silent corruption, so it is not an option: they still have
+    // nowhere to go only if creating the table just failed, which is an error, not a no-op.
+    ensureListSpansDataset();
 
     hsize_t n_new = list_spans_buffer.size();
     hsize_t current_dims[1] = {0};

@@ -1425,10 +1425,76 @@ du harnais ne peut pas : il fait `FORCE_CREATE_PULSE`). `core_profiles.h5` **724
 `core_profiles` (plus aucune table à la racine), et `-m get-slice` relu en V1 : 20/20 appels sans `[FAILED]`
 (17 238 µs/appel — le chemin v1, pas une régression du v2).
 
-**Reste ouvert, non corrigé.** La liste des objets à supprimer en mode WRITE de `panzerdb.cpp`
-(l. 277-284) omet `list_spans`, alors que ce dataset est créé (l. 382) : un `PanzerDB(WRITE)` sur un fichier
-v2 **existant** qui en contient un échouerait dans `H5Dcreate2`. Non déclenché par les tests — qui recréent
-toujours leur fichier — et sans rapport avec la conversion, qui supprime le fichier entier.
+**Ce que ce point laissait ouvert.** La liste des objets à supprimer en mode WRITE de `panzerdb.cpp`
+omettait `list_spans`, alors que ce dataset est créé juste après : un `PanzerDB(WRITE)` posé sur un fichier v2
+**existant** qui en contient un échouait dans son `H5Dcreate2`. Sans rapport avec la conversion, qui supprime
+le fichier entier — mais le trou était réel sur le chemin du `ids_put()`, et sa conséquence n'est pas un échec :
+voir le point 27.
+
+## 27. `list_spans` survit à un second WRITE : ce sont les bornes d'éléments de la vie précédente qui collent (2026-10-20)
+
+**Le trou.** `PanzerDB::init(WRITE)` supprime les tables qu'il recrée quelques lignes plus bas — `index`,
+`data_raw_f64/i32/str/c128`, `paths`, `parent_paths`, `path_table` — et **`list_spans` manquait à la liste**,
+alors que la création de ce dataset n'était pas gardée : un `H5Dcreate2` dont personne ne regardait le retour.
+
+**Pourquoi rien ne le disait, ni dans le code ni dans `LastTest.log`.** Deux constructeurs, deux sorts. Celui
+qui prend un nom de fichier fait `H5Fcreate(..., H5F_ACC_TRUNC)` : le fichier est vide, il n'y a pas de
+collision. Celui qui prend un `loc_id` **réutilise** le fichier — et c'est celui de l'AL :
+`HDF5Writer_v2::setWriteStrategy` construit un `PanzerDB(loc_id, WRITE, true, false)` sur le fichier IDS que
+`HDF5Writer` a **ouvert**, pas créé. Aucun test ne rouvrait un fichier en WRITE, donc le `H5Dcreate2` raté n'a
+jamais été atteint avant qu'on écrive le test de reproduction.
+
+**La chaîne, et pourquoi elle rend du faux au lieu de échouer.**
+1. `H5Dcreate2` sur un nom déjà pris échoue — diag HDF5 : `H5Lint.c line 524 in H5L__link_cb(): name already
+   exists` — et `list_spans_dset` reste à `-1`.
+2. `flushListSpans()` commençait par `if (list_spans_buffer.empty() || list_spans_dset < 0) return;` : les
+   lignes neuves sont jetées sans un mot.
+3. La table de la vie précédente, elle, est toujours sur le disque. `loadListSpans()` la recharge dans
+   `cached_list_spans`, **clé = `row_id`**.
+4. Les `row_id` repartent de 0 après la troncature des autres tables : les lignes périmées décrivent donc les
+   nouvelles données, avec les bornes des anciens éléments.
+
+Mesuré avant correctif : après la réécriture, l'élément 0 revient en 511 caractères et l'élément 1 en 393 —
+`stuvwxyz{bcdefghijklmnop...` — là où le fichier porte `tiny`. Des valeurs de la bonne taille, donc **rien ne
+les dénonce** : ce n'est pas une troncature, c'est une corruption.
+
+**Le jumeau : APPEND dans un fichier qui n'a jamais eu de table.** L'ouverture APPEND n'ouvrait `list_spans`
+que si elle existait. Un pulse écrit avant l'Option B, auquel on ajoute par `put_slice` un élément de plus de
+511 caractères : l'élément est posé sur un seul slot de 512 o et **aucune ligne de spans n'est produite**. À la
+lecture, faute de bornes, chaque slot devient un élément : 3 éléments dont un sur 3 slots remontent en
+`[5 x 512]`. Silencieusement, là encore.
+
+**Le correctif.**
+- La liste de suppression gagne `list_spans`, avec l'invariant écrit à côté : *tout dataset que cette branche
+  recrée doit s'y trouver*, parce qu'un moteur WRITE reçu par `loc_id` ne tronque pas le fichier.
+- La création est sortie dans `ensureListSpansDataset()` — extent illimité **chunké** à 4096, `contiguous +
+  illimité` étant une erreur HDF5 — appelée à l'ouverture WRITE, dans `appendListSpan()` **et** dans
+  `flushListSpans()`. La table apparaît donc d'elle-même sur un APPEND legacy.
+- Un `H5Dcreate2` qui échoue lève une `ALBackendException` au lieu de laisser un handle `-1` derrière lui. Le
+  message porte le pourquoi : sans cette table, un élément plus long qu'un slot ne peut pas être stocké. La
+  création côté producteur est délibérée : le flush est atteignable depuis le destructeur, ce n'est pas un
+  endroit où l'on peut rapporter une erreur.
+
+**Deux tests** (`ctest` **96/96**, 94 + 2) :
+- `test_engine_list_spans_over_write` : trois vies d'un même fichier. A, premier WRITE dans un groupe enfant ;
+  B, second WRITE sur le même fichier avec une autre liste — **même nombre de lignes de spans mais bornes
+  différentes**, donc seul le contenu des bornes peut départager les deux vies (un slice enregistrant une ligne
+  par élément dès que l'un déborde, le nombre de lignes ne suffit pas) ; C, `H5Ldelete` de la table pour simuler
+  un fichier legacy, puis APPEND.
+- `test_al_string_list_reput` : le chemin réel de l'AL, deux `ids_put()` GLOBAL sur le même IDS
+  (`coordinate_system/coordinate/value_labels`), l'élément long déplacé de la position 1 à la 0, relecture par
+  l'AL entre les deux.
+
+**Non-vacuité, mesurée.** Retirer le `H5Ldelete` fait tomber les deux tests. Retirer `ensureListSpansDataset()`
+des **deux** appelants ne casse que la phase C — `slice 1 came back as 2D [5 x 512], expected 2D [3 x ...]`, et
+la table vide là où il fallait `0:3 1:1 2:1` — pendant que A et B passent et que le test AL reste vert (son
+WRITE crée la table à l'ouverture) ; le retirer d'un seul des deux ne prouve rien, l'autre rattrape. Le test
+moteur compte aussi une exception comme un échec : puisque le correctif peut jeter, un `main()` sans `catch`
+transformait le sabotage en `SIGABRT` (RC 134) au lieu d'un diagnostic lisible.
+
+**À savoir pour un fichier existant.** Un pulse v2 réécrit en place ne conserve plus la `list_spans` de la vie
+précédente. C'est ce qu'un WRITE doit faire, mais quiconque comparait deux états successifs du même fichier
+voyait l'ancienne table.
 
 
 
