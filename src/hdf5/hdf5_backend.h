@@ -22,6 +22,8 @@
 #include <memory>
 #include <vector>
 #include <list>
+#include <set>
+#include <string>
 
 #include "data_interpolation.h"
 
@@ -56,27 +58,37 @@ class HDF5Backend:public Backend {
     int access_mode;   // The mode passed to openPulse(); selects reader vs writer paths.
     int files_path_strategy;   // Pulse directory layout (always MODIFIED_MDSPLUS_STRATEGY here).
 
-    // A v2 pulse opened while the target version is 1.0 is a conversion, not an edit.
-    // conversion_to_v1_ says this session was accepted as one (getVersion decides that);
-    // conversion_applied_ says its v2 storage has already been dropped, so that happens
-    // once per session and only under an actual write.
+    // A session whose target version does not match the layout on disk is a rewrite, not an
+    // edit: one layout has to be erased before the other is laid down. conversion_to_v1_ says a
+    // v2 pulse was accepted for a 1.0 rewrite, upgrade_to_v2_ says a v1 pulse was accepted for a
+    // 2.0 one -- getVersion decides both, each under its own environment switch.
+    // storage_rewritten_ then says the master file has to carry the new label at closePulse():
+    // an IDS file is annotated by whoever creates it, but only the master's label picks the
+    // reader of the next open.
     bool conversion_to_v1_ = false;
-    bool conversion_applied_ = false;
+    bool upgrade_to_v2_ = false;
+    bool storage_rewritten_ = false;
+    // The drop is per IDS file, not per session: a session may rewrite several IDS of one pulse,
+    // and each of their files has to be erased once. Doing it once in total would leave the
+    // second file holding both layouts.
+    std::set < std::string > rewritten_IDS_;
 
     /**
-     * @brief Removes everything the v2 layout put in one IDS, so the v1 writer can lay it
-     *        down from scratch.
+     * @brief Erases one IDS file so the writer can lay the other layout down from scratch.
      * @param ctx The write operation about to start (names the IDS).
-     * @note Runs before the event handler opens the IDS file for that operation: the v1
-     *       writer then creates the file, its external link and its "1.0" header itself
-     *       (HDF5Writer::create_IDS_group), instead of adding classic datasets next to the
-     *       v2 tables -- which would leave a file holding both layouts.
-     * @note Deleting the file rather than unlinking its tables is deliberate: HDF5 hands no
-     *       space back, so an emptied v2 file would keep its v2 size, which is exactly what
-     *       a conversion is meant to measure.
-     * @note Releases the v2 read session first -- it holds handles on the objects going away.
+     * @note Called for the first write of an IDS in a session whose layout differs from the one
+     *       on disk, in either direction (v2 -> v1 and v1 -> v2). Runs before the event handler
+     *       opens the IDS file for that operation, so the writer -- v1 or v2 -- creates the file,
+     *       its external link and its own version header itself
+     *       (HDF5Writer::create_IDS_group) instead of adding its datasets next to the previous
+     *       layout's, which would leave a file holding both.
+     * @note Deleting the file rather than unlinking its objects is deliberate: HDF5 hands no
+     *       space back, so an emptied file would keep the size of the layout it is leaving,
+     *       which is exactly what a conversion is meant to measure.
+     * @note Releases the read session first -- the v2 one keeps an engine and its handles alive
+     *       across operations, and they point at the objects about to go away.
      */
-    void dropIDSStorageForConversion(OperationContext *ctx);
+    void dropIDSStorageForRewrite(OperationContext *ctx);
     /**
      * @brief Parses a "major.minor" version string.
      * @param versionStr Text to parse.

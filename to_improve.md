@@ -1496,5 +1496,85 @@ transformait le sabotage en `SIGABRT` (RC 134) au lieu d'un diagnostic lisible.
 précédente. C'est ce qu'un WRITE doit faire, mais quiconque comparait deux états successifs du même fichier
 voyait l'ancienne table.
 
+## 28. Convertir un pulse 1.0 en 2.0 : le `master.h5` restait « 1.0 » et le fichier gardait ses datasets v1 (2026-10-21)
+
+**Le signal.** Un pulse v1 réécrit avec une cible 2.0 sous `BACKEND_ALLOW_AUTO_UPGRADE=true` restait étiqueté
+« 1.0 » dans `master.h5`. Le rapport est exact, mais l'étiquette n'était que la partie visible : le fichier IDS,
+lui, se retrouvait à porter **les deux layouts à la fois**.
+
+**Ce que la branche upgrade faisait réellement.** `HDF5Backend::getVersion(ctx)` y posait `writerVersion` et
+`versionToReturn` — deux locales **mortes**. Les cas `open_pulse`/`force_open_pulse` du `switch` tombent, sans
+`break`, dans le cas `create_pulse`, qui fait `return getTargetVersion()` ; le `if (!masterFileAlreadyOpened)`
+qui installe l'écrivain n'est donc pas atteint. L'écrivain vient en réalité du constructeur
+(`createBackendComponents(getVersion())` → déjà la cible), et seul le lecteur est ré-instancié depuis la version
+physique plus haut dans la fonction. Autrement dit : **la branche upgrade n'armait rien du tout**. Ce qui existait,
+c'est seulement le refus quand le flag est éteint.
+
+**La chaîne, une fois la permission accordée.**
+1. **Rien n'est effacé.** `beginAction()` ne déclenchait l'effacement que sous `conversion_to_v1_`. L'écrivain v2
+   pose `index`, `path_table`, `data_raw_*` **dans le groupe du nom de l'IDS**, là où sont déjà `core_profiles/time`
+   et `core_profiles/profiles_1d[]&signal_1d` — les deux générations rangent tout dans ce groupe. Fichier hybride.
+2. **Le fichier IDS garde son en-tête « 1.0 »** : `HDF5Writer::create_IDS_group` l'écrit à la création, `openIDSFile`
+   ne le réécrit jamais sur un fichier existant.
+3. **`master.h5` n'est pas ré-étiqueté** : `closePulse()` n'appelait `rewriteHeaderVersion()` que sous
+   `conversion_applied_`, c'est-à-dire dans l'autre sens seulement.
+
+Observable à l'open suivant : cet attribut est ce que `HDF5Utils::openPulse()` lit pour **choisir le lecteur**, donc
+le pulse repart en lecteur v1 sur des datasets v1 restés intacts — il relit l'ancien pulse et **ne voit jamais ce que
+l'upgrade vient d'écrire**. Et sans `BACKEND_ALLOW_AUTO_UPGRADE`, le même open **jette** : le fichier est refusé pour
+l'étiquette qu'il porte lui-même.
+
+**Le correctif est le symétrique du point 26**, avec les mêmes mécanismes :
+- `getVersion()` arme `upgrade_to_v2_` dans sa branche upgrade — sous `BACKEND_ALLOW_AUTO_UPGRADE`, qui reste le seul
+  gate : il n'a pas été question d'ajouter un deuxième switch pour le sens 1.0 → 2.0.
+- `conversion_applied_` devient `storage_rewritten_` et porte les deux sens : « cette session a réellement posé un
+  layout que le master n'annonce pas ». `closePulse()` ré-étiquette alors avec `getTargetVersion()` et non un littéral
+  « 1.0 », puisque la cible peut être 2.0. Toujours **uniquement si la session a écrit** : une session qui a seulement
+  lu un pulse v1 avec une cible 2.0 laisse les deux fichiers intacts.
+- `dropIDSStorageForConversion()` devient `dropIDSStorageForRewrite()`, appelée pour la première écriture de chaque
+  IDS dans une session dont le layout diffère de celui du disque — dans un sens comme dans l'autre. Le fichier part
+  (lien externe + fichier), et l'écrivain — v2 ici — le recrée avec son lien et son propre en-tête.
+
+**L'effacement devient par IDS, pas par session.** L'appel était gardé par `!conversion_applied_` : une seule fois par
+session, donc un second IDS du même pulse gardait ses deux layouts. C'était déjà vrai en v2 → v1 ; le trou est fermé
+pour les deux directions d'un coup (`rewritten_IDS_`, inséré avant toute décision pour que l'échec d'un IDS n'amène
+pas l'autre deux fois).
+
+**Test ajouté** : `test_al_upgrade_v1_to_v2` (`ctest` **97/97**, 96 + 1), miroir de `test_al_convert_v2_to_v1`. Il écrit
+le pulse en v1, vérifie les étiquettes « 1.0 » **sur le master et sur le fichier IDS** et la présence des datasets v1
+avec leurs formes ({3} et {3,10}) ; refuse l'ouverture en cible 2.0 **sans** le flag et vérifie qu'un refus ne touche
+rien ; puis avec le flag réécrit tout l'IDS en un seul GLOBAL put et vérifie : étiquettes « 2.0 » sur les deux fichiers,
+tables v2 présentes, datasets v1 **disparus**, puis réouverture **sans** le flag — `getVersion()` ne doit plus jeter, et
+les trois tranches se relisent par l'AL à leurs valeurs. Comme au point 26, l'état d'avant n'est pas lu par l'AL
+(chemin v1 non maintenu : 14 `test_al_*` sur 53 échouent en cible 1.0, deux en SEGFAULT) mais par l'API HDF5, ce qui
+est de toute façon la seule façon de voir que les datasets ont bien disparu.
+
+**Non-vacuité, mesurée.** Deux sabotages, chacun sur une moitié du correctif :
+- Ré-étiquette re-greffée sur `conversion_to_v1_` seule → phase 3 : `master file now labelled 1.0, IDS file 2.0`,
+  RC 1. C'est exactement le bug rapporté.
+- Effacement neutralisé (la fonction s'arrête après sa comptabilité, l'étiquette suit) → phase 3 déjà :
+  `master file now labelled 2.0, IDS file 1.0`, RC 1. Le fichier hybride est donc dénoncé par les étiquettes avant
+  d'atteindre la phase qui compare les objets — prévu « phase 4 », tombé plus tôt ; la phase 4 reste là pour le cas
+  où l'étiquette du fichier IDS suivrait quand même.
+
+Après restauration : aucune marque de sabotage dans le source, et les 97 tests repassent. Le renommage
+`conversion_applied_` → `storage_rewritten_` ne casse pas `test_al_convert_v2_to_v1`.
+
+**Ce que le test a appris sur le format, en premier lieu.** Sa première exécution échouait phase 4 sur
+`core_profiles/paths` absent. `h5ls -r` sur le fichier produit montre le layout courant : `index`, `path_table`,
+`data_raw_{f64,i32,str,c128}`, `list_spans` — **sous `/core_profiles`**, jamais à la racine. `paths` n'est plus
+matérialisé dans un fichier neuf (M1 : `parent_paths` reconstruit à la lecture ; `panzerdb.cpp:374-377` laisse le
+handle invalide en WRITE et ne le relit que pour un fichier legacy — d'où sa présence dans la liste de suppression
+des lignes 282-283). Deux conséquences, volontairement laissées hors de ce point :
+`test_al_convert_v2_to_v1` vérifie l'absence des tables v2 avec `H5Lexists(f, "index")` et consorts, donc **à la
+racine** du fichier IDS et sous des noms qui n'y ont jamais été — cette vérification est vacuement vraie, et le
+harnais du point 26 mesurait la même chose sans la nommer (« racine du fichier IDS réduite au groupe
+`core_profiles` ») ; l'effacement, lui, supprime le fichier entier, il n'était pas concerné.
+
+**Ce qui reste ouvert sur cette fonction.** Le `switch` de `getVersion(ctx)` n'a toujours pas de `break` entre
+`open_pulse`/`force_open_pulse` et `create_pulse` (noté dans l'en-tête). Inoffensif tant que le constructeur installe
+l'écrivain de la cible, mais dès que `access_mode` n'est aucun des quatre modes pulse, la fonction retourne
+`versionToReturn` sans l'avoir jamais écrit.
+
 
 

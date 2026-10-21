@@ -231,6 +231,10 @@ al_add_hdf5_test(test_al_slice_write_after_foreign_append)
 # The v2 -> v1 conversion switch (BACKEND_HDF5_FORCE_CONVERSION_TO_V1): the lock must stay
 # when it is off, and the converted pulse must read back as a plain v1 pulse when it is on.
 al_add_hdf5_test(test_al_convert_v2_to_v1)
+# The other direction (BACKEND_ALLOW_AUTO_UPGRADE): rewriting a v1 pulse with a 2.0 target has to
+# drop the v1 datasets and re-annotate master.h5, or the next open reads a "1.0" label and hands
+# the pulse to the v1 reader -- which never sees what the upgrade wrote.
+al_add_hdf5_test(test_al_upgrade_v1_to_v2)
 # Global read of a 1-slice scalar time series must stay 1D(1) (AL convention,
 # to_improve.md point 3); static scalars must remain 0D.
 al_add_hdf5_test(test_al_global_code_output_1slice)
