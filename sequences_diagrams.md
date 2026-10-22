@@ -1,357 +1,380 @@
-# PanzerDB — Stratégies de récupération des données (diagrammes de séquence)
+# PanzerDB (HDF5 backend v2) — sequence diagrams of the five high-level verbs
 
-> Source : `src/hdf5/` de IMAS-Core (backend v2). Le `PanzerDB` (moteur) est la couche
-> de storage ; les **stratégies** (`GlobalReadStrategy`, `SliceReadStrategy`,
-> `TimeRangeReadStrategy`) encapsulent les différents patterns de lecture ;
-> l'**API d'accès direct** (`imas::direct_access`) contourne les stratégies et
-> adresse `PanzerDB` directement.
-
----
-
-## 1. Vue architecturale globale
-
-```
-IMAS (client)
-   │
-   ▼
-ALBackend::readData(ctx, field, timebase, data, datatype, dim, size)
-   │
-   ▼
-HDF5Backend::readData  (hdf5_backend.cpp:218)
-   │
-   ▼
-HDF5Reader_v2::read_ND_Data  (hdf5_reader_v2.cpp:113)
-   │
-   │  prepare_strategy(ctx) → select_strategy(ctx->getRangemode())
-   │
-   ├──────────────────────┬──────────────────────┐
-   ▼                      ▼                      ▼
-GlobalReadStrategy   SliceReadStrategy   TimeRangeReadStrategy
- (GLOBAL_OP)          (SLICE_OP)          (TIMERANGE_OP)
-   │                      │                      │
-   └──────────────────────┼──────────────────────┘
-                          ▼
-                    PanzerDB (moteur)
-              getLeaves  /  readTensor  /  readSliceDirect
-              readLeavesUnion  /  readInterpolatedData  /  readDataByIndex
-                          │
-                          ▼
-              HDF5 (H5Dread, H5S_SELECT_SET / H5S_SELECT_OR)
-```
+> `put()`, `get()`, `put_slice()`, `get_slice()`, `getSample()` as they reach
+> `src/hdf5/`. **Only public interface operations appear as arrows**: the `Backend`
+> pure virtuals (`include/al_backend.h`), the public methods of `HDF5Writer_v2`,
+> `HDF5Reader_v2` and `PanzerDB`, and the three `IReadStrategy` virtuals. Internal
+> helpers (`prepare_strategy`, `select_strategy`, `writeDataSlicesImpl`,
+> `read_dataset_globally`, `restoreTimeContext`, …) appear as notes only, because they
+> are not what a caller or a new backend has to implement.
+>
+> No raw HDF5 call (`H5Dread`, `H5Sselect_hyperslab`) is shown either — the point of
+> these diagrams is the contract between the four public layers, not where the bytes
+> land. Verified against `13ad876` (2026-10-22).
 
 ---
 
-## 2. Sélection de stratégie (factory)
+## 1. Who is who
 
-`HDF5Reader_v2::select_strategy` (hdf5_reader_v2.cpp:64–84) choisit selon
-`OperationContext::getRangemode()`, posé par la couche IMAS :
-
-| Rangemode IMAS | Stratégie instanciée | Cas d'usage |
+| Participant | What it is | Public surface used below |
 |---|---|---|
-| `GLOBAL_OP` | `GlobalReadStrategy` | Lecture d'un nœud en complet (toutes les tranches temporelles) |
-| `SLICE_OP` | `SliceReadStrategy` | Lecture d'**une** tranche temporelle demandée |
-| `TIMERANGE_OP` | `TimeRangeReadStrategy` | Lecture sur une **plage** temporelle avec éventuellement rééchantillonnage |
+| **Caller** | the IMAS high-level layer (`ids_put` / `ids_get` / `ids_put_slice` / `ids_get_slice` / `ids_getSample`) | the AL verbs |
+| **AL low-level verbs** | `include/al_lowlevel.h:268-491` | `al_begin_dataentry_action`, `al_begin_global_action`, `al_begin_slice_action`, `al_begin_timerange_action`, `al_begin_arraystruct_action`, `al_write_data`, `al_read_data`, `al_end_action`, `al_close_pulse` |
+| **HDF5Backend** | `src/hdf5/hdf5_backend.cpp`, concrete `Backend` | `openPulse:184`, `beginAction:282`, `writeData:250`, `readData:255`, `beginWriteArraystructAction:270`, `beginReadArraystructAction:277`, `endAction:330`, `closePulse:225` |
+| **HDF5Writer_v2 / HDF5Reader_v2** | the v2 write and read sessions | `setWriteStrategy`, `write_ND_Data`, `beginWriteArraystructAction`, `endAction`, `closePulse`, `deleteData` / `open_IDS_group`, `read_ND_Data`, `beginReadArraystructAction`, `endAction`, `release_session` |
+| **PanzerDB** | the storage engine | `beginArray`, `endArray`, `writeData`, `writeDataSlices`, `writeMetadata`, `flush`, `close`, `reanchor`, `getLeaves`, `getAOSShape`, `getWholeDynamicSignal`, `readMetadata`, `readInterpolatedData`, `readLeavesUnion`, `readTensor` |
+| **DataInterpolation** | shared AL time-interpolation component (`include/data_interpolation.h`) | `getTimeRangeIndices`, `resample_timebasis`, `interpolate`, `interpolate_with_resampling` |
 
-Les stratégies sont en cache membres (instanciées une fois, reset dans
-`open_IDS_group`, hdf5_reader_v2.cpp:41–46).
+`DataInterpolation` is there because the backend declares itself interpolation-capable
+(`supportsTimeDataInterpolation` / `supportsTimeRangeOperation`), which makes the AL
+install the component at backend creation (`src/al_backend.cpp:88-89`).
+
+### Which verb becomes which call
+
+| AL verb | `Backend` virtual | Where it goes in v2 |
+|---|---|---|
+| `al_begin_dataentry_action` (`:268`) | `openPulse` (`al_backend.h:66`) | `hdf5_backend.cpp:184` — the label in `master.h5` picks the v1 or v2 reader/writer |
+| `al_begin_global_action` (`:477`) | `beginAction` (`:87`) | `GLOBAL_OP`: `create_IDS_group` + `setWriteStrategy(GLOBAL_OP)` (`hdf5_events_handler.cpp:24-25`) for a write, `open_IDS_group` (`:67`) for a read |
+| `al_begin_slice_action` (`:479`) | `beginAction` (`:87`) | `SLICE_OP`: `open_IDS_group` + `setWriteStrategy(SLICE_OP)` (`:34-35`) for a write, `open_IDS_group` (`:67`) for a read |
+| `al_begin_timerange_action` (`:481`) | `beginAction` (`:87`) | `TIMERANGE_OP`, reads only: `open_IDS_group` (`:67`) |
+| `al_begin_arraystruct_action` (`:485`) | `beginArraystructAction` (`:164`) | `hdf5_backend.cpp:270` (write) / `:277` (read) |
+| `al_write_data` (`:489`) | `writeData` (`:113`) | `HDF5Writer_v2::write_ND_Data` (`hdf5_backend.cpp:252`) |
+| `al_read_data` (`:487`) | `readData` (`:138`) | `HDF5Reader_v2::read_ND_Data` (`hdf5_backend.cpp:258`) |
+| `al_end_action` (`:483`) | `endAction` (`:95`) | `hdf5_backend.cpp:330` → the events handler routes it to the writer (`hdf5_events_handler.cpp:79`/`:89`) or the reader (`:81`/`:96`), then `close_group` (`:91`/`:98`) |
+| `al_close_pulse` (`:279`) | `closePulse` (`:78`) | `hdf5_backend.cpp:225` → reader `:242` or writer `:244` |
+
+`al_delete_data` (`:422`) is not one of the five verbs but follows the same shape:
+`Backend::deleteData` → `HDF5Writer_v2::deleteData` (`hdf5_writer_v2.cpp:499`), which
+releases the engine first because the base class is about to unlink the datasets that
+engine holds handles on.
 
 ---
 
-## 3. Diagrammes de séquence
+## 2. The five verbs
 
-Légende participants :
-- **Client** — application IMAS ou outil externe
-- **BE** — `HDF5Backend` / `HDF5Reader_v2`
-- **STRAT** — la stratégie courante (`IReadStrategy` dérivée)
-- **PZDB** — `PanzerDB` (moteur)
-- **HDF5** — runtime HDF5 (`H5Dread`, `H5Sselect_*`)
+### 2.1 `put()` — `GLOBAL_OP` write
 
-### 3.1 GLOBAL_OP — GlobalReadStrategy
-
-Lecture d'un nœud complet (toutes les tranches).
+One fresh `PanzerDB(WRITE)` engine for the whole IDS; everything the AL writes goes
+through `write_ND_Data`, and the file is finished when the action ends.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client
+    participant C as Caller
+    participant AL as AL low-level verbs
     participant BE as HDF5Backend
-    participant STRAT as GlobalReadStrategy
-    participant PZDB as PanzerDB
-    participant HDF5
+    participant W2 as HDF5Writer_v2
+    participant PZ as PanzerDB
 
-    Client->>BE : readData(ctx GLOBAL_OP, field, …)
-    BE->>STRAT : read_ND_Data(ctx, field, timebase, …)
-    Note over STRAT : read_dataset_globally(ctx, field,…)<br/>(iread_strategy.h:795)
-    STRAT->>PZDB : readMetadata(path)
-    STRAT->>PZDB : getLeaves()
-    PZDB->>HDF5 : H5Dget_space(/index)
-    PZDB->>HDF5 : H5Dread(/index)
-    PZDB->>HDF5 : H5Dread(/paths)
-    PZDB-->>STRAT : vector<Leaf> (+ parent_path reconstruit)
+    C->>AL: al_begin_dataentry_action(uri, FORCE_CREATE_PULSE)
+    AL->>BE: openPulse(ctx, mode)
+    Note over BE: hdf5_backend.cpp:184 — reads the pulse label, picks the backend<br/>generation, creates the pulse
 
-    alt STRING
-        STRAT->>PZDB : readTensor<std::string>(leaf, out)
-        PZDB->>HDF5 : H5Dread(data_raw_str)
-    end
+    C->>AL: al_begin_global_action(pctx, "core_profiles", "", WRITE_OP)
+    AL->>BE: beginAction(opCtx)
+    BE->>BE: eventsHandler->beginAction(opCtx, …)
+    BE->>W2: create_IDS_group(opCtx, …)
+    BE->>W2: setWriteStrategy(opCtx, GLOBAL_OP, loc_id)
+    W2->>PZ: PanzerDB(loc_id, WRITE)
+    Note over W2: hdf5_writer_v2.cpp:91 then :99-100 — a GLOBAL_OP write always<br/>builds a fresh engine and drops the previous one. The @key map<br/>scraped from IDSDef.xml is built once here.
 
-    opt FLOAT64/INT32/COMPLEX128
-        STRAT->>PZDB : readLeavesUnion(sorted_leaves, out, dtype)
-        Note over PZDB : offsets monotones ?<br/>H5Dget_space + H5Sselect_none + H5Sselect_hyperslab(OR) ×N<br/>+ H5Dread
-        PZDB->>HDF5 : H5Dread(data_raw_*)
-    end
-
-    PZDB-->>STRAT : data
-    STRAT-->>BE : 0
-    BE-->>Client : 0
-```
-
-### 3.2 SLICE_OP — SliceReadStrategy
-
-Lecture d'une tranche temporelle demandée ; résout l'indice de slice via
-`getTimeIndex` (base temps) puis interpole si nécessaire.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant BE as HDF5Backend
-    participant STRAT as SliceReadStrategy
-    participant PZDB as PanzerDB
-    participant HDF5
-
-    rect rgb(230,240,255)
-    Note over STRAT : beginReadArraystructAction (size de AoS)
-    BE->>STRAT : beginReadArraystructAction(arrctx, &size)
-    STRAT->>PZDB : readScalar<int32_t>("ids_properties&homogeneous_time")
-    STRAT->>PZDB : getTimeIndex(timebase, requested_time, mode)
-    STRAT->>PZDB : getAOSShape(aos_path)
-    PZDB-->>STRAT : size
-    end
-
-    rect rgb(255,245,230)
-    STRAT->>PZDB : readMetadata(full_path)
-    STRAT->>PZDB : readInterpolatedData(cpath, time, basis, mode, dt, &ndim, shape, &data, expect_time)
-
-    rect rgb(245,245,245)
-    Note over PZDB : readInterpolatedData (panzerdb.cpp:2957)
-    PZDB->>PZDB : getSlicesTimesIndices(...) → nearestAvailableSliceIndex(…)
-    PZDB->>PZDB : read_slice_at(path, t, type)
-    alt FLOAT64/INT32/COMPLEX128
-        PZDB->>PZDB : readDataByIndex(path, t, ndim, shape, &buf)
-    end
-    end
-
-    rect rgb(230,255,235)
-    Note over PZDB,HDF5 : readDataByIndex / readSliceDirect
-    alt time_index == -1  (statique / agrégation)
-        PZDB->>PZDB : readTensor(leaf, buf)  /  readLeavesUnion(...)
-        PZDB->>HDF5 : H5Dread(data_raw_*)
-    else time_index ≥ 0     (une slice dynamique)
-        PZDB->>PZDB : isTimeInLeaf(leaf, t)
-        PZDB->>HDF5 : H5Dget_space(data_raw_*)
-        PZDB->>HDF5 : H5Sselect_hyperslab(SET, off, cnt)
-        PZDB->>HDF5 : H5Dread(data_raw_*)
-    end
-    end
-
-    PZDB-->>STRAT : data
-    STRAT-->>BE : 0
-    BE-->>Client : 0
-    end
-```
-
-### 3.3 TIMERANGE_OP — TimeRangeReadStrategy
-
-Lecture sur une plage `[tmin, tmax]`, avec éventuellement rééchantillonnage
-(`resample_timebasis`) et interpolation linéaire si demandé.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant BE as HDF5Backend
-    participant STRAT as TimeRangeReadStrategy
-    participant PZDB as PanzerDB
-    participant Intp as DataInterpolation
-    participant HDF5
-
-    rect rgb(230,240,255)
-    Note over STRAT : beginReadArraystructAction
-    BE->>STRAT : beginReadArraystructAction(arrctx, &size)
-    STRAT->>PZDB : readScalar<int32_t>("ids_properties&homogeneous_time")
-    STRAT->>PZDB : getWholeDynamicSignal(timebase)  // vecteur temps
-    PZDB->>PZDB : for each leaf in getLeaves() : readTensor
-    PZDB->>HDF5 : H5Dread(data_raw_f64)
-    STRAT->>Intp : getTimeRangeIndices(tmin,tmax,dt, time_basis, &tmin_idx,&tmax_idx,&size, method)
-    end
-
-    rect rgb(255,245,230)
-    STRAT->>STRAT : read_ND_Data(ctx, field, …)
-    alt static (non temps-dépendant)
-        STRAT->>STRAT : read_dataset_globally(…)
-        STRAT->>PZDB : readTensor / readLeavesUnion
-        PZDB->>HDF5 : H5Dread(data_raw_*)
-    else dynamique numérique (chemin chaud)
-        Note over STRAT : probe la slice t[0] pour dimensionner
-        STRAT->>PZDB : readInterpolatedData(path, t[0], basis, mode, dt, &ndim0, shape0, &probe, true)
-        loop k = 0..K-1
-            STRAT->>PZDB : readInterpolatedData(path, t[k], basis, mode, dt, &ndim, shape, &buf, true)
-            PZDB->>PZDB : getSlicesTimesIndices → nearestAvailableSliceIndex → readDataByIndex
-            PZDB->>HDF5 : H5Dread(data_raw_*)
-            PZDB-->>STRAT : buf[k]
+    loop once per node of the IDS
+        C->>AL: al_write_data(octx, field, timebase, data, type, dim, size)
+        AL->>BE: writeData(ctx, field, timebase, …)
+        BE->>W2: write_ND_Data(ctx, field, timebase, …)
+        Note over W2: hdf5_writer_v2.cpp:195 — '/' becomes '&'; the timebase decides<br/>the branch, and the schema replay adds the @key leaves
+        alt node with no timebase (static)
+            W2->>PZ: writeData(name, shape, data)
+        else node with a timebase (time-dependent)
+            W2->>PZ: writeDataSlices(name, shape, data, …)
         end
-    else dynamique non-numérique
-        STRAT->>STRAT : read_dataset_globally(…)
-        PZDB->>HDF5 : H5Dread(data_raw_*)
-        STRAT->>Intp : interpolate_with_resampling(…)
+        opt the node has schema attributes
+            W2->>PZ: writeMetadata(path + "@" + key, value)
+        end
     end
+
+    opt the node sits inside an array of structures
+        C->>AL: al_begin_arraystruct_action(octx, path, timebase, size)
+        AL->>BE: beginArraystructAction(aosCtx, size)
+        BE->>W2: beginWriteArraystructAction(aosCtx, size)
+        W2->>PZ: beginArray(name, size) — static AoS
+        W2->>PZ: beginArray(name, timebase) — dynamic AoS
+        Note over W2,PZ: a dynamic AoS takes its size from the timebase, a static one<br/>from the caller. An empty AoS never reaches this call<br/>(hdf5_backend.cpp:272).
     end
+
+    C->>AL: al_end_action(octxID)
+    AL->>BE: endAction(opCtx)
+    BE->>W2: endAction(opCtx)
+    W2->>PZ: endArray() — once per open AoS level
+    W2->>PZ: flush() — the commit point
+    W2->>PZ: close()
+    Note over W2,PZ: hdf5_writer_v2.cpp:475 flushes, then :482 closes because the mode<br/>is WRITE. A put() leaves a finished file behind.
+
+    C->>AL: al_close_pulse(pctx, CLOSE_PULSE)
+    AL->>BE: closePulse(ctx, mode)
+    BE->>W2: closePulse(ctx, mode, …)
+    Note over BE: a session that rewrote the layout re-labels master.h5 here<br/>(hdf5_backend.cpp:238) so the next open picks the right reader
 ```
 
-### 3.4 Accès direct (`imas::direct_access`) — contourne les stratégies
+### 2.2 `get()` — `GLOBAL_OP` read
 
-API de bas niveau, sans `HDF5Backend` ni `IReadStrategy`. Ouvre son propre
-`PanzerDB`, résout le type, et lit via `readDataByIndex` (ou variantes
-typées).
+The whole node, every time slice. The read session keeps one engine for the whole
+session, so the second `get()` on the same pulse does not re-decode `/index`.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant User as User/API
-    participant DAPI as imas::direct_access
-    participant PZDB as PanzerDB
-    participant HDF5
+    participant C as Caller
+    participant AL as AL low-level verbs
+    participant BE as HDF5Backend
+    participant R2 as HDF5Reader_v2
+    participant PZ as PanzerDB
 
-    User->>DAPI : read_tensor(ids_name, "profiles_1d/ion/temperature")
-    Note over DAPI : direct_access_api.cpp:503
-    DAPI->>PZDB : readMetadata(instance_path)
-    DAPI->>PZDB : getLeafType(path)
-    PZDB-->>DAPI : DataType
-    DAPI->>PZDB : getAOSShape(aos_path) / getDynamicAOSSize(aos_path)
+    C->>AL: al_begin_dataentry_action(uri, OPEN_PULSE)
+    AL->>BE: openPulse(ctx, mode)
+    Note over BE: hdf5_backend.cpp:184 — the label decides the reader
 
-    DAPI->>DAPI : read_typed_tensor<T>(…) → readDataByIndex (variante type)
-    DAPI->>PZDB : readDataByIndex(full_path, time_index, &ndim, shape, &data)
-    PZDB->>PZDB : time_index == -1 ? readTensor : readSliceDirect
-    PZDB->>HDF5 : H5Dget_space / H5Sselect_hyperslab / H5Dread
-    PZDB-->>DAPI : data
-    DAPI-->>User : TensorView
+    C->>AL: al_begin_global_action(pctx, "core_profiles", "", READ_OP)
+    AL->>BE: beginAction(opCtx)
+    BE->>BE: eventsHandler->beginAction(opCtx, …)
+    BE->>R2: open_IDS_group(opCtx, file_id, …)
+    Note over R2: hdf5_reader_v2.cpp:53 — the session engine and its decoded<br/>index are deliberately NOT dropped when a new group opens
+
+    opt walking an array of structures
+        C->>AL: al_begin_arraystruct_action(octx, path, timebase, size)
+        AL->>BE: beginArraystructAction(aosCtx, size)
+        BE->>R2: beginReadArraystructAction(aosCtx, size)
+        R2->>PZ: getAOSShape(level)
+        PZ-->>R2: the effective size of the AoS
+    end
+
+    loop once per node asked for
+        C->>AL: al_read_data(octx, field, timebase, &data, &type, &dim, size)
+        AL->>BE: readData(ctx, field, timebase, …)
+        BE->>R2: read_ND_Data(ctx, field, timebase, …)
+        Note over R2: hdf5_reader_v2.cpp:148 — '/' becomes '&', then the GLOBAL_OP<br/>strategy is chosen (:86). The engine is moved onto this operation's<br/>group id (reanchor, :92) instead of rebuilt; only a refusal rebuilds it.
+        R2->>PZ: getLeaves()
+        PZ-->>R2: the cached leaf table
+        R2->>PZ: readMetadata(path)
+        PZ-->>R2: the node's @key attributes
+        alt several leaves for one node (time slices, AoS elements)
+            R2->>PZ: readLeavesUnion(leaves, buffer, dtype)
+        else a single leaf
+            R2->>PZ: readTensor(leaf, buffer)
+        end
+        PZ-->>R2: the values
+        R2-->>BE: 1 on success, 0 when the node is not there (include/al_backend.h:135)
+    end
+
+    C->>AL: al_end_action(octxID)
+    AL->>BE: endAction(opCtx)
+    BE->>R2: endAction(opCtx)
+    Note over R2: hdf5_reader_v2.cpp:76 — delegated only when this context owns the<br/>group; the engine itself stays open for the next operation
+
+    C->>AL: al_close_pulse(pctx, CLOSE_PULSE)
+    AL->>BE: closePulse(ctx, mode)
+    BE->>R2: closePulse(ctx, mode, …)
+```
+
+### 2.3 `put_slice()` — `SLICE_OP` write
+
+The distinctive part: the `APPEND` engine is built by the **first** slice of the session
+and every later slice re-anchors the same one. `endAction` commits and keeps it alive.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant AL as AL low-level verbs
+    participant BE as HDF5Backend
+    participant W2 as HDF5Writer_v2
+    participant PZ as PanzerDB
+
+    C->>AL: al_begin_dataentry_action(uri, OPEN_PULSE)
+    AL->>BE: openPulse(ctx, OPEN_PULSE)
+
+    loop one put_slice() per time slice
+        C->>AL: al_begin_slice_action(pctx, "core_profiles", WRITE_OP, t, interp)
+        AL->>BE: beginAction(opCtx)
+        BE->>BE: eventsHandler->beginAction(opCtx, …)
+        BE->>W2: open_IDS_group(opCtx, …)
+        BE->>W2: setWriteStrategy(opCtx, SLICE_OP, loc_id)
+        alt first slice of the session
+            W2->>PZ: PanzerDB(loc_id, APPEND)
+            Note over W2,PZ: hdf5_writer_v2.cpp:131 — adopts the index layout already in the<br/>file rather than writing the newest one
+        else a later slice of the same session
+            W2->>PZ: reanchor(loc_id)
+            Note over W2,PZ: hdf5_writer_v2.cpp:130 — the engine built by the first slice is<br/>reused. An APPEND accepts the move only while the row count<br/>still equals the next row it would write, so rows another writer<br/>added in between force a rebuild.
+        end
+
+        C->>AL: al_write_data(octx, field, timebase, data, type, dim, size)
+        AL->>BE: writeData(ctx, field, timebase, …)
+        BE->>W2: write_ND_Data(ctx, field, timebase, …)
+        W2->>PZ: writeDataSlices(name, shape, data, …)
+        Note over W2,PZ: one /index row per signal per call; the time anchor of the row is<br/>computed here, and a signal that already exists gets a second row<br/>rather than an edit of the first.
+
+        C->>AL: al_end_action(octxID)
+        AL->>BE: endAction(opCtx)
+        BE->>W2: endAction(opCtx)
+        W2->>PZ: flush() — the commit point of this slice
+        Note over W2,PZ: hdf5_writer_v2.cpp:475 then :482 — no close(): the engine, its<br/>handles, its decoded table and HDF5's write chunk cache survive to<br/>the next put_slice(). The order inside flush() is payloads, then<br/>/path_table, then /list_spans, then /index — never the reverse.
+    end
+
+    C->>AL: al_close_pulse(pctx, CLOSE_PULSE)
+    AL->>BE: closePulse(ctx, mode)
+    BE->>W2: closePulse(ctx, mode, …)
+    W2->>PZ: released here, not before
+    Note over W2,PZ: hdf5_writer_v2.cpp:490 with the reset at :494 — releasing the engine<br/>before the base class closes the pulse is what keeps HDF5 from<br/>segfaulting at library termination.
+```
+
+### 2.4 `get_slice()` — `SLICE_OP` read
+
+One time slice, at the requested instant. The time is resolved to a slice index by the
+engine, which is also where a missing slice becomes the closest available one.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant AL as AL low-level verbs
+    participant BE as HDF5Backend
+    participant R2 as HDF5Reader_v2
+    participant PZ as PanzerDB
+    participant IN as DataInterpolation
+
+    C->>AL: al_begin_slice_action(pctx, "core_profiles", READ_OP, t, LINEAR_INTERP)
+    AL->>BE: beginAction(opCtx)
+    BE->>BE: eventsHandler->beginAction(opCtx, …)
+    BE->>R2: open_IDS_group(opCtx, file_id, …)
+
+    opt walking an array of structures
+        C->>AL: al_begin_arraystruct_action(octx, path, timebase, size)
+        AL->>BE: beginArraystructAction(aosCtx, size)
+        BE->>R2: beginReadArraystructAction(aosCtx, size)
+        R2->>PZ: getAOSShape(level)
+        PZ-->>R2: the effective size of the AoS
+    end
+
+    loop once per node asked for
+        C->>AL: al_read_data(ctx, field, timebase, &data, &type, &dim, size)
+        AL->>BE: readData(ctx, field, timebase, …)
+        BE->>R2: read_ND_Data(ctx, field, timebase, …)
+        Note over R2: hdf5_reader_v2.cpp:148 — the SLICE_OP strategy is chosen on the<br/>session engine (reanchored at :92), shared by every range mode
+        R2->>PZ: readMetadata(path)
+        R2->>PZ: readInterpolatedData(path, t, timebase, interp, …)
+        Note over PZ: slice_read_strategy.cpp:114. The time is turned into a slice index<br/>through the node's timebase; a slice that is not there is resolved by<br/>nearestAvailableSliceIndex (panzerdb.h:1109) and the covering rows<br/>come from rowsForTime (panzerdb.h:488).
+        opt interp is LINEAR_INTERP and the two neighbours exist
+            PZ->>IN: interpolate(previous, next, t)
+            IN-->>PZ: the slice at t
+        end
+        PZ-->>R2: one slice, shape without the time axis
+    end
+
+    C->>AL: al_end_action(octxID)
+    AL->>BE: endAction(opCtx)
+    BE->>R2: endAction(opCtx)
+    C->>AL: al_close_pulse(pctx, CLOSE_PULSE)
+    AL->>BE: closePulse(ctx, mode)
+```
+
+### 2.5 `getSample()` — `TIMERANGE_OP` with a requested time vector
+
+> **On the name.** `getSample` is not a symbol in this tree — the only mention is the
+> title of `tests/hdf5_backend/test_al_resampling_user_vector.cpp` ("getSample
+> equivalent"). The high-level `getSample(times)` verb is a `TIMERANGE_OP` read whose
+> `OperationContext` carries a `dtime` vector plus an interpolation mode; that vector is
+> the only thing that distinguishes it from a plain time-range read.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant AL as AL low-level verbs
+    participant BE as HDF5Backend
+    participant R2 as HDF5Reader_v2
+    participant PZ as PanzerDB
+    participant IN as DataInterpolation
+
+    C->>AL: al_begin_timerange_action(pctx, ids, READ_OP, tmin, tmax, dtime, interp)
+    AL->>BE: beginAction(opCtx)
+    BE->>BE: eventsHandler->beginAction(opCtx, …)
+    BE->>R2: open_IDS_group(opCtx, file_id, …)
+    Note over AL,BE: OperationContext::getTimeRange returns tmin, tmax, dtime, interp<br/>(include/al_context.h:353). A non-empty dtime means resampling.
+
+    opt walking an array of structures
+        C->>AL: al_begin_arraystruct_action(octx, path, timebase, size)
+        AL->>BE: beginArraystructAction(aosCtx, size)
+        BE->>R2: beginReadArraystructAction(aosCtx, size)
+        R2->>PZ: the timebase of this level, once per session
+        PZ-->>R2: the time values
+        alt the level is time-dependent
+            R2->>IN: resample_timebasis(tmin, tmax, dtime, timebase)
+            IN-->>R2: the size of the resampled AoS
+        else the level is static
+            R2->>IN: getTimeRangeIndices(tmin, tmax, dtime, timebase)
+            IN-->>R2: window indices and size
+            R2->>PZ: getAOSShape(level)
+        end
+        Note over R2,PZ: timerange_read_strategy.cpp:29-31 for the resampled size, :49-56 for<br/>the window, :60 for a static level. The timebase itself is reached<br/>through IReadStrategy::getTimeValues, which memoises the whole signal.
+    end
+
+    loop once per node asked for
+        C->>AL: al_read_data(ctx, field, timebase, &data, &type, &dim, size)
+        AL->>BE: readData(ctx, field, timebase, …)
+        BE->>R2: read_ND_Data(ctx, field, timebase, …)
+        Note over R2: hdf5_reader_v2.cpp:148 — the TIMERANGE_OP strategy on the same<br/>session engine the other range modes use
+        R2->>PZ: readMetadata(path)
+        alt numeric time-dependent node
+            R2->>PZ: readInterpolatedData(path, dtime[0], timebase, interp, …)
+            PZ-->>R2: the probe, which sizes the node
+            loop k over the requested times
+                R2->>PZ: readInterpolatedData(path, dtime[k], timebase, interp, …)
+                PZ->>IN: interpolate / resample at dtime[k]
+                PZ-->>R2: the value at dtime[k]
+            end
+        else static or non-numeric node
+            R2->>PZ: the whole node
+            PZ-->>R2: all of it
+            R2->>IN: interpolate_with_resampling(…)
+            IN-->>R2: the window, on the requested time vector
+        end
+    end
+
+    C->>AL: al_end_action(octxID)
+    AL->>BE: endAction(opCtx)
+    BE->>R2: endAction(opCtx)
+    C->>AL: al_close_pulse(pctx, CLOSE_PULSE)
+    AL->>BE: closePulse(ctx, mode)
 ```
 
 ---
 
-## 4. Méthodes cœur de PanzerDB
+## 3. Session state the five verbs walk through
 
-Toutes résolvent via le cache d'index `getLeaves()` + les colonnes
-`/index` (14 u64) et les datasets bruts `data_raw_{f64,i32,c128,str}`.
+| | `put()` | `get()` | `put_slice()` | `get_slice()` / `getSample()` |
+|---|---|---|---|---|
+| Engine | `PanzerDB(WRITE)`, built and closed inside the action | `PanzerDB(READ)`, one per session | `PanzerDB(APPEND)`, one per slice session | the same read engine as `get()` |
+| Kept across operations | no | yes — re-anchored on each group id | yes — re-anchored on each group id | yes |
+| Re-anchor gate | n/a | the `/index` row count must be unchanged | `rows_now == next row this session would write` | same as the read gate |
+| Commit | `flush()` at `endAction`, then `close()` | n/a | `flush()` at `endAction`, engine kept | n/a |
+| Reused across calls | schema `@key` map | decoded leaf table, memoised whole signals, negative "no slice at any index" cache | AoS time counters, handles and write chunk cache | path/name index, memoised time bases, chunk cache |
 
-| Méthode | Rôle | HDF5 bas-niveau |
-|---|---|---|
-| `getLeaves()` (cpp:1167) | Cache des feuilles ; **reconstruit `parent_path`** via `(parent_id, kind, full_path)` — aucune donnée dupliquée sur disque | `H5Dget_space`, `H5Dread` sur `/index` + `/paths` |
-| `getLeafType(path)` (cpp:3277) | Type d'un nœud (décode `flags >> 4`) | — |
-| `isTimeInLeaf(leaf, t)` (cpp:2137) | Prédicat : la feuille couvre-t-elle la slice `t` ? | — |
-| `nearestAvailableSliceIndex(…)` (cpp:2152) | **Résolution de gap** : plus proche slice disponible (dir −1/+1/0) | — |
-| `readTensor<T>(leaf, buf)` (cpp:1328/1372) | Lecture complète d'une feuille (toutes ses données) | `H5Dget_space`, `H5Sselect_hyperslab(SET)`, `H5Dread` |
-| `readSliceDirect<T>(leaf, t, buf)` (cpp:886) | Lecture d'**une** slice dynamique | `H5Sselect_hyperslab(SET)`, `H5Dread` |
-| `readLeavesUnion(leaves, buf, dt)` (cpp:952) | **Lecture groupée** (Hyperslab OR) ; monotone → 1 `H5Dread`, sinon par feuille | `H5Sselect_none`, `H5Sselect_hyperslab(OR) × N`, `H5Dread` |
-| `readScalar<T>(path, status)` (h:802) | Scalar unitaire | (via `readTensor`) |
-| `getWholeDynamicSignal(path)` (cpp:3099) | Concatène toutes les tranches d'un signal dynamique (base temps) | (par feuille `readTensor`) |
-| `readDataByIndex(path, t, &ndim, shape, &buf)` (cpp:2248) | Lecture C-style par chemin + `time_index` | (via `readTensor`/`readSliceDirect`) |
-| `readInterpolatedData(…, expect_time_dim=true)` (cpp:2957) | Lecture interp à un instant `time` (linéaire le plus souvent) | (via `readDataByIndex` + `DataInterpolation::interpolate`) |
+Why the two gates differ: an append only ever adds an `/index` row and never rewrites
+one, so a reader can treat "same row count" as "nothing changed", while a writer must
+ignore the rows its own `flush()` just added and only notice foreign ones. Guard tests:
+`test_al_slice_read_after_append_between_reads` and
+`test_al_slice_write_after_foreign_append`.
 
 ---
 
-## 5. Layout d'`/index` (M1, en production)
+## 4. Where the details live
 
-14 colonnes `uint64`. Les 3 colonnes M1 sont `row[11]` (flags), `row[12]`
-(parent_id), `row[13]` (index_value). **Aucune colonne de texte parent** :
-`parent_path` est dérivé à la lecture.
+This file deliberately stops at the interfaces. Everything behind them is in
+`developer_guide_v2.1.md`:
 
-| row | champ | commentaire |
-|--:|--|--|
-| 0 | type | actuellement toujours 0, conservé |
-| 1 | ndim | nombre de dimensions du tenseur |
-| 2..7 | shape[0..5] | dimensions |
-| 8 | time_index | première slice émise (0 si statique) |
-| 9 | offset | offset (éléments) dans `data_raw_{f64/i32/c128/str}` |
-| 10 | count | nombre d'éléments |
-| 11 | flags | `(DataType << 4) \| kind` — kind : 0 data / 1 empty / 2 static-AoS / 3 dynamic-AoS |
-| 12 | **parent_id** | `PANZER_NO_PARENT_ROW` (0xFFFF…F) si racine, sinon n° de ligne du conteneur |
-| 13 | **index_value** | instance courante (t pour un AoS fils, i pour un data leaf dans un AoS) |
-
-### Règle de reconstruction de `parent_path` (getLeaves, panzerdb.cpp:1244–1257)
-
-```
-si parent_id == PANZER_NO_PARENT_ROW :  parent_path = ""
-si kind ∈ {0,1} (data/empty)          :  parent_path = full_path  − 1 segment (le nom)
-si kind ∈ {2,3} (AoS statique/ dynamique) : parent_path = full_path − 2 segments (instance + nom)
-```
-
-`rfind('/')` retire les segments, avec garde `end > 0`. Aucune table des
-symboles — arithmétique de chaîne sur le chemin déjà stocké dans `paths`.
-
-### Exemple concret — `profiles_1d[t].ion[i].temperature` (2 t × 2 i × 5 spatial)
-
-Produit par le vrai writer C++ PanzerDB ; `h5ls -r` + h5py `/index` brut :
-
-| row | full_path (`/paths`) | kind | parent_path reconstruit | operation |
-|--:|--|--:|--|--|
-| 0 | `profiles_1d` | 3 dyn | `""` | `parent_id == NO_PARENT` |
-| 1 | `profiles_1d/0/ion` | 2 stat | `profiles_1d` | kind 2 → strip 2 |
-| 2 | `profiles_1d/0/ion/0/temperature` | 0 data | `profiles_1d/0/ion/0` | kind 0 → strip 1 |
-| 3 | `profiles_1d/0/ion/1/temperature` | 0 data | `profiles_1d/0/ion/1` | kind 0 → strip 1 |
-| 4 | `profiles_1d/1/ion` | 2 stat | `profiles_1d` | kind 2 → strip 2 |
-| 5 | `profiles_1d/1/ion/0/temperature` | 0 data | `profiles_1d/1/ion/0` | kind 0 → strip 1 |
-| 6 | `profiles_1d/1/ion/1/temperature` | 0 data | `profiles_1d/1/ion/1` | kind 0 → strip 1 |
-
-Colonnes M1 correspondantes (brut `/index` u64) :
-
-| row | flags (row[11]) | parent_id (row[12]) | index_value (row[13]) |
-|--:|--:|--:|--:|
-| 0 | 0x03 (3) | 0xFFFFFFFFFFFFFFFF | 0 |
-| 1 | 0x02 (2) | 0 | 0 |
-| 2 | 0x00 (0) | 1 | 0 |
-| 3 | 0x00 (0) | 1 | 1 |
-| 4 | 0x02 (2) | 0 | 1 |
-| 5 | 0x00 (0) | 4 | 0 |
-| 6 | 0x00 (0) | 4 | 1 |
-
-Lignes complètes (14 u64) :
-
-```
-row0: [0, 1, 0×5, 0, 0,  0, 3, 18446744073709551615, 0]   # profiles_1d
-row1: [0, 1, 2,  0×4, 0, 0,  0, 2, 0, 0]                   # ion @t=0 (size 2)
-row2: [0, 1, 5,  0×4, 0, 0,  5, 0, 1, 0]                   # temp @t=0,i=0 (offset 0, cnt 5)
-row3: [0, 1, 5,  0×4, 0, 5,  5, 0, 1, 1]                   # temp @t=0,i=1 (offset 5)
-row4: [0, 1, 2,  0×4, 0, 0,  0, 2, 0, 1]                   # ion @t=1
-row5: [0, 1, 5,  0×4, 1, 10, 5, 0, 4, 0]                   # temp @t=1,i=0 (offset 10)
-row6: [0, 1, 5,  0×4, 1, 15, 5, 0, 4, 1]                   # temp @t=1,i=1 (offset 15)
-```
-
-(`data_raw_f64` tient 20 doubles = 4 × 5, offsets 0/5/10/15.)
-
----
-
-## 6. Points clairs
-
-- **Le path en index porte les instances** : `profiles_1d/0/ion/0/temperature`
-  est le chemin « index » ; le chemin « logique » (IMAS) est
-  `profiles_1d.ion.temperature`. Ce que `list_nodes` renvoie, c'est le
-  logique ; ce que store `panzerdb` c'est l'index. `parent_path` reconstruit
-  est le **chemin index** du parent.
-- **`readLeavesUnion`** est l'optimisation clé des lectures multi-tranches :
-  un seul `H5Dread` si les offsets sont monotones (data écrite chronologique),
-  sinon N `H5Dread` ordonné pour préserver le temps.
-- **`nearestAvailableSliceIndex`** est le mécanisme de « gap-filling » : si la
-  slice demandée est absente, renvoie la plus proche (direction −1/+1/0).
-  C'est ce qui rend `readInterpolatedData` robuste aux trous de données.
-- **`readSliceDirect`** (une slice) vs **`readLeavesUnion`** (K slices) :
-  les deux font un `H5Sselect_hyperslab(SET)` ou `H5S_SELECT_OR` respectivement
-  puis `H5Dread` unique. Zéro intermédiaires.
-- **SWMR-safe** : toutes les lectures sont `H5Dget_space`/`H5Sselect_*`/`H5Dread`
-  sur datasets **fixe-width** (C_S1 256 B pour `paths`, u64 pour `/index`),
-  aucun vlen → compatible avec le mode SWMR (writer) à venir.
-
----
-
-_Fichier généré automatiquement pour la documentation interne. Tout les chemins
-`file:line` sont vérifiés dans le code source (état 39f6f23)._
+- **§2** — the on-disk format a `put()` produces: the v3 index (7 packed `u64` columns) and
+  the interned `/path_table`, and how the three index generations stay readable.
+- **§3.6** — the session engines, `reanchor`, the index handoff between engines, and the
+  commit ordering that makes `flush()` a safe commit point.
+- **§4** — the three read strategies, `ReadIndex`, and where the engine-side caches sit.
+- **§8** — error handling and the buffer-width rule that `readTensor` enforces.
