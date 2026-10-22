@@ -48,6 +48,7 @@ void HDF5Reader_v2::release_session()
     session_index.reset();
     session_db.reset();
     session_gid = -1;
+    anchor_may_be_stale = false;
 }
 
 void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::unordered_map<std::string, hid_t> &opened_IDS_files, std::string &files_directory, std::string &relative_file_path)
@@ -59,11 +60,22 @@ void HDF5Reader_v2::open_IDS_group(OperationContext *ctx, hid_t file_id, std::un
     // throw the engine and its shared index away and rebuild both (twice per getSlice).
     // select_strategy moves the engine onto the new group id instead, and drops it there
     // only when that move is impossible.
+    //
+    // What this operation does owe the session is the knowledge that its anchor may now
+    // be void: the group it was taken on can have been closed, HDF5 may hand that id back
+    // out for another group, and another writer may have grown /index in between. Hence
+    // the flag instead of a check here -- select_strategy has to answer that question
+    // anyway, and answering it at the operation boundary is what keeps it out of the
+    // per-node read path.
+    anchor_may_be_stale = true;
 }
 
 void HDF5Reader_v2::close_group(OperationContext *ctx)
 {
     HDF5Reader::close_group(ctx);
+    // The group the engine is anchored on has just been H5Gclose'd: whatever
+    // select_strategy believed about that anchor is void until it is re-checked.
+    anchor_may_be_stale = true;
 }
 
 
@@ -89,18 +101,30 @@ void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
     // The group id changes at every operation, so an existing engine is moved onto it
     // rather than rebuilt: rebuilding threw away the decoded /index, the memoised
     // signals and the dataset handles with their chunk caches, twice per getSlice.
-    if (session_db && session_db->reanchor(gid)) {
+    //
+    // That move is asked once per operation, not once per node: this runs from
+    // prepare_strategy, which every read entry point calls (read_ND_Data,
+    // beginReadArraystructAction, endAction), while the group itself is opened twice per
+    // operation. Re-asking it per node cost 4 303 315 re-opens of /index -- each one
+    // H5Fget_name, H5Oget_info3, H5Otoken_cmp, H5Dget_space -- against 122 266 real reads
+    // on core_profiles_3 of pulse 54924, ~9 s of a 22 s get() for an anchor that had not
+    // moved. The boundary is where the anchor can actually have been lost (open_IDS_group,
+    // close_group) and where a foreign write can show up, so that is where it is checked;
+    // within one operation the file cannot change underneath a read of its own.
+    const bool anchor_trusted = session_db && !anchor_may_be_stale && gid == session_gid;
+    if (!anchor_trusted) {
+        if (!session_db || !session_db->reanchor(gid)) {
+            session_db.reset();
+            session_index.reset();
+            global_strategy.reset();
+            slice_strategy.reset();
+            timerange_strategy.reset();
+            read_strategy = nullptr;
+            session_db = std::make_shared<PanzerDB>(gid, PanzerDB::OpenMode::READ);
+            session_index = std::make_shared<ReadIndex>(session_db);
+        }
         session_gid = gid;
-    } else {
-        session_gid = gid;
-        session_db.reset();
-        session_index.reset();
-        global_strategy.reset();
-        slice_strategy.reset();
-        timerange_strategy.reset();
-        read_strategy = nullptr;
-        session_db = std::make_shared<PanzerDB>(gid, PanzerDB::OpenMode::READ);
-        session_index = std::make_shared<ReadIndex>(session_db);
+        anchor_may_be_stale = false;
     }
 
     if (ctx->getRangemode() == GLOBAL_OP) {

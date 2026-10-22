@@ -1576,5 +1576,124 @@ harnais du point 26 mesurait la même chose sans la nommer (« racine du fichier
 l'écrivain de la cible, mais dès que `access_mode` n'est aucun des quatre modes pulse, la fonction retourne
 `versionToReturn` sans l'avoir jamais écrit.
 
+## 29. Le `reanchor` du reader est payé à chaque nœud de l'arbre — un `get()` global à 22 s au lieu de 12,6 s (2026-10-22)
+
+**Le symptôme.** Depuis que le moteur de lecture survit aux opérations (point 25), un `get()` global de
+`core_profiles` occurrence 3 (choc 54924) passe de **12,6 s en V1 à 22 s en V2** — soit ×1,7 au-dessus de la
+baseline V2 d'avant la série d'optimisations, pas une amélioration. `equilibrium` occurrence 1, même choc,
+n'était **pas** touché : le temps y restait plat. Cette asymétrie est la clé du diagnostic, pas un hasard.
+
+**Dispositif.** LD_PRELOAD sur les appels HDF5 (`H5Dopen2` / `H5Dread` / `H5Oget_info3` / `H5Fget_name` /
+`H5Dget_space` / `H5Otoken_cmp` / `H5Gopen2`) avec histogramme par nom de dataset, autour de
+`example-cpp-benchmark -m get -o 3` (8150 tranches × 101 points × 3 quantités) et `-m get-slice`. Fichiers :
+l'archive v1 du tir et sa conversion v2 (`test_convert_rt/A1`, `index` = {171165, 7}, `path_table` = {48930},
+`data_raw_f64` = {9894100}).
+
+**Base mesurée** — un seul `get()` global V2, avant correctif :
+
+| appel HDF5 | compte | remarque |
+|---|---|---|
+| `H5Dopen2` | **4 303 326** | dont **4 303 315** sur le dataset `index` ; les 11 autres sont les 7 datasets v2 |
+| `H5Oget_info3` | 4 303 314 | inside `panzer_same_object` |
+| `H5Otoken_cmp` | 4 303 313 | idem |
+| `H5Fget_name` | **8 606 628** | ×2 par re-ancre (`panzer_file_name` est appelé deux fois) |
+| `H5Dget_space` | 4 425 584 | 4 303 315 pour `panzer_index_rows` + le reste pour les données |
+| `H5Gopen2` | **2** | l'AL n'ouvre le groupe IDS qu'**une fois par opération** |
+| `H5Dread` | **122 266** | le vrai travail : 105 951 sur `data_raw_f64`, 11 894 sur les tables |
+
+Donc **35,2 millions d'appels HDF5 pour 122 266 lectures**, soit ~288 appels de vérification par lecture —
+environ 9 s sur les 22. Le ratio explique l'asymétrie : la revalidation est factorisée par le nombre de
+**nœuds de l'arbre**, pas par la taille des données. `core_profiles` occ 3 fait 4 303 315 re-ancrages
+(528 par tranche) ; `core_profiles` occ 1 n'en fait que 47 688 (245 par tranche, ~0,25 s de surcharge) ;
+`equilibrium_1` a 195 tranches → ~0,1 s, noyé dans le bruit. « Non touché » veut dire « peu de tranches »,
+pas « chemin différent ».
+
+**La cause.** `prepare_strategy()` est appelé **par nœud** (`read_ND_Data` l.151, `beginReadArraystructAction`
+l.72, `endAction` l.78) → `select_strategy()` → `reanchor(gid)` **inconditionnel**. Avant `4ff4651`, le garde
+valait `if (gid != session_gid)` : comme l'AL ne rouvre le groupe qu'une fois par opération (`H5Gopen2` = 2),
+le test échouait une fois sur l'opération et la revalidation coûtait zéro sur le reste de l'arbre. `4ff4651` a
+remplacé ce garde par un appel systématique — nécessaire, puisque `gid` **se recycle** entre opérations (le
+même id revient d'une opération à l'autre alors que le fichier a pu bouger), mais posé au mauvais endroit : une
+question par opération est devenue une question par nœud.
+
+**Ce qui n'était pas en cause.** Le chemin écriture : `HDF5Writer_v2::setWriteStrategy` est appelé **une fois
+par opération** (l.91) et ne re-ancre qu'en `SLICE_OP` (l.130) — en `GLOBAL_OP` il libère le moteur de slices
+et installe un moteur WRITE neuf. C'est pourquoi `put()` global n'a jamais régressé, et pourquoi il n'y avait
+**rien à désactiver selon le mode** : la fréquence, pas le mode.
+
+**Le correctif.** Une revalidation **au plus une fois par opération**, pour les trois modes. Le reader porte un
+drapeau `anchor_may_be_stale` : levé par `open_IDS_group()` et `close_group()` (le groupe qui a servi l'ancre
+peut avoir été refermé, HDF5 peut redonner le même id, un writer externe peut avoir fait grandir `/index`),
+baissé par `select_strategy()` une fois l'ancre vérifiée pour le `gid` courant.
+
+```cpp
+const bool anchor_trusted = session_db && !anchor_may_be_stale && gid == session_gid;
+if (!anchor_trusted) {
+    if (!session_db || !session_db->reanchor(gid)) { /* reconstruction complète */ }
+    session_gid = gid;
+    anchor_may_be_stale = false;
+}
+```
+
+Ce n'est pas un `gid != session_gid` de retour : le drapeau est levé à **chaque** opération, donc le cas
+tordu que `4ff4651` corrigeait (id recyclé, fichier modifié entre-temps) repasse bien par `reanchor()`.
+`release_session()` remet le drapeau à zéro avec `session_gid`.
+
+**Après** (même run, mêmes compteurs) :
+
+| appel HDF5 | avant | après |
+|---|---|---|
+| `H5Dopen2` | 4 303 326 | **14** (7 noms distincts) |
+| `H5Oget_info3` | 4 303 314 | **2** |
+| `H5Fget_name` | 8 606 628 | **4** |
+| `H5Dopen2` sur `index` | 4 303 315 | **1** |
+| `H5Dread` | 122 266 | **122 266** (inchangé — les données ne bougent pas) |
+
+**Gains mesurés** :
+
+| opération | avant | après |
+|---|---|---|
+| `get()` global, occ 3, V2 | 21,72 / 21,86 / 22,10 / 22,23 / 22,02 s | **8,30 / 8,16 / 8,18 s** |
+| même `get()` en V1 (archive, référence non régressée) | 12,4 – 12,66 s | — |
+| `getSlice`, occ 3, 8150 appels | 3 203,24 / 3 198,8 µs/appel (26,11 / 26,07 s) | **2 142,1 / 2 136,14 µs/appel** (17,46 / 17,41 s) |
+
+Le `get()` repasse **sous** le V1 : la revalidation était le seul écart, et le moteur partagé rendu par
+`4ff4651` devient un gain net (8,2 s contre 12,6 s en V1). Le chemin slice gagne ×1,5 aussi
+(`H5Oget_info3` 4 857 509 → 16 303, `H5Dopen2` 4 857 532 → 16 326, `H5Dread` 114 113 identique des deux côtés) :
+la revalidation par opération reste payée là où elle sert, et disparaît des nœuds intermédiaires. Le digest de
+valeur du `get()` est **inchangé** (`cae8e52dcd94b6cc`), donc l'ancre n'a pas été relâchée — seulement reposée.
+
+**Garde d'invalidation.** `test_al_slice_read_after_append_between_reads` (un append étranger entre deux
+lectures de la même session) doit rester verte, et elle l'est. Elle est **non vide** : en forçant
+`anchor_trusted = (session_db != nullptr)` — c'est-à-dire en supprimant l'appel à `reanchor()` — le test échoue
+sur `signal_1d[0] at t=0.3 = 120, expected 130`, exactement la signature annoncée par le message de `4ff4651`.
+Un sabotage plus doux (drapeau jamais levé) ne fait **pas** échouer le test : dans ce scénario le `gid` change
+déjà de lui-même entre opérations, donc le test ne discrimine pas le drapeau seul — il discrimine la présence
+de `reanchor()`, ce qui est l'important.
+
+**Un piège de mesure à connaître.** Ces deux gardes n'écrivent pas forcément en v2 : `getTargetVersion()` vaut
+(2,0) quand `BACKEND_DEFAULT_WRITE_VERSION` est absente (`hdf5_backend.cpp:62-63`), mais l'environnement de la
+machine l'exporte à **1.0** (avec `BACKEND_ALLOW_AUTO_UPGRADE=true` et `BACKEND_HDF5_FORCE_CONVERSION_TO_V1=true`).
+Lancées telles quelles, elles écrivent donc un pulse v1, et **la phase 2 (lecture) échoue** sur
+`Unable to open HDF5 dataset: profiles_1d[]&time` (levé par `hdf5_dataset_handler.cpp:225`) — avant même
+d'atteindre le reader v2. Vérifié en stashant le correctif et en rebâtissant : **même échec sur HEAD**.
+
+Ce n'est **pas** le reader v1 incapable de lire du v1 : l'archive v1 du tir 54924 se relit très bien (et ne
+contient pas non plus de `profiles_1d[]&time`). L'écriture réussit et produit le layout v1 attendu
+(`profiles_1d[]&signal_1d` {3,10} + `_SHAPE` + `AOS_SHAPE` + `/core_profiles/time` {3}, master annoté « 1.0 ») ;
+c'est la lecture qui réclame le temps propre de l'AoS — le contexte est `ArraystructContext(&opCtx, "profiles_1d",
+"time")` — un dataset que l'écrivain v1 ne pose pas ici. `H5Dopen2` échoue, `H5Lexists` est faux, et la branche
+qui crée le dataset manquant n'est prise que si `slice_mode` est vrai dans cet appel d'ouverture : en lecture,
+ce n'est pas le cas, d'où le throw. Asymétrie write/read du chemin v1 sur cette forme, donc, et elle est connue :
+11 tests de la suite rendent la main explicitement sur la cible 1.0 (`if (version == std::make_pair(1,0))`,
+dont ceux de slices dynamiques), et le point 28 consigne « 14 `test_al_*` sur 53 échouent en cible 1.0,
+deux en SEGFAULT ». Les gardes de `4ff4651` et `7547a22` n'ont pas cette sortie anticipée. Pour qu'elles valident
+le reader v2, forcer `BACKEND_DEFAULT_WRITE_VERSION=2.0`. Et un `make` qui échoue laisse l'ancien binaire en
+place, ce qui peut faire afficher un « exit=0 » faux — vérifier l'horodatage du lien avant de conclure.
+
+`bench_read` a été essayé pour la jambe `equilibrium` et **écarté** : il construit un fichier d'un seul groupe
+(15 nœuds, `d_elems 0`), donc ses chiffres ne représentent pas le chemin d'un IDS réel (`developer_guide_v2.1.md`
+§11 dit la même chose : ce binaire n'est pas enregistré comme test).
+
 
 

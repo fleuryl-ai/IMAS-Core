@@ -44,6 +44,11 @@ class HDF5Reader_v2 : public HDF5Reader {
     std::shared_ptr<PanzerDB> session_db;         // Read-only engine for the current session.
     std::shared_ptr<ReadIndex> session_index;     // Index (path/name -> leaves) built once over session_db.
     hid_t session_gid = -1;                        // Group id the session engine was opened on.
+    // True once the group that anchor was taken on may have been closed -- an operation
+    // ended, or the storage was rewritten -- so the next read has to re-anchor before
+    // trusting the decoded /index again. Set by open_IDS_group/close_group, cleared by
+    // select_strategy once the anchor has been checked for the current group id.
+    bool anchor_may_be_stale = false;
 
     std::unique_ptr<IReadStrategy> global_strategy;   // Lazily created, sharing session_db + session_index.
     std::unique_ptr<IReadStrategy> slice_strategy;
