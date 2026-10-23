@@ -1687,9 +1687,38 @@ qui crée le dataset manquant n'est prise que si `slice_mode` est vrai dans cet 
 ce n'est pas le cas, d'où le throw. Asymétrie write/read du chemin v1 sur cette forme, donc, et elle est connue :
 11 tests de la suite rendent la main explicitement sur la cible 1.0 (`if (version == std::make_pair(1,0))`,
 dont ceux de slices dynamiques), et le point 28 consigne « 14 `test_al_*` sur 53 échouent en cible 1.0,
-deux en SEGFAULT ». Les gardes de `4ff4651` et `7547a22` n'ont pas cette sortie anticipée. Pour qu'elles valident
-le reader v2, forcer `BACKEND_DEFAULT_WRITE_VERSION=2.0`. Et un `make` qui échoue laisse l'ancien binaire en
-place, ce qui peut faire afficher un « exit=0 » faux — vérifier l'horodatage du lien avant de conclure.
+deux en SEGFAULT ». Les gardes de `4ff4651` et `7547a22` n'ont pas cette sortie anticipée.
+
+Le mécanisme est vérifié dans le code : `getTimeVectorDataSet` (`hdf5_reader.cpp:356-363`) construit le handler
+du vecteur de temps et appelle `open()` **sans jamais appeler `setSliceMode()`** — donc `slice_mode` y vaut faux,
+et la branche « créer si absent » de `hdf5_dataset_handler.cpp:215` est fermée d'office pour ce dataset, d'où le
+throw l.225. (Au passage, `hdf5_reader.cpp:338` teste `(timebasename != "time" || timebasename != "&time")`,
+toujours vrai quelle que soit la chaîne — probablement un `&&` voulu. Non creusé, hors du périmètre de ce point.)
+
+**Colmatage.** Les deux gardes épinglent désormais leur version cible elles-mêmes, au moyen du motif déjà utilisé
+par `test_al_convert_v2_to_v1.cpp:61-65` et `test_al_upgrade_v1_to_v2.cpp:56-57` : `setenv` sur
+`BACKEND_DEFAULT_WRITE_VERSION=2.0` en tête de `main()`, avant la construction du backend. Le pinning est dans le
+binaire et non dans `set_tests_properties`, donc il vaut aussi quand on lance l'exécutable directement — ce que
+fait la checklist du guide §11. Les deux autres interrupteurs ambiants (`BACKEND_ALLOW_AUTO_UPGRADE`,
+`BACKEND_HDF5_FORCE_CONVERSION_TO_V1`) ne sont pas pin : le pulse est créé neuf en 2.0, donc ni upgrade ni
+conversion ne s'appliquent.
+
+Mesure dans l'environnement ambiant (variable toujours à 1.0) : les deux gardes passent de `exit=1` à `exit=0`, et
+surtout l'histogramme des noms ouverts par `H5Dopen2` (LD_PRELOAD) montre les tables du layout v2 — `index` ×7,
+`path_table` ×5, `data_raw_f64` ×5, `data_raw_i32` ×5, `data_raw_str` ×5 — c'est-à-dire le moteur que la garde est
+censée surveiller. L'étiquette `HDF5_BACKEND_VERSION` du `master.h5` n'est **pas** relevée ici : les deux gardes
+suppriment leur base de test à la fin d'un run réussi, il ne reste rien à inspecter — c'est l'histogramme qui prouve
+le chemin exercé, pas l'attribut.
+
+Non-vacuité re-prouvée **après** avoir touché aux tests : en retirant de nouveau l'appel à `reanchor()`
+(`anchor_trusted = (session_db != nullptr)`), la garde de lecture rougit sur
+`signal_1d[0] at t=0.3 = 120, expected 130` et `ctest` l'annonce en échec ; restaurée (md5 du source identique,
+zéro marque de sabotage), `ctest` rend 2/2.
+
+Ce colmatage ne répare **pas** le v1 : le pigeon « 14 `test_al_*` sur 53 échouent en cible 1.0 » reste vrai, et
+les gardes ne couvrent volontairement plus que le moteur de session v2 — leur objet. Et un `make` qui échoue
+laisse l'ancien binaire en place, ce qui peut faire afficher un « exit=0 » faux — vérifier l'horodatage du lien
+avant de conclure.
 
 `bench_read` a été essayé pour la jambe `equilibrium` et **écarté** : il construit un fichier d'un seul groupe
 (15 nœuds, `d_elems 0`), donc ses chiffres ne représentent pas le chemin d'un IDS réel (`developer_guide_v2.1.md`

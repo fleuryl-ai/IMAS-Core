@@ -17,6 +17,7 @@
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -131,6 +132,10 @@ static bool read_slice(HDF5Backend &backend, DataEntryContext &ctx, double targe
 int main() {
     try {
         std::cout << "\n=== Test: a read session sees slices appended after it read ===\n";
+        // This gate pins the v2 session engine; the target version comes from the
+        // environment, so without pinning it an ambient BACKEND_DEFAULT_WRITE_VERSION=1.0
+        // moves the whole test onto the v1 path, where there is no engine to invalidate.
+        setenv("BACKEND_DEFAULT_WRITE_VERSION", "2.0", 1);
         if (fs::exists("./test_db_slice_read_after_append_between_reads"))
             fs::remove_all("./test_db_slice_read_after_append_between_reads");
 
