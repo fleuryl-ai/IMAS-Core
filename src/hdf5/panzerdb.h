@@ -450,6 +450,30 @@ private:
     mutable uint64_t no_slice_gen = 0;
     mutable uint64_t no_slice_rows = 0;
 
+    /**
+     * @brief Per dynamic AoS root: the path tails this file actually carries under it.
+     *
+     * A dynamic AoS element is addressed by its time index, so a request for
+     * `<root>/<something>/<tail>` is probed as `<root>/<index><tail>` for every index
+     * of the time base when neither the direct nor the index-dropped path exists. That
+     * probe answers nothing for a signal this file does not hold, yet it costs one
+     * substituted path (and one hash of it) per step of the time base: measured on
+     * 54924 occurrence 3, 501 of the 535 paths one getSlice asks for are absent, which
+     * is 8.1M probes and 402 of the 424 CPU-ms of the first slice read of a process.
+     *
+     * Whether such a path can hold a row at ANY index is a property of the decoded
+     * table, not of the requested index, so the tails are collected here once per
+     * decoded state (`<root>` -> {`<tail>`...}) and the question becomes one lookup.
+     * The views point into the same path blocks as `leaf_lookup` keys, so they follow
+     * leaf_cache_gen / index_rows_loaded exactly like the caches above.
+     */
+    mutable std::unordered_map<std::string, std::unordered_set<std::string_view>> dynamic_aos_tails;
+    mutable uint64_t dynamic_tails_gen = 0;
+    mutable uint64_t dynamic_tails_rows = 0;
+    // "the map above was built for that state", not just "the stamps match": a map left
+    // empty because no absent path was ever asked for must not be read as "no family".
+    mutable bool dynamic_tails_built = false;
+
     mutable std::list<std::vector<char>> cached_paths_blocks;
     mutable std::list<std::vector<char>> cached_parent_paths_blocks;
     mutable std::unordered_map<std::string_view, std::vector<size_t>> leaf_lookup;
@@ -562,6 +586,11 @@ private:
         // Per-root "how many time steps so far" counters, which restoreTimeContext()
         // would otherwise rebuild from every leaf of the table at each open.
         std::unordered_map<std::string, uint64_t> aos_time_counters;
+        // Which path tails exist under each dynamic AoS root — the answers
+        // dynamicAosFamilyHasRows() gives without walking the time base. Its views point
+        // into paths_blocks just above, so the two are always swapped together.
+        std::unordered_map<std::string, std::unordered_set<std::string_view>> aos_tails;
+        bool tails_built = false;
     };
 
     /// The single parked state this thread owns (replaced when another file opens).
@@ -1110,6 +1139,19 @@ public:
                                        int64_t prefer_direction,
                                        const std::vector<double>& time_basis,
                                        double requested_time = -1.0) const;
+
+    /**
+     * @brief Does any row of the decoded table sit at `<root>/<element><suffix>`?
+     *
+     * This is the question nearestAvailableSliceIndex answers by probing one
+     * substituted path per step of the time base. The answer is a property of the
+     * table, not of the requested index, so it is settled by a lookup in
+     * `dynamic_aos_tails` (built on first need, see above).
+     */
+    bool dynamicAosFamilyHasRows(const std::string& root, const std::string& suffix) const;
+
+    /// (Re)builds `dynamic_aos_tails` from the decoded table and stamps it.
+    void buildDynamicAosTails() const;
 
     //==========================================================================
     // Read API - Data Retrieval

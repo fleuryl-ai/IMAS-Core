@@ -1401,6 +1401,9 @@ bool PanzerDB::adoptIndexHandoff() {
     if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
     std::swap(parked.whole_signals, whole_signals);
     std::swap(parked.no_slice_paths, no_slice_at_any_index);
+    // Travels with paths_blocks just above: its views are substrings of those texts.
+    std::swap(dynamic_aos_tails, parked.aos_tails);
+    dynamic_tails_built = parked.tails_built;
     leaf_cache_gen = parked.generation;
     index_rows_loaded = parked.rows;
     index_paths_loaded = parked.paths;
@@ -1412,6 +1415,8 @@ bool PanzerDB::adoptIndexHandoff() {
     whole_signals_rows = index_rows_loaded;
     no_slice_gen = leaf_cache_gen;
     no_slice_rows = index_rows_loaded;
+    dynamic_tails_gen = leaf_cache_gen;
+    dynamic_tails_rows = index_rows_loaded;
     const bool covers_whole_table = (current_rows == parked.rows);
     parked = IndexHandoff{};
     return covers_whole_table;
@@ -1442,6 +1447,11 @@ void PanzerDB::handBackIndexHandoff() {
     if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
     std::swap(whole_signals, parked.whole_signals);
     std::swap(no_slice_at_any_index, parked.no_slice_paths);
+    // The flag follows the map it describes: what this engine hands over keeps its
+    // "already built" answer, and the engine is left holding an empty map.
+    std::swap(dynamic_aos_tails, parked.aos_tails);
+    parked.tails_built = dynamic_tails_built;
+    dynamic_tails_built = false;
     parked.key = index_file_name;
     parked.index_token = index_token;
     parked.rows = index_rows_loaded;
@@ -1805,6 +1815,10 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         cached_dynamic_aos_roots.clear();
         cached_paths_blocks.clear();
         cached_parent_paths_blocks.clear();
+        // Its keys are substrings of the path texts above, so they die with them: the
+        // map has to go too, not merely be treated as stale.
+        dynamic_aos_tails.clear();
+        dynamic_tails_built = false;
         // index_rows_loaded > 0 means "the containers above hold that many decoded
         // rows" — the handoff relies on it, so dropping the decode drops the counter.
         index_rows_loaded = 0;
@@ -3341,6 +3355,45 @@ PanzerDB::RowSlice PanzerDB::rowsForTime(std::string_view path, int64_t time_ind
     if (lo == 0) return {nullptr, 0};
     return {&rows[lo - 1], 1};
 }
+void PanzerDB::buildDynamicAosTails() const {
+    getLeaves();  // leaf_lookup and the path blocks it views have to exist first
+    dynamic_aos_tails.clear();
+    for (const auto& kv : leaf_lookup) {
+        const std::string_view path = kv.first;
+        // Filed under EVERY root the path sits under, not just the first one the root
+        // search would pick: the search resolves the ROOT from the requested path, and a
+        // path may be reachable through a nested dynamic AoS whose root is not the one it
+        // resolves to. Filing it once could then answer "no family" where a row exists,
+        // i.e. drop data -- so the index stays deliberately over-inclusive.
+        for (const auto& root : cached_dynamic_aos_roots) {
+            if (path.size() <= root.size() || path[root.size()] != '/' ||
+                path.compare(0, root.size(), root) != 0) continue;
+            const std::string_view rest = path.substr(root.size() + 1);
+            const std::string_view::size_type slash = rest.find('/');
+            const std::string_view element =
+                (slash == std::string_view::npos) ? rest : rest.substr(0, slash);
+            // Only a numeric element can be reached: the substitution asks for
+            // root + "/" + to_string(idx) + suffix, and idx is never negative here.
+            bool numeric = !element.empty();
+            for (char c : element) if (c < '0' || c > '9') { numeric = false; break; }
+            if (!numeric) continue;
+            const std::string_view tail =
+                (slash == std::string_view::npos) ? std::string_view() : rest.substr(slash);
+            dynamic_aos_tails[root].insert(tail);
+        }
+    }
+    dynamic_tails_gen = leaf_cache_gen;
+    dynamic_tails_rows = index_rows_loaded;
+    dynamic_tails_built = true;
+}
+bool PanzerDB::dynamicAosFamilyHasRows(const std::string& root, const std::string& suffix) const {
+    if (!dynamic_tails_built || dynamic_tails_gen != leaf_cache_gen ||
+        dynamic_tails_rows != index_rows_loaded)
+        buildDynamicAosTails();
+    const auto it = dynamic_aos_tails.find(root);
+    if (it == dynamic_aos_tails.end()) return false;
+    return it->second.find(std::string_view(suffix)) != it->second.end();
+}
 int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
                                              int64_t prefer_direction,
                                              const std::vector<double>& time_basis,
@@ -3399,6 +3452,24 @@ int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requ
     const bool target_live = path_has_rows(target_path);
     const bool generic_live = !generic_path.empty() && path_has_rows(generic_path);
     if (!target_live && !generic_live && dynamic_aos.empty()) return -1;
+
+    // Only the substituted form can answer now, and whether it exists AT ALL is a
+    // property of the decoded table, not of the requested index: if no row sits under
+    // this root with this tail, no index can be reached and the scans below would walk
+    // the whole time base to say so. Measured on 54924 occurrence 3 (V2): 501 of the
+    // 535 paths one getSlice asks for are absent, 8.1M probes, 402 of the 424 CPU-ms
+    // of the first slice read of a process (to_improve.md point 24).
+    const bool family_live = (!target_live && !generic_live)
+                                 ? dynamicAosFamilyHasRows(dynamic_aos, remainder_suffix)
+                                 : true;
+
+    if (!family_live) {
+        // Same conclusion the two scans would have reached, recorded the same way so
+        // the next read of this path stops before even resolving the root.
+        if (nb > 0 && requested_idx >= 0 && requested_idx <= hi)
+            no_slice_at_any_index[target_path] = nb;
+        return -1;
+    }
 
     auto path_covers = [&](const std::string& path, int64_t idx) -> bool {
         for (size_t lidx : rowsForTime(path, idx)) {
