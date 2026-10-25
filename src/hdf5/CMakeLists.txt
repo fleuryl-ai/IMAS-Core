@@ -203,6 +203,10 @@ al_add_hdf5_test(test_al_timeslice_nested_x_point)
 # homogeneous / inhomogeneous timebases
 al_add_hdf5_test(test_al_homog_timebase_2d_signal)
 al_add_hdf5_test(test_al_inhom_timebase)
+# an inhomogeneous IDS may give a root-level signal its own time base as a sibling
+# leaf ("<sig>/time"); a slice read must follow that declared path instead of
+# falling back to a root "time" that such an IDS never writes.
+al_add_hdf5_test(test_al_inhom_root_signal_slice)
 
 # gap handling
 al_add_hdf5_test(test_al_gap_closest_prev)

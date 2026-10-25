@@ -320,9 +320,14 @@ public:
      * @brief Retrieves time values associated with a context.
      * @param ctx The context.
      * @param homogeneous_time Flag indicating if time is homogeneous.
+     * @param timebasename The timebase path the caller declared for this read.
+     * @param dataset_path Path of the node being read (flat, '&' separated). It is
+     *        what a declared RELATIVE timebase anchors on: out of an AoS the base
+     *        of "<signal>/data" is "<signal>/time", which no context carries.
      * @return Vector of time values.
      */
-    std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "") {
+    std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "",
+                                      const std::string& dataset_path = "") {
     refresh_index_if_needed();
     std::vector<double> time_values;
 
@@ -349,8 +354,38 @@ public:
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
     if (!arrCtx) { // Case where context is OperationContext
-        time_values = panzer_db_ptr->getWholeDynamicSignal("time"); // Fallback for root time
-        return time_values;
+        // Out of any AoS there is no element to anchor the base on, so the only
+        // sources left are the ones the caller declared: the timebase path of
+        // this read and the path of the node being read. A root "time" is tried
+        // last, never first -- an inhomogeneous IDS has nothing there, each
+        // signal carrying its own base as a sibling leaf ("<signal>/time"), and
+        // looking for it alone is what made get_slice/getSample throw.
+        std::vector<std::string> candidates;
+        const std::string flat_tb = cleanFlatPath(timebasename_copy);
+        if (!flat_tb.empty()) {
+            // The AL hands the timebase relative to the node's container (the
+            // writer paired "sig1/time" with writeData("sig1/data", "time")), so
+            // anchor it on the node's own parent first.
+            const std::string flat_node = cleanFlatPath(dataset_path);
+            const size_t sep = flat_node.find_last_of('&');
+            if (sep != std::string::npos)
+                candidates.push_back(flat_node.substr(0, sep) + "&" + flat_tb);
+            candidates.push_back(flat_tb);  // declared as an absolute path
+        }
+        candidates.push_back("time");
+
+        for (const std::string& candidate : candidates) {
+            const std::string root_key = "ROOT:" + candidate;
+            auto cached = time_values_cache.find(root_key);
+            if (cached != time_values_cache.end()) {
+                if (!cached->second.empty()) return cached->second;
+                continue;
+            }
+            std::vector<double> found = panzer_db_ptr->getWholeDynamicSignal(candidate);
+            time_values_cache[root_key] = found;
+            if (!found.empty()) return found;
+        }
+        return time_values;  // nothing declared resolved to a base
     }
 
     // Find the "timed" parent to build the timebase path

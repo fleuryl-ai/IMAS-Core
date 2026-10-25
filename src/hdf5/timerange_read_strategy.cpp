@@ -181,7 +181,7 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
     const bool per_element_timebase =
         homogeneous_time == 0 && !timebasename.empty() && !isTimedContext(ctx);
     if (per_element_timebase || time_basis_vector.empty()) {
-        time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename);
+        time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename, dataset_name);
         DEBUG_PRINT("Loaded time_basis_vector on demand, size: " << time_basis_vector.size());
     }
 
