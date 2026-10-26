@@ -207,6 +207,10 @@ al_add_hdf5_test(test_al_inhom_timebase)
 # leaf ("<sig>/time"); a slice read must follow that declared path instead of
 # falling back to a root "time" that such an IDS never writes.
 al_add_hdf5_test(test_al_inhom_root_signal_slice)
+# ... and a dynamic signal the dictionary declares but the file never wrote (neither
+# data nor base): the slice read answers "not available" instead of throwing on the
+# empty time base, the way the 1.0 reader leaves the node undefined.
+al_add_hdf5_test(test_al_missing_dynamic_signal_slice)
 
 # gap handling
 al_add_hdf5_test(test_al_gap_closest_prev)

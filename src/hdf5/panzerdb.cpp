@@ -4320,6 +4320,39 @@ int PanzerDB::readInterpolatedData(
                          void** data_out,
                          bool expect_time_dim) {
 
+    // A node this file does not hold has no row in the decoded table, at any time
+    // index. Settling that BEFORE the time base is consulted is what keeps a signal
+    // the dictionary declares but nobody wrote from dying inside DataInterpolation:
+    // such a signal has no base of its own either, and an empty time vector is
+    // precisely what getSlicesTimesIndices throws on two lines below -- so the
+    // absence of the data was never reported, only the absence of its base. The 1.0
+    // reader tests the dataset first (HDF5Reader::read_ND_Data) and leaves the node
+    // undefined. The resolution mirrors nearestAvailableSliceIndex, which keeps its
+    // own early-outs for signals that do exist.
+    auto filed_under_any_index = [this](const char* path) -> bool {
+        getLeaves(); // builds leaf_lookup and cached_dynamic_aos_roots
+        auto rows_for = [this](const std::string& p) -> bool {
+            const auto it = leaf_lookup.find(std::string_view(p));
+            return it != leaf_lookup.end() && !it->second.empty();
+        };
+        std::string target(path);
+        if (rows_for(target)) return true;
+        for (const auto& root : cached_dynamic_aos_roots) {
+            if (target.size() <= root.size() || target[root.size()] != '/' ||
+                target.compare(0, root.size(), root) != 0) continue;
+            // The reader addresses a node through the AoS index it carries, but the
+            // file may hold it under the generic path (index dropped) or under a
+            // different index of the same family -- either form can answer.
+            const std::string remainder = target.substr(root.size() + 1);
+            const auto slash = remainder.find('/');
+            const std::string suffix =
+                (slash == std::string::npos) ? std::string() : remainder.substr(slash);
+            if (rows_for(root + suffix)) return true;
+            return dynamicAosFamilyHasRows(root, suffix);
+        }
+        return false;
+    };
+    if (!filed_under_any_index(full_data_path)) return -1;
 
     DataInterpolation data_interpolation_component;
     std::map<std::string, int> times_indices;
