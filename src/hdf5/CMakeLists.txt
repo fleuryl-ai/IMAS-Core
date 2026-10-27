@@ -211,6 +211,11 @@ al_add_hdf5_test(test_al_inhom_root_signal_slice)
 # data nor base): the slice read answers "not available" instead of throwing on the
 # empty time base, the way the 1.0 reader leaves the node undefined.
 al_add_hdf5_test(test_al_missing_dynamic_signal_slice)
+# a homogeneous IDS resolves the AoS slice index on its root time base (one index row on
+# a bulk write) rather than the base the dynamic AoS keeps for itself (one row per step);
+# the gapped-AoS fixture pins why that cannot be done unconditionally -- its elements are
+# numbered in write order, behind the time axis.
+al_add_hdf5_test(test_al_homog_aos_element_index)
 
 # gap handling
 al_add_hdf5_test(test_al_gap_closest_prev)
