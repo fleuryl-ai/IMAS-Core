@@ -20,11 +20,31 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
 
         timebase_name = cleanFlatPath(sanitize_path(timed_parent, timebase_name));
 
-        std::string timebase_path = getPath(timed_parent, false);
+        std::string aos_path = getPath(timed_parent, false);
+        std::string timebase_path = aos_path;
         if (!timebase_path.empty()) timebase_path += "/";
         timebase_path += timebase_name;
 
-        slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
+        // The base a dynamic AoS keeps for itself is what maps a requested time onto an
+        // ELEMENT index, and the two bases part company as soon as the AoS skips time
+        // steps: the elements are then numbered 0,1,2... behind the time axis, and
+        // answering on the root base would point at elements the file never wrote. Where
+        // the AoS holds exactly one element per time point the two agree, and there the
+        // root base is the one worth asking -- a bulk write leaves it on a single index
+        // row, while the AoS's own base carries a row per time step, interleaved with the
+        // payloads that separate the steps, so reading it costs a chunk decompression per
+        // step (to_improve.md point 24). It is also the base the data read settles on
+        // (getTimeValues), so reading it adds nothing to the operation.
+        if (getHomogeneousTime() == 1) {
+            const std::vector<double> homogeneous_base = getTimeValues(nullptr, 1);
+            if (!homogeneous_base.empty() &&
+                panzer_db_ptr->getDynamicAOSSize(aos_path) == homogeneous_base.size()) {
+                slice_idx = panzer_db_ptr->getTimeIndex("time", opCtx->getTime(), opCtx->getInterpmode());
+            }
+        }
+        if (slice_idx < 0) {
+            slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
+        }
     }
 
     std::string path_container = getPath(ctx, false, slice_idx);
