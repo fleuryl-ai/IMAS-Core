@@ -44,6 +44,13 @@
  *   in the raw data dataset. This design is highly efficient for both writing and for
  *   reading specific time slices or data subsets.
  *
+ * - **Time Bases Stored Apart** (v4): the values of an IDS's time bases (`time`, and the
+ *   per-element base of a dynamic AoS such as `profiles_1d/time`) go to a block of their
+ *   own, `data_time_f64`, instead of the payload block. A base written one slice at a time
+ *   would otherwise be interleaved with the payloads of every slice, which spreads it over
+ *   the whole block: reading it back then decompresses every chunk of the block. The row
+ *   carries which block its offset belongs to (`Leaf::block`); see rawDatasetFor().
+ *
  * - **Array of Structures (AoS) Emulation**: PanzerDB emulates complex, nested data
  *   structures (Arrays of Structures) using a path-based system. For example, a path
  *   like "profiles_1d/0/ion/0/density" represents a specific data node within a
@@ -92,6 +99,15 @@ struct ChunkingConfig {
     size_t data_chunk_i32 = 262144;           // 1 MB per chunk (262k int32)
     size_t data_chunk_c128 = 65536;           // 1 MB per chunk (65k complex)
     size_t data_chunk_str = 128;             // 128 strings per chunk (~64 KB for fixed 512B elements)
+
+    // Time-base block (data_time_f64) chunking. Deliberately small and NOT tied to
+    // the usage profile: a time base is appended a few values at a time (one
+    // putSlice() = one flush = one H5Dset_extent + write), and flush()'s cost is the
+    // re-compression of the tail chunk (to_improve.md point 23). 512 doubles = 4 KiB
+    // keeps that tail re-compression negligible while a full read of an 8000-step
+    // base still costs 16 chunks instead of the 2198 the scatter in data_raw_f64
+    // used to touch.
+    size_t data_chunk_time = 512;
     
     // Path chunking
     size_t path_chunk_entries = 8192;         // 8k paths per chunk
@@ -148,21 +164,39 @@ inline constexpr uint64_t PANZER_INDEX_COLUMNS = 12;
 // (14 columns), inferred from the dataset extent.
 //   v2 (2): 12 u64 columns + /paths row-aligned (256B fixed C_S1 per row).
 //   v3 (3): 7 packed u64 columns + interned paths in /path_table (unique texts).
-// New files are written v3; APPEND keeps the layout of the file it opens.
+//   v4 (4): v3 packing + a raw block of its own for time bases (Leaf::block).
+// New files are written v4; APPEND keeps the layout of the file it opens.
+// A pre-v4 build CANNOT read a v4 file: it does not recognise the stamp, so it
+// falls back to the v2 column map on a 7-column table and decodes garbage. That
+// is accepted on purpose (no v2 file is in the field); the reader here refuses
+// anything above PANZER_INDEX_VERSION_V4 so the same mistake cannot happen again
+// against a future format.
 inline constexpr uint32_t PANZER_INDEX_VERSION_V2 = 2;
 inline constexpr uint32_t PANZER_INDEX_VERSION_V3 = 3;
+inline constexpr uint32_t PANZER_INDEX_VERSION_V4 = 4;
 inline constexpr uint64_t PANZER_INDEX_COLUMNS_V3 = 7;
 inline constexpr uint32_t PANZER_NO_PARENT_ROW_V3 = 0xFFFFFFFFu;
 inline constexpr uint32_t PANZER_NO_PATH_ROW_V3 = 0xFFFFFFFFu;
 
+// Name of the raw block holding time-base values (v4). It is a second
+// FLOAT64 block with its own append cursor, so the values of a base written
+// slice by slice stay contiguous instead of being scattered one per payload
+// block across data_raw_f64 (measured: 8000 values of a core_profiles time
+// base spread over 144M doubles -> every chunk of the block decompressed just
+// to read them; see to_improve.md point 24 and 30).
+inline constexpr const char *PANZER_TIME_DATASET = "data_time_f64";
+
 // v3 row packing inside the 7 u64 columns (see PANZER_INDEX_COLUMNS_V3):
 //   col0 offset(u64) | col1 count(u64)
 //   col2 path_id(u32 low) | parent_id(u32 high, 0xFFFFFFFF = no parent)
-//   col3 time_index(u32 low) | (flags | ndim<<8)(u32 high)
+//   col3 time_index(u32 low) | (flags | ndim<<8 | block<<12)(u32 high)
 //   col4 shape[0] | shape[1]<<32   col5 shape[2] | shape[3]<<32   col6 shape[4] | shape[5]<<32
 // Leaf::flags stays (kind | dtype<<4); ndim is recovered from bits 8..11 of the
-// stored word and masked out before reaching the public Leaf.
+// stored word and the raw block selector from bit 12, both masked out before
+// reaching the public Leaf. Bit 12 must NOT enter Leaf::flags: the data type is
+// read as flags>>4 all over the read path.
 inline constexpr uint64_t PANZER_V3_NDIM_SHIFT = 8;
+inline constexpr uint64_t PANZER_V3_BLOCK_SHIFT = 12;
 
 /**
  * @struct PathComponents
@@ -233,6 +267,11 @@ public:
         uint64_t offset = 0;            // Element offset of this leaf inside its raw data dataset.
         uint64_t count = 0;             // Number of stored elements (slice_volume * n_time_steps).
         uint64_t flags = 0;             // low 4 bits: node kind; upper bits: DataType. See struct doc.
+        // Which raw block `offset` addresses: 0 = the block of this leaf's data type
+        // (data_raw_f64/_i32/_c128/_str), 1 = the time-base block (data_time_f64).
+        // Only v4 files can carry 1; every other layout leaves it at 0. Use
+        // rawDatasetFor()/rawExtentFor() instead of picking a dataset by type.
+        uint8_t block = 0;
         bool is_empty = false;          // Convenience flag mirroring (flags & 0xF) == 1.
         uint64_t row_id = 0;            // Position in /index (= getLeaves() vector index). Used for span-table lookup.
 
@@ -292,6 +331,9 @@ private:
     mutable hid_t data_dset_i32 = -1; // int64_t
     mutable hid_t data_dset_c128 = -1; // complex
     mutable hid_t data_dset_str = -1; // string
+    // Time-base block (v4): the values of an IDS's time bases live here, in a
+    // FLOAT64 block with its own append cursor. See PANZER_TIME_DATASET.
+    mutable hid_t data_dset_time = -1; // time bases (double)
     // Span-table dataset (only for list elements > STRING_MAX_LEN-1; empty if all compact)
     hid_t list_spans_dset = -1;
     std::vector<uint64_t> list_spans_buffer;   // 4 u64s per entry (row_id, element_idx, slot_offset, slot_span)
@@ -303,6 +345,7 @@ private:
     hsize_t disk_size_i32 = 0;
     hsize_t disk_size_c128 = 0;
     hsize_t disk_size_str = 0;
+    hsize_t disk_size_time = 0;
 
     /**
      * @brief (Re)loads the on-disk size of every raw data dataset into disk_size_*.
@@ -346,6 +389,7 @@ private:
     std::vector<int32_t> data_buffer_i32;
     std::vector<std::complex<double>> data_buffer_c128;
     std::vector<std::string> data_buffer_str;
+    std::vector<double> data_buffer_time;   // time-base values (v4, see PANZER_TIME_DATASET)
 
     std::vector<char> paths_buffer;       // Buffer for plain text paths (fixed size)
     std::vector<char> parent_paths_buffer;
@@ -434,6 +478,12 @@ private:
     mutable std::unordered_map<std::string, std::vector<double>> whole_signals;
     mutable uint64_t whole_signals_gen = 0;
     mutable uint64_t whole_signals_rows = 0;
+
+    // A union read whose range dwarfs the elements it recovers means the rows are
+    // scattered across a raw block (the pre-v4 time-base pattern). readLeavesUnion
+    // says so once per file: the symptom is a multi-second call with no explanation,
+    // and repeating it on every slice read of a campaign buries the log.
+    mutable bool scatter_warning_issued = false;
 
     /**
      * @brief Paths found to hold no slice at any index of a given time base.
@@ -730,6 +780,54 @@ public:
     static DataType leafDataType(const Leaf& leaf) {
         return static_cast<DataType>(leaf.flags >> 4);
     }
+
+    /**
+     * @brief Raw block a value lives in: 0 = the block of its data type,
+     *        1 = the time-base block (data_time_f64, v4 only).
+     */
+    enum RawBlock : uint8_t { RAW_BLOCK_TYPE = 0, RAW_BLOCK_TIME = 1 };
+
+    /**
+     * @brief Handle of the raw dataset holding a value of type `dtype` in block
+     *        `block`. Since v4 a FLOAT64 value can sit in either block, so a type
+     *        alone no longer identifies the dataset: every read must go through here.
+     * @return The dataset handle, or -1 when the block does not exist in this file
+     *         (a v3 file has no time block, and a leaf should not point at one).
+     */
+    hid_t rawDatasetFor(DataType dtype, uint8_t block) const {
+        if (block == RAW_BLOCK_TIME) return data_dset_time;
+        switch (dtype) {
+            case DataType::FLOAT64:         return data_dset_f64;
+            case DataType::INT32:           return data_dset_i32;
+            case DataType::COMPLEX128:      return data_dset_c128;
+            case DataType::STRING:
+            case DataType::LIST_OF_STRINGS:
+            case DataType::STRING_CHUNKED:  return data_dset_str;
+            default:                        return -1;
+        }
+    }
+    hid_t rawDatasetFor(const Leaf& leaf) const {
+        return rawDatasetFor(leafDataType(leaf), leaf.block);
+    }
+
+    /**
+     * @brief Materialised extent (element count) of a raw dataset, 0 if not open.
+     *
+     * The dangling-row guardrail in getLeaves() compares a DATA row's
+     * offset+count against this, so it must be the extent of the block the row
+     * actually addresses -- not of the dataset of its type.
+     */
+    uint64_t rawExtentFor(hid_t dset_id) const;
+
+    /**
+     * @brief Release every HDF5 handle this engine holds, without committing.
+     *
+     * A constructor that throws never runs a destructor, so an open refused for
+     * some reason of its own has to hand back what it already opened -- a file
+     * left registered read-only makes every later open of it fail with
+     * "file is already open for read-only".
+     */
+    void abandonOpenHandles();
 
     /**
      * @brief True for leaves storing a scalar string (compact or chunked).
@@ -1428,12 +1526,16 @@ private:
      * @param flags        Node kind (low 4 bits) or metadata marker.
      * @param parent_id    Row id of the enclosing AoS meta node, or PANZER_NO_PARENT_ROW.
      * @param index_value  Instance index within that parent AoS (0 if absent).
+     * @param block        Raw block the offset addresses (RawBlock). Stored only in a
+     *                     v4 file's packed row; ignored by the v2/legacy layouts,
+     *                     which have no time-base block to point at.
      * @return The row id assigned to the appended row (stable parent-first order).
      */
     uint64_t append_index_row(const std::string& full_path, const std::string& parent_path,
                                  const std::vector<size_t>& shape, uint64_t type,
                                  uint64_t time_idx, uint64_t offset, uint64_t count, uint64_t flags,
-                                 uint64_t parent_id, uint64_t index_value);
+                                 uint64_t parent_id, uint64_t index_value,
+                                 uint8_t block = RAW_BLOCK_TYPE);
 
     /**
      * @brief v3 only: returns the /path_table id of `full_path`, appending the text

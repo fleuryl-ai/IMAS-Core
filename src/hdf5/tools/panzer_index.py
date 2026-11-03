@@ -13,6 +13,10 @@ kind, type, ndim, shape, time, offset, count, parent — le même décodage que
   - type  = flags >> 4   ; 0=F64 1=I32 2=C128 3=STR 4=STR_LIST 5=STR_CHUNKED
   - layout v3 (7 colonnes + attribut index_version=3) : lignes packées 56 o et
     chemins internés dans /path_table ; décodé ici vers la vue 12 colonnes
+  - layout v4 (7 colonnes + index_version=4) : même packing, bit 12 du mot
+    drapeaux = bloc brut (0 = data_raw_*, 1 = data_time_f64). La colonne
+    affichée « blk » nomme le dataset où « off » pointe ; elle ne passe JAMAIS
+    par type (= flags >> 4), qui reste masqué à 0xFF comme côté lecteur C++
   - layout v2 12 colonnes : ndim | shape[6] | time | off | count | flags | parent
   - layout 14 colonnes (legacy) : + col. "type" en tête et "index_value" en queue (jamais lues)
 
@@ -49,7 +53,8 @@ NO_PARENT = 0xFFFFFFFFFFFFFFFF
 KIND_NAMES = {0: "data", 1: "empty", 2: "aos-static", 3: "aos-dyn"}
 KIND_ALIASES = {name: k for k, name in KIND_NAMES.items()}
 TYPE_NAMES = {0: "F64", 1: "I32", 2: "C128", 3: "STR", 4: "STR_LIST", 5: "STR_CHUNKED"}
-RAW_DATASETS = ("data_raw_f64", "data_raw_i32", "data_raw_c128", "data_raw_str")
+RAW_DATASETS = ("data_raw_f64", "data_raw_i32", "data_raw_c128", "data_raw_str",
+                "data_time_f64")
 
 
 def parent_path_of(path, kind):
@@ -65,35 +70,45 @@ def parent_path_of(path, kind):
 
 
 def colmap(ncols):
-    """Indices des colonnes décodées ; miroir de ``PanzerDB::getLeaves()``."""
+    """Indices des colonnes décodées ; miroir de ``PanzerDB::getLeaves()``.
+
+    ``block`` est la colonne du bloc brut (v4 seulement) ; None ailleurs : une
+    ligne v2/legacy n'a pas de bloc temps, ses offsets sont dans data_raw_*."""
     if ncols == 14:  # legacy : "type" en tête + "index_value" en queue (jamais relues)
-        return dict(ndim=1, shape=2, time=8, off=9, cnt=10, flags=11, parent=12)
+        return dict(ndim=1, shape=2, time=8, off=9, cnt=10, flags=11, parent=12, block=None)
     if ncols == 12:  # v2 : ndim | shape[6] | time | offset | count | flags | parent_id
-        return dict(ndim=0, shape=1, time=7, off=8, cnt=9, flags=10, parent=11)
+        return dict(ndim=0, shape=1, time=7, off=8, cnt=9, flags=10, parent=11, block=None)
+    if ncols == 13:  # vue décodée du packing v3/v4 : les 12 colonnes v2 + bloc
+        return dict(ndim=0, shape=1, time=7, off=8, cnt=9, flags=10, parent=11, block=12)
     raise ValueError(
-        "dataset 'index' à {} colonnes : layout inconnu (attendu 7 (v3), 12 ou 14)".format(ncols))
+        "dataset 'index' à {} colonnes : layout inconnu (attendu 7 (v3/v4), 12 ou 14)".format(ncols))
 
 
 M32 = 0xFFFFFFFF
 
 
-def is_v3(group):
-    """Version du format : attribut index_version, sinon déduction par les colonnes."""
+def index_version(group):
+    """Version du format telle qu'estampée (0 = sans attribut, déduit des colonnes)."""
     v = group["index"].attrs.get("index_version", 0)
     try:
-        v = int(v)
+        return int(v)
     except (TypeError, ValueError):
-        v = 0
-    return v == 3 or group["index"].shape[1] == 7
+        return 0
+
+
+def is_v3(group):
+    """Layout packé 7 colonnes (v3 comme v4 : même packing, le bloc est un bit)."""
+    return index_version(group) >= 3 or group["index"].shape[1] == 7
 
 
 def decode_v3(group):
-    """Décode les 7 colonnes u64 packées du layout v3 (+ /path_table interné)
-    dans la représentation 12 colonnes v2, miroir de PanzerDB::getLeaves().
+    """Décode les 7 colonnes u64 packées du layout v3/v4 (+ /path_table interné)
+    dans la représentation 12 colonnes v2 augmentée d'une 13e colonne pour le
+    bloc brut, miroir de PanzerDB::getLeaves().
 
     col0 offset | col1 count
     col2 path_id(u32 bas) | parent_id(u32 haut, 0xFFFFFFFF=racine)
-    col3 time(u32 bas) | (flags|ndim<<8)(u32 haut)
+    col3 time(u32 bas) | (flags|ndim<<8|block<<12)(u32 haut)
     col4..6 shape[0..5] (2×u32 par colonne)
     Retourne (rows_décodées, paths, n_entrées_path_table).
     """
@@ -104,7 +119,7 @@ def decode_v3(group):
     if "path_table" in group:
         table = [bytes(s).decode("utf-8", "replace").rstrip("\x00")
                  for s in group["path_table"][:]]
-    dec = numpy.zeros((n, 12), dtype=numpy.uint64)
+    dec = numpy.zeros((n, 13), dtype=numpy.uint64)
     paths = []
     for i in range(n):
         r = raw[i]
@@ -114,6 +129,7 @@ def decode_v3(group):
         sflags = int(r[3]) >> 32
         flags = sflags & 0xFF
         ndim = (sflags >> 8) & 0xF
+        block = (sflags >> 12) & 1
         dec[i][0] = ndim
         for d in range(6):
             dec[i][1 + d] = (int(r[4 + d // 2]) >> (32 * (d % 2))) & M32
@@ -122,6 +138,7 @@ def decode_v3(group):
         dec[i][9] = int(r[1])
         dec[i][10] = flags
         dec[i][11] = NO_PARENT if parent32 == 0xFFFFFFFF else parent32
+        dec[i][12] = block
         paths.append(table[pid] if pid < len(table) else "?id{}".format(pid))
     return dec, paths, len(table)
 
@@ -157,7 +174,7 @@ def dump_group(name, group, args):
     v3 = is_v3(group)
     if v3:
         rows, paths, n_path_entries = decode_v3(group)
-        ncols_decoded = 12
+        ncols_decoded = 13
     else:
         rows = idx[:]  # ndarray (n_rows, ncols), uint64
         paths = read_paths(group, n_rows)
@@ -194,7 +211,9 @@ def dump_group(name, group, args):
         return
 
     if v3:
-        layout = "7 colonnes v3 packées + /path_table interné ({} chemins uniques)".format(n_path_entries)
+        ver = index_version(group)
+        layout = "{} colonnes v{} packées + /path_table interné ({} chemins uniques)".format(
+            idx.shape[1], ver if ver else "3/4", n_path_entries)
     elif ncols == 14:
         layout = "14 colonnes  (legacy : type@col0 et index_value@col13 non lues)"
     else:
@@ -219,7 +238,10 @@ def dump_group(name, group, args):
         if (int(row[cm["flags"]] & 0xF) == 0
                 and int(row[cm["flags"]] >> 4) == 0  # F64
                 and (path == "time" or path.rsplit("/", 1)[-1] == "time")):
-            tb.append("{} (row {}, {} pts)".format(path, i, int(row[cm["cnt"]])))
+            in_time_block = cm["block"] is not None and int(row[cm["block"]])
+            tb.append("{} (row {}, {} pts{})".format(
+                path, i, int(row[cm["cnt"]]),
+                ", data_time_f64" if in_time_block else ""))
     if tb:
         lines.append("timebase(s) : " + "  ".join(tb))
     extents = ["{}={}".format(d, group[d].shape[0]) for d in RAW_DATASETS if d in group]
@@ -241,6 +263,11 @@ def dump_group(name, group, args):
         flags = int(row[cm["flags"]])
         dtype = flags >> 4
         type_s = "-" if kind in (1, 2, 3) else TYPE_NAMES.get(dtype, "t{}".format(dtype))
+        # « blk » : où « off » pointe. v4 range les bases de temps dans
+        # data_time_f64 ; v3/v2/legacy n'ont qu'un bloc F64, tout est « raw ».
+        blk_col = cm["block"]
+        blk_s = "-" if (kind in (1, 2, 3) or blk_col is None) else (
+            "time" if int(row[blk_col]) else "raw")
         ndim = int(row[cm["ndim"]])
         if ndim:
             shape = "[" + ",".join(
@@ -269,10 +296,11 @@ def dump_group(name, group, args):
                     slices = str(total)
         table.append((
             str(i), path, KIND_NAMES.get(kind, "k{}".format(kind)), type_s,
-            str(ndim), shape, str(int(row[cm["time"]])), slices,
+            blk_s, str(ndim), shape, str(int(row[cm["time"]])), slices,
             str(int(row[cm["off"]])), str(int(row[cm["cnt"]])), parent))
 
-    headers = ("row", "path", "kind", "type", "ndim", "shape", "t", "slices", "off", "count", "parent")
+    headers = ("row", "path", "kind", "type", "blk", "ndim", "shape", "t", "slices",
+               "off", "count", "parent")
     widths = [max(len(h), max(len(r[j]) for r in table)) for j, h in enumerate(headers)]
 
     def fmt(cells):

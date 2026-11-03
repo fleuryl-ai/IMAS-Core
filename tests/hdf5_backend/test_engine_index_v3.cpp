@@ -1,13 +1,15 @@
 // @file  test_engine_index_v3.cpp
 // @brief v3 index format contract (REVIEW_PERF point 13/14/16):
-//   * new files carry /index with an "index_version"=3 attribute, 7 packed
-//     u64 columns, and an interned /path_table instead of row-aligned /paths;
+//   * new files carry /index with an "index_version" attribute (v4 today, same
+//     7 packed u64 columns as v3), and an interned /path_table instead of
+//     row-aligned /paths;
 //   * repeated paths cost ONE path_table entry (dedup), not one per row;
 //   * round-trip of the public Leaf surface is unchanged (path/parent/shape/
 //     flags/offsets), including APPEND continuation (stable ids, no path
 //     duplication);
-//   * a hand-crafted legacy 12-column file (no attribute, row-aligned /paths)
-//     is still readable (upward compatibility).
+//   * a hand-crafted v3 file (stamped 3, no time-base block) and a hand-crafted
+//     legacy 12-column file (no attribute, row-aligned /paths) are both still
+//     readable (upward compatibility).
 #include "panzerdb.h"
 #include <hdf5.h>
 
@@ -90,7 +92,7 @@ int main() {
 
     hid_t f = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     HARD_CHECK(f >= 0);
-    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V3 && "new file must be stamped v3");
+    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V4 && "new file must be stamped v4");
     const hsize_t path_entries = dset_rows(f, "path_table");
     HARD_CHECK(path_entries > 0 && "v3 must own a /path_table");
     HARD_CHECK(dset_rows(f, "paths") == 0 && "v3 must NOT carry row-aligned /paths");
@@ -231,8 +233,84 @@ int main() {
         db.close();
     }
 
+    // ------------------------------------------------------------------
+    // 4. v3 compatibility: hand-craft a file stamped index_version=3 — packed
+    //    7 columns, interned /path_table, NO data_time_f64 (a v3 file has no
+    //    time-base block). This is exactly a file written by the previous build,
+    //    so its rows must decode with the block bit at 0 and its offsets must
+    //    still be read from data_raw_f64.
+    //    One meta row (dyn AoS "leg3") + one data row "leg3/0/y" (2 f64).
+    // ------------------------------------------------------------------
+    const std::string v3_name = "test_index_v3_v3file.h5";
+    if (fs::exists(v3_name)) fs::remove(v3_name);
+    {
+        hid_t lf = H5Fcreate(v3_name.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims[2] = {2, 7}, maxd[2] = {H5S_UNLIMITED, 7}, chunk[2] = {16, 7};
+        hid_t sp = H5Screate_simple(2, dims, maxd);
+        hid_t pl = H5Pcreate(H5P_DATASET_CREATE);
+        H5Pset_chunk(pl, 2, chunk);
+        hid_t idx = H5Dcreate2(lf, "index", H5T_STD_U64LE, sp, H5P_DEFAULT, pl, H5P_DEFAULT);
+        H5Sclose(sp);
+        // col3 low = time, high = flags | ndim<<8 | block<<12 (bit left at 0: v3)
+        uint64_t rows[2][7] = {
+            {0, 0, 0 | ((uint64_t)PANZER_NO_PARENT_ROW_V3 << 32), (uint64_t)3 << 32 | ((uint64_t)1 << 40), 0, 0, 0},
+            {0, 2, 1 | ((uint64_t)0 << 32),                      (uint64_t)0 << 32 | ((uint64_t)1 << 40), 2, 0, 0},
+        };
+        H5Dwrite(idx, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, rows);
+        hsize_t avdim[1] = {1};
+        hid_t avsp = H5Screate_simple(1, avdim, nullptr);
+        hid_t av = H5Acreate2(idx, "index_version", H5T_STD_U32LE, avsp, H5P_DEFAULT, H5P_DEFAULT);
+        const uint32_t stamp = PANZER_INDEX_VERSION_V3;
+        H5Awrite(av, H5T_NATIVE_UINT32, &stamp);
+        H5Aclose(av); H5Sclose(avsp);
+        H5Dclose(idx); H5Pclose(pl);
+
+        hid_t st = H5Tcopy(H5T_C_S1);
+        H5Tset_size(st, 256);
+        H5Tset_strpad(st, H5T_STR_NULLPAD);
+        hsize_t pdims[1] = {2}, pmax[1] = {H5S_UNLIMITED}, pchunk[1] = {16};
+        hid_t psp = H5Screate_simple(1, pdims, pmax);
+        hid_t ppl = H5Pcreate(H5P_DATASET_CREATE);
+        H5Pset_chunk(ppl, 1, pchunk);
+        hid_t pds = H5Dcreate2(lf, "path_table", st, psp, H5P_DEFAULT, ppl, H5P_DEFAULT);
+        H5Sclose(psp);
+        char pbuf[2][256] = {};
+        std::snprintf(pbuf[0], 256, "leg3");
+        std::snprintf(pbuf[1], 256, "leg3/0/y");
+        H5Dwrite(pds, st, H5S_ALL, H5S_ALL, H5P_DEFAULT, pbuf);
+        H5Dclose(pds); H5Pclose(ppl); H5Tclose(st);
+
+        hsize_t ddims[1] = {2}, dmax[1] = {H5S_UNLIMITED}, dchunk[1] = {16};
+        hid_t dsp = H5Screate_simple(1, ddims, dmax);
+        hid_t dpl = H5Pcreate(H5P_DATASET_CREATE);
+        H5Pset_chunk(dpl, 1, dchunk);
+        hid_t dds = H5Dcreate2(lf, "data_raw_f64", H5T_IEEE_F64LE, dsp, H5P_DEFAULT, dpl, H5P_DEFAULT);
+        H5Sclose(dsp);
+        double dvals[2] = {33.0, 44.0};
+        H5Dwrite(dds, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, dvals);
+        H5Dclose(dds); H5Pclose(dpl);
+        H5Fclose(lf);
+    }
+    {
+        PanzerDB db(v3_name, PanzerDB::OpenMode::READ);
+        const auto& leaves = db.getLeaves();
+        HARD_CHECK(leaves.size() == 2 && "v3 file: 2 rows decoded");
+        const PanzerDB::Leaf* y = find_leaf(leaves, "leg3/0/y");
+        HARD_CHECK(y && "v3 data row decoded");
+        HARD_CHECK(y->parent_path == "leg3/0" && "v3 parent reconstructed from text rule");
+        HARD_CHECK(y->count == 2 && y->ndim == 1 && y->shape[0] == 2);
+        HARD_CHECK(y->block == 0 && "a v3 row addresses the payload block");
+        double out[2] = {0, 0};
+        db.readTensor(*y, out);
+        HARD_CHECK(out[0] == 33.0 && out[1] == 44.0 &&
+                   "v3 offsets still address data_raw_f64");
+        std::cout << "  [OK] hand-crafted v3 file (stamped 3, no time block) still readable\n";
+        db.close();
+    }
+
     fs::remove(filename);
     fs::remove(legacy_name);
+    fs::remove(v3_name);
     std::cout << "\nALL TESTS PASSED!\n";
     return 0;
 }

@@ -130,6 +130,9 @@ al_add_hdf5_test(test_engine_commit_order_guardrail)
 # v3 index format: packed 7-column /index + interned /path_table, version
 # attribute, and upward compatibility with legacy 12-column files.
 al_add_hdf5_test(test_engine_index_v3)
+# v4 time-base block (data_time_f64): both time bases get their own raw block and
+# stay contiguous, and a stamped-ahead index_version is refused by name.
+al_add_hdf5_test(test_engine_time_base_layout)
 # Counters table that restoreTimeContext() rebuilds at open (aos_time_counters):
 # what getDynamicAOSSize / getAOSShape answer in READ, and where APPEND resumes.
 al_add_hdf5_test(test_engine_time_context)

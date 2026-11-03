@@ -1724,5 +1724,150 @@ avant de conclure.
 (15 nœuds, `d_elems 0`), donc ses chiffres ne représentent pas le chemin d'un IDS réel (`developer_guide_v2.1.md`
 §11 dit la même chose : ce binaire n'est pas enregistré comme test).
 
+---
+
+## 30. Les bases de temps dorment dans `data_raw_f64` : un `getSlice()` qui relit 836,6 MiB pour 16 000 doubles — layout v4 (2026-11-02)
+
+**Le symptôme.** Deux commandes tapées à la main, le 2026-11-02, sur les arbres de l'étude
+`IMAS-Cpp/benchmark_put_vs_putslice` : un `getSlice()` sur `tree_8000x2000_slice_v2` met **3,75 s**, le même appel
+sur `tree_8000x2000_slice_v1` met **0,105 s**. Le rapport du 27/10 (§7.2) avait chiffré cet appel sans
+l'expliquer : « 836,6 MiB relus pour répondre à une question sur 144 ko de valeurs ».
+
+**Base mesurée** — un seul `getSlice()` dans un processus neuf, sur chaque fichier nommé (campagne
+`2026-10-27`, layout **v3**), sous `/usr/bin/time -v strace -e trace=pread64` :
+
+| un `getSlice()` lisant le fichier nommé | paroi | octets physiques sur `core_profiles.h5` | RSS crête |
+|---|---|---|---|
+| `tree_8000x2000_slice_v2` (écrit par `putSlice()`, v3) | 4,87 s | **836,6 MiB** en 2 292 `pread64` | **1 208 MiB** |
+| `tree_8000x2000_put_v2` (écrit par `put()`, v3) | 0,58 s | 0,9 MiB en 55 appels | 50 MiB |
+| `tree_8000x2000_slice_v1` (écrit par `putSlice()`, 1.0) | 0,56 s | 0,3 MiB en 169 appels | 32 MiB |
+| `tree_8000x2000_put_v1` (écrit par `put()`, 1.0) | 0,95 s | 12,7 MiB en 119 appels | 52 MiB |
+
+L'outil est `benchmark_put_vs_putslice/readbytes.sh`, pas la colonne `rss_MiB=` du pilote : `rssBytes()` lit
+`/proc/self/statm` **après** l'appel, une fois le tampon rendu, et affichait 108 MiB là où la crête valait
+1 237 336 kB.
+
+**La cause — l'index, pas le chronomètre.** `panzer_index.py` sur `tree_8000x2000_slice_v2/core_profiles.h5`
+(layout v3, block `data_raw_f64` de 144 024 000 éléments) :
+
+| lignes de la table `index` du fichier nommé, lues par un `getSlice()` | lignes | Σ `count` | étendue balayée | ratio étendue/Σ |
+|---|---|---|---|---|
+| `time` (base de temps racine) | 8 000 | 8 000 | 144 005 998 | **18 000,7** |
+| `profiles_1d/time` (base de temps de l'AoS) | 8 000 | 8 000 | 144 005 998 | **18 000,7** |
+
+Les deux bases avancent d'un **pas constant de 18 003** éléments — chaque tranche écrit 2 000 points × 8
+quantités, plus sa base de temps. 8 000 lignes d'un seul double étalées sur 144 006 000 éléments recouvrent
+**99,99 %** du dataset : avec un chunk de 65 536, cela fait **2 198 chunks** à relire, soit 836,6 MiB et
+1 208 MiB de RSS, pour 8 000 doubles réellement demandés.
+
+**Ce qui n'était pas en cause.** Le lecteur. Un chunk de 65 536 doubles ne contient que 3 à 4 valeurs de temps :
+aucune politique de fusion de fenêtres, aucun cache, aucune lecture séquentielle ne peut rattraper un facteur 18
+000. Le coût se prend à l'**écriture** — c'est un choix de layout, pas une régression du chemin de lecture. Le
+`getSlice()` chaud (moyenne 1,13 ms sur 100 appels) n'a jamais été en cause : c'est le premier appel, celui qui
+pose l'union des fenêtres, qui paye.
+
+**Le correctif — un bloc de temps séparé, estampillé v4.**
+
+- Dataset `data_time_f64` (`PANZER_TIME_DATASET`), chunk `ChunkingConfig::data_chunk_time = 512` — 512 doubles,
+  pas 65 536 : le bloc ne contient que des bases de temps, sa densité n'a rien à voir avec celle des valeurs.
+- Estampille `PANZER_INDEX_VERSION_V4 = 4` dans l'attribut `index_version`. Les portails de lecture restent
+  `>= V3` : un fichier v3 ou legacy se lit toujours, avec son ancien layout. Une version **inconnue** (supérieure)
+  est refusée **par son nom** — `rejectUnknownIndexVersion()` lève un `ALBackendException` dont le message
+  contient `index_version=N`, sur les deux chemins `READ` et `APPEND`. Silencieux, ce refus aurait lu un layout
+  dont il ne connaît pas la colonne `block`.
+- Le bloc d'appartenance d'une ligne d'index n'est plus déduit du dtype : `Leaf::block` porte
+  `RAW_BLOCK_TYPE` / `RAW_BLOCK_TIME`, et `append_index_row()` l'enregistre. Les 22 sites qui lisent
+  `flags >> 4` ne sont pas touchés — le bloc n'est **pas** un bit de `flags`.
+- Fenêtre bornée dans `readLeavesUnion()` : tampon de 32 MiB réutilisé, et **un** avertissement par fichier
+  quand `(hi-lo)/Σ count > 64`. C'est ce qui borne désormais l'ancienne dérive sur un fichier écrit avant v4 —
+  message réellement émis sur `tree_8000x2000_slice_v2` :
+  `reading 144005998 elements of /core_profiles/data_raw_f64 to recover 8000 (18000x): these index rows are
+  scattered across the block. Time bases get their own block in index v4 (files written by this build); this
+  file predates it. (first occurrence for this file)`
+
+**Le piège qui a fait perdre une campagne : `/time` contre `&time`.** La première campagne v4 a écrit
+`data_time_f64 shape={0}` et laissé `data_raw_f64` à 144 024 000 — **alors que `ctest` rendait 101/101**. Les
+tests du moteur appelaient `writeDataSlices(..., "time")` ; l'AL, lui, arrive avec une autre orthographe.
+`HDF5Writer_v2::write_ND_Data` convertit `/` en `&` dans le timebase, mais `begin_ND_AoS` passe
+`ctx->getTimebasePath()` **brut** : selon la jambe, le moteur recevait `/time` (AoS) ou `&time` (standalone),
+jamais `time`. Les deux prédicats qui routent vers le bloc de temps étaient donc **toujours faux**. Instrumentation
+temporaire (`std::cerr` dans `writeDataSlicesImpl` et `writeDataImpl`) + un appel réel via `buildpaths` →
+`dyn_tb=/time`, `arg_tb=&time`. Corrigé par `normalisedTimebase()` (remplace `&` par `/`, retire les slashs
+initiaux), appliqué aux deux prédicats. Leçon à garder : **un test qui imite l'API du moteur ne prouve rien sur
+le chemin de l'AL** ; les deux orthographes sont désormais exercées dans `test_engine_time_base_layout`.
+
+**Poignée de main trouvée par le test de refus.** Un `PanzerDB` dont le **constructeur** lève ne passe jamais par
+son destructeur : le refus d'ouvrir un `index_version` inconnu laissait `file_id` et les datasets ouverts, et le
+fichier restait enregistré en lecture seule chez HDF5 — l'ouverture suivante du même chemin échouait sur
+« file is already open for read-only ». Ce n'était pas un artefact de test : l'AL rattrape l'exception et
+continue. Corrigé par `abandonOpenHandles()` (ferme datasets et groupe, rend le handle du fichier, remet
+`file_id = -1` pour que le `close()` du destructeur sorte tout de suite), appelé aux deux sites de refus.
+
+**Après** — même pilote, mêmes géométries, campagne taguée `2026-11-02-v4` (les arbres du 27/10 sont intacts) :
+
+| structure du fichier nommé (`structure.sh`, `h5ls`) | v3 (27/10) | v4 (02/11) |
+|---|---|---|
+| `data_raw_f64` de `tree_8000x2000_slice_v2` écrit par `putSlice()` | 144 024 000 éléments | **144 008 000** |
+| `data_time_f64` du même fichier | absent | **16 000** |
+| `core_profiles.h5` de `tree_8000x2000_slice_v2` | 877 385 294 o | 876 728 012 o |
+| ratio étendue/Σ count d'une base de temps (les deux chemins `time`) | 18 000,7 | **2,00** |
+
+| un `getSlice()` lisant le fichier nommé (campagne `2026-11-02-v4`) | paroi | octets physiques sur `core_profiles.h5` | RSS crête |
+|---|---|---|---|
+| `tree_8000x2000_slice_v2` (v4) | **0,22 s** | **0,9 MiB** en 89 appels | **60 MiB** |
+| `tree_8000x2000_put_v2` (v4) | 0,32 s | 0,9 MiB en 73 appels | 57 MiB |
+| `tree_8000x2000_slice_v1` (1.0, inchangé) | 0,18 s | 0,3 MiB en 158 appels | 36 MiB |
+| `tree_8000x2000_put_v1` (1.0, inchangé) | 1,14 s | 12,7 MiB en 108 appels | 54 MiB |
+
+Sur la jambe de 100 `getSlice()` en un seul processus (`results_slice_8000x2000_slice_v2_*`) : jambe
+3,706 s → **0,231 s**, pire appel **3 555,92 ms → 89,31 ms**, médiane 1,13 → 1,15 ms. Sur le `get()` complet du
+même fichier (`results_get3_8000x2000_slice_v2_*`) : 13,70 s → **10,42 s**, et 2 472,4 MiB → **1 635,5 MiB** en
+4 427 `pread64`. Les trois autres cellules (deux fichiers 1.0, un fichier 2.0 écrit par `put()`) ne bougent pas.
+
+**Les valeurs ne bougent pas.** Les digest des 21 tableaux sont identiques ligne à ligne entre les deux
+campagnes sur les **12** cellules `digest` (3 géométries × put/slice × v1/v2) ; seule la ligne `uri=` diffère,
+parce que l'arbre porte un suffixe de campagne. C'est le contrôle qui distingue un changement de layout d'un
+changement de données.
+
+**Gardes.** `tests/hdf5_backend/test_engine_time_base_layout.cpp` (cinq sections : tranche à tranche, `bulk`
+temporel, `APPEND`, **les deux orthographes de l'AL `/time` et `&time`**, refus nommé de `index_version=99` en
+`READ` et `APPEND`) ; `test_engine_index_v3.cpp` estampille v4 + fichier v3 synthétique ; 
+`test_al_upgrade_v1_to_v2.cpp` vérifie que `data_time_f64` est **rempli** après upgrade, pas seulement présent ;
+`test_al_convert_v2_to_v1.cpp` liste le dataset à supprimer ; `test_engine_commit_order_guardrail.cpp` garde sa
+garde `version >= 3`. `ctest` : **101/101**.
+
+**Reste ouvert.**
+- Le ratio par chemin est **2,00**, pas 1,00 : les deux bases de `core_profiles` sont entrelacées dans le même
+  bloc, donc la fenêtre d'un instant couvre deux emplacements pour une valeur par base. Le bloc entier, lui, est
+  dense (16 000 lignes, offsets 0..15 999 sans trou, ratio 1,00). Une paire de valeurs tombe toujours sur des
+  offsets pair+impair, donc **jamais** de part et d'autre d'une frontière de chunk de 512 : un `getSlice()` touche
+  **un** chunk de `data_time_f64`, contre 2 198 chunks de `data_raw_f64` avant.
+- Le `get()` sur le fichier appendu reste à 1 635,5 MiB, soit ~1,9 passe du fichier (836 MiB sur le fichier écrit
+  par un seul `put()`). Ce surcroît vient de l'entrelacement des **feuilles** dans `data_raw_f64` — deux feuilles
+  voisines dans le fichier se lisent dans des groupes différents et se chevauchent — et non des bases de temps.
+  Non traité.
+- L'alignement de gap préexistant construit `dynamic_aos_path + "/" + dynamic_aos_timebase` avec le timebase
+  **brut**, donc `profiles_1d//time` côté C++ : le lookup dans `aos_time_counters` échoue en silence et le
+  rattrapage ne s'applique pas sur ce chemin. Volontairement **pas touché** ici (hors périmètre), mais à corriger
+  avec la même normalisation.
+- Les fichiers déjà écrits en v3 gardent leur layout et leur coût en octets : le correctif est du côté de
+  l'écriture. Ce que la fenêtre bornée leur apporte, mesuré sur le **même** fichier
+  (`tree_8000x2000_slice_v2`, jambe `get-slice -N 10 -R 10`, une seule lecture de l'union) :
+
+  | la jambe qui relit `tree_8000x2000_slice_v2` (layout v3) | bibliothèque du 27/10 | bibliothèque du 02/11 |
+  |---|---|---|
+  | octets physiques sur `core_profiles.h5` (un seul `getSlice()`, `strace`) | 836,6 MiB en 2 292 | **836,6 MiB en 2 290** (inchangé) |
+  | RSS de la jambe de 100 appels | 1 264 620 kB | **143 664 kB** |
+  | paroi de la jambe de 100 appels | 4,05 s | 5,03 s |
+  | RSS de la jambe `digest` sur ce même fichier | 2 481 612 kB | **1 377 112 kB** |
+
+  Les 19 lignes `[DIGEST] array=` de la jambe `digest` rendue par la bibliothèque neuve sur
+  ce fichier v3 sont identiques à celles du 27/10 : la fenêtre change la façon d'atteindre
+  les octets, pas ce qu'ils disent.
+
+  Donc : mémoire divisée par ~8,8, octets inchangés, et ~24 % de temps en plus sur ce fichier — la fenêtre
+  découpe l'union en passes au lieu de la matérialiser d'un coup. L'avertissement, lui, nomme le fichier et son
+  facteur d'amplification. Un pulse existant ne devient pas v4 tout seul.
+
 
 

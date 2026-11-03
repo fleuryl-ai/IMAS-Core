@@ -354,14 +354,16 @@ int main() {
         }
 
         std::cout << "--- Phase 5: no v2 table left in the IDS file ---\n";
-        for (const char *table : {"index", "paths", "path_table", "data_raw_f64", "list_spans"}) {
+        for (const char *table : {"index", "paths", "path_table", "data_raw_f64",
+                                  "data_time_f64", "list_spans"}) {
             if (v2_table_left(table)) {
                 std::cerr << "'" << table << "' is still in " << IDS_FILE
                           << " -- the v2 storage survived the conversion" << std::endl;
                 return 1;
             }
         }
-        std::cout << "    index / paths / path_table / data_raw_f64 / list_spans: none left\n";
+        std::cout << "    index / paths / path_table / data_raw_f64 / data_time_f64 /"
+                     " list_spans: none left\n";
 
         std::cout << "--- Phase 6: the v1 datasets are there and hold the data ---\n";
         std::vector<double> want_times;

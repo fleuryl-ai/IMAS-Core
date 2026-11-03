@@ -162,7 +162,10 @@ std::string u64Text(uint64_t v) {
 // Type helpers (global PanzerDB naming)
 // --------------------------------------------------------------------------
 
-const char* dataRawName(PanzerDB::DataType dt) {
+const char* dataRawName(PanzerDB::DataType dt, uint8_t block) {
+    // v4 files keep time bases in their own FLOAT64 block; a leaf's offsets are
+    // relative to the block named by its Leaf::block, never to data_raw_f64.
+    if (block == PanzerDB::RAW_BLOCK_TIME) return PANZER_TIME_DATASET;
     switch (dt) {
         case PanzerDB::DataType::FLOAT64:         return "data_raw_f64";
         case PanzerDB::DataType::INT32:           return "data_raw_i32";
@@ -228,7 +231,7 @@ bool createVDS(hid_t file_id, hid_t view_root, const PanzerDB::Leaf& leaf,
     if (leaf.count == 0) return false;           // nothing to map
 
     auto dt = static_cast<PanzerDB::DataType>(leaf.flags >> 4);
-    const char* raw = dataRawName(dt);
+    const char* raw = dataRawName(dt, leaf.block);
     if (!raw) return false;
 
     // 1. Parent group
@@ -439,6 +442,7 @@ struct AggLeaf {
     std::vector<std::string> groupSegs;
     std::string              leafName;
     PanzerDB::DataType       dt = PanzerDB::DataType::UNKNOWN;
+    uint8_t                  block = 0;   // PanzerDB::RawBlock the offsets live in
     std::string              schema;
 
     // One slot per AoS level of the instance path, preceded by slot 0 holding
@@ -510,6 +514,10 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
             (ps.groupSegs.empty() && leafName == "index") ? std::string("index_node") : leafName;
 
         const auto dt = static_cast<PanzerDB::DataType>(rows.front()->flags >> 4);
+        // The writer routes a path's rows to one raw block for the whole file
+        // (data_dset_time either exists for the file or does not), so the first
+        // row's block is the block of every row in this group.
+        const uint8_t block = rows.front()->block;
         const std::string key = joinPath(ps.groupSegs) + '\x1f' + storedLeaf + '\x1f' + dtypeString(dt);
 
         AggLeaf& agg = aggs[key];
@@ -517,6 +525,7 @@ void buildAggregates(const std::vector<PanzerDB::Leaf>& leaves,
             agg.groupSegs = ps.groupSegs;
             agg.leafName  = storedLeaf;
             agg.dt        = dt;
+            agg.block     = block;
             agg.schema    = PanzerDB::stripIndices(fullPath);
             agg.timeName  = ps.groupSegs.empty() ? std::string("time") : ps.groupSegs.back();
             for (const auto& lv : ps.levels) {
@@ -715,7 +724,7 @@ bool createAggVDS(hid_t file_id, hid_t view_root, const AggLeaf& agg,
                   bool noAosGroups,
                   PublishStats& st)
 {
-    const char* raw = dataRawName(agg.dt);
+    const char* raw = dataRawName(agg.dt, agg.block);
     if (!raw || agg.cells.empty()) return false;
 
     std::vector<hsize_t> dims;

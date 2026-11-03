@@ -45,8 +45,10 @@ const int STEPS = 3;        // slices in the pulse (t = 0.0, 0.1, 0.2)
 
 // Both layouts put their objects in the group named after the IDS: "core_profiles/index" for the
 // v2 table, "core_profiles/time" for a v1 dataset. The names below are therefore path-like.
+// data_time_f64 is the v4 time-base block: an upgraded pulse keeps its time base there instead of
+// interleaving it with the signal payloads as v3 did.
 const char* V2_TABLES[] = {"core_profiles/index", "core_profiles/path_table",
-                           "core_profiles/data_raw_f64"};
+                           "core_profiles/data_raw_f64", "core_profiles/data_time_f64"};
 const char* V1_DATASETS[] = {"core_profiles/time", "core_profiles/profiles_1d[]&signal_1d"};
 
 double expected_value(int t_idx, int x) { return 100.0 + t_idx * 10.0 + x; }
@@ -327,6 +329,22 @@ int main() {
             if (object_in_IDS_file(name)) {
                 std::cerr << "'" << name << "' is still in " << IDS_FILE
                           << " -- the file holds both layouts, and only one of them will be read"
+                          << std::endl;
+                return 1;
+            }
+        }
+        // Presence is not the contract for the time-base block: WRITE creates it empty,
+        // so a pulse whose time base stayed among the payloads would still show the
+        // table. Read it back -- the AL hands the timebase around as "/time" and
+        // "&time", and the row has to be routed on the path those spellings name.
+        {
+            std::vector<hsize_t> tb_shape;
+            std::vector<double> tb_values;
+            if (!read_double_dataset("core_profiles/data_time_f64", tb_shape, tb_values) ||
+                tb_values.size() < (size_t)STEPS) {
+                std::cerr << "core_profiles/data_time_f64 holds " << tb_values.size()
+                          << " values, expected the " << STEPS
+                          << " of the pulse -- the time base did not move into the v4 block"
                           << std::endl;
                 return 1;
             }
