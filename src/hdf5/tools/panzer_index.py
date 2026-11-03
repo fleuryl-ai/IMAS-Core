@@ -17,6 +17,9 @@ kind, type, ndim, shape, time, offset, count, parent — le même décodage que
     drapeaux = bloc brut (0 = data_raw_*, 1 = data_time_f64). La colonne
     affichée « blk » nomme le dataset où « off » pointe ; elle ne passe JAMAIS
     par type (= flags >> 4), qui reste masqué à 0xFF comme côté lecteur C++
+  - layout v5 (7 colonnes + index_version=5) : le bloc brut occupe les bits 12
+    et 13 (0 = data_raw_*, 1 = data_time_f64, 2 = data_scalar_f64/_i32/_c128 —
+    les scalaires ayant une valeur par pas de temps, ex. global_quantities&ip)
   - layout v2 12 colonnes : ndim | shape[6] | time | off | count | flags | parent
   - layout 14 colonnes (legacy) : + col. "type" en tête et "index_value" en queue (jamais lues)
 
@@ -54,7 +57,8 @@ KIND_NAMES = {0: "data", 1: "empty", 2: "aos-static", 3: "aos-dyn"}
 KIND_ALIASES = {name: k for k, name in KIND_NAMES.items()}
 TYPE_NAMES = {0: "F64", 1: "I32", 2: "C128", 3: "STR", 4: "STR_LIST", 5: "STR_CHUNKED"}
 RAW_DATASETS = ("data_raw_f64", "data_raw_i32", "data_raw_c128", "data_raw_str",
-                "data_time_f64")
+                "data_time_f64",
+                "data_scalar_f64", "data_scalar_i32", "data_scalar_c128")
 
 
 def parent_path_of(path, kind):
@@ -72,8 +76,9 @@ def parent_path_of(path, kind):
 def colmap(ncols):
     """Indices des colonnes décodées ; miroir de ``PanzerDB::getLeaves()``.
 
-    ``block`` est la colonne du bloc brut (v4 seulement) ; None ailleurs : une
-    ligne v2/legacy n'a pas de bloc temps, ses offsets sont dans data_raw_*."""
+    ``block`` est la colonne du bloc brut (v4 : 1 bit ; v5 : 2 bits) ; None
+    ailleurs : une ligne v2/legacy n'a pas de bloc séparé, ses offsets sont dans
+    data_raw_*."""
     if ncols == 14:  # legacy : "type" en tête + "index_value" en queue (jamais relues)
         return dict(ndim=1, shape=2, time=8, off=9, cnt=10, flags=11, parent=12, block=None)
     if ncols == 12:  # v2 : ndim | shape[6] | time | offset | count | flags | parent_id
@@ -129,7 +134,7 @@ def decode_v3(group):
         sflags = int(r[3]) >> 32
         flags = sflags & 0xFF
         ndim = (sflags >> 8) & 0xF
-        block = (sflags >> 12) & 1
+        block = (sflags >> 12) & 3   # v4 : 0/1 ; v5 : 0=data_raw_*, 1=time, 2=scalar
         dec[i][0] = ndim
         for d in range(6):
             dec[i][1 + d] = (int(r[4 + d // 2]) >> (32 * (d % 2))) & M32
@@ -238,7 +243,7 @@ def dump_group(name, group, args):
         if (int(row[cm["flags"]] & 0xF) == 0
                 and int(row[cm["flags"]] >> 4) == 0  # F64
                 and (path == "time" or path.rsplit("/", 1)[-1] == "time")):
-            in_time_block = cm["block"] is not None and int(row[cm["block"]])
+            in_time_block = cm["block"] is not None and int(row[cm["block"]]) == 1
             tb.append("{} (row {}, {} pts{})".format(
                 path, i, int(row[cm["cnt"]]),
                 ", data_time_f64" if in_time_block else ""))
@@ -264,10 +269,12 @@ def dump_group(name, group, args):
         dtype = flags >> 4
         type_s = "-" if kind in (1, 2, 3) else TYPE_NAMES.get(dtype, "t{}".format(dtype))
         # « blk » : où « off » pointe. v4 range les bases de temps dans
-        # data_time_f64 ; v3/v2/legacy n'ont qu'un bloc F64, tout est « raw ».
+        # data_time_f64 et v5 les scalaires par pas de temps dans data_scalar_* ;
+        # v3/v2/legacy n'ont qu'un bloc F64, tout est « raw ».
         blk_col = cm["block"]
-        blk_s = "-" if (kind in (1, 2, 3) or blk_col is None) else (
-            "time" if int(row[blk_col]) else "raw")
+        blk_id = -1 if blk_col is None else int(row[blk_col])
+        blk_s = "-" if kind in (1, 2, 3) else {0: "raw", 1: "time", 2: "scalar"}.get(blk_id,
+                                                                                     "?{}".format(blk_id))
         ndim = int(row[cm["ndim"]])
         if ndim:
             shape = "[" + ",".join(

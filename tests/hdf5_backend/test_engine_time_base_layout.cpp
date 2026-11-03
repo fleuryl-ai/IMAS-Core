@@ -140,7 +140,7 @@ int main() {
 
     hid_t f = H5Fopen(slice_name.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     HARD_CHECK(f >= 0);
-    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V4 && "new file must be stamped v4");
+    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V5 && "new file must be stamped v5");
     const hsize_t time_extent = dset_extent(f, PANZER_TIME_DATASET);
     const hsize_t payload_extent = dset_extent(f, "data_raw_f64");
     H5Fclose(f);

@@ -6,12 +6,14 @@
 //   * hand-crafts a DANGLING index row (kind 0 / FLOAT64) whose offset is far
 //     past the materialised data_raw_f64 extent — the exact torn state the old
 //     index-first ordering could leave behind after a mid-flush crash;
-//   * hand-crafts a second one addressing the v4 TIME block (block bit set,
+//   * hand-crafts a second one addressing the v4 TIME block (block selector set,
 //     offset past data_time_f64), which must be checked against THAT extent;
-//   * verifies the reader SKIPS both dangling rows (they never appear in the
+//   * hand-crafts a third one addressing the v5 SCALAR block (offset past
+//     data_scalar_f64), same rule;
+//   * verifies the reader SKIPS every dangling row (they never appear in the
 //     leaves) and that the valid leaf still round-trips.
 //
-// The injection is layout-aware: v3/v4 files (7 packed columns + interned
+// The injection is layout-aware: v3/v4/v5 files (7 packed columns + interned
 // /path_table) and v2/legacy files (12/14 columns + row-aligned /paths).
 #include "panzerdb.h"
 #include <hdf5.h>
@@ -39,12 +41,12 @@ namespace fs = std::filesystem;
 
 // Append one fabricated DANGLING row to /index AND to the file's path storage.
 // Its offset is set far past the extent of the block it addresses — data_raw_f64,
-// or data_time_f64 when `time_block` is set (the v4 block selector lives in bit 12
-// of the packed flags word) — so the reader's guardrail must skip it. The path
-// datasets are extended consistently with the format version in effect (v3/v4: one
-// extra path_table entry; v2: one /paths row).
+// or data_time_f64 / data_scalar_f64 when `block` names one (the block selector
+// lives in bits 12..13 of the packed flags word) — so the reader's guardrail must
+// skip it. The path datasets are extended consistently with the format version in
+// effect (v3/v4/v5: one extra path_table entry; v2: one /paths row).
 static void inject_dangling_row(const std::string& path, const char* ghost_path,
-                                bool time_block) {
+                                uint8_t block) {
     hid_t f = H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
     HARD_CHECK(f >= 0 && "inject: open RW");
 
@@ -85,8 +87,8 @@ static void inject_dangling_row(const std::string& path, const char* ghost_path,
         row[0] = 999999;                                       // offset far past extent
         row[1] = 4;                                            // count
         row[2] = (uint64_t)ghost_id | ((uint64_t)PANZER_NO_PARENT_ROW_V3 << 32);
-        // time 0 | (flags 0 = kind data / FLOAT64) | ndim 0 | block bit where v4 puts it
-        row[3] = ((uint64_t)(time_block ? (1u << PANZER_V3_BLOCK_SHIFT) : 0u)) << 32;
+        // time 0 | (flags 0 = kind data / FLOAT64) | ndim 0 | block selector where v4/v5 put it
+        row[3] = ((uint64_t)block << PANZER_V3_BLOCK_SHIFT) << 32;
         // Extend /path_table by one entry, then the index row by one.
         hsize_t new_pdims[1] = {pdims[0] + 1};
         H5Dset_extent(path_dset, new_pdims);
@@ -102,7 +104,8 @@ static void inject_dangling_row(const std::string& path, const char* ghost_path,
         H5Tclose(ptype); H5Sclose(pms); H5Sclose(ps);
     } else {
         HARD_CHECK((ncols == 12 || ncols == 14) && "inject: known v2/legacy /index layout");
-        HARD_CHECK(!time_block && "inject: only the v4 packing can address the time block");
+        HARD_CHECK(block == PanzerDB::RAW_BLOCK_TYPE &&
+                   "inject: only the v4/v5 packing can address a separate block");
         const bool legacy = (ncols == 14);
         const unsigned off_c    = legacy ? 9  : 8;
         const unsigned cnt_c    = legacy ? 10 : 9;
@@ -180,23 +183,27 @@ int main() {
         std::cout << "  [OK] baseline: s_f64 writes and round-trips (1 leaf)\n";
     }
 
-    // --- inject two dangling rows, then re-read ---------------------------
-    // One addresses the payload block, the other the v4 time-base block: the
-    // guardrail has to test each against the extent of the block its row names.
-    inject_dangling_row(filename, "dangling_ghost", false);
-    inject_dangling_row(filename, "dangling_ghost_time", true);
+    // --- inject three dangling rows, then re-read --------------------------
+    // One addresses the payload block, one the v4 time-base block and one the v5
+    // per-step-scalar block: the guardrail has to test each against the extent of
+    // the block its row names.
+    inject_dangling_row(filename, "dangling_ghost", PanzerDB::RAW_BLOCK_TYPE);
+    inject_dangling_row(filename, "dangling_ghost_time", PanzerDB::RAW_BLOCK_TIME);
+    inject_dangling_row(filename, "dangling_ghost_scalar", PanzerDB::RAW_BLOCK_SCALAR);
 
     {
         PanzerDB db(filename, PanzerDB::OpenMode::READ);
         std::vector<PanzerDB::Leaf> leaves = db.getLeaves();
 
-        // The guardrail must have skipped both dangling rows: still just one leaf,
-        // and neither ghost path may be present in the leaf table.
+        // The guardrail must have skipped all three dangling rows: still just one
+        // leaf, and none of the ghost paths may be present in the leaf table.
         HARD_CHECK(leaves.size() == 1 && "dangling rows must be skipped");
         HARD_CHECK(find_leaf(leaves, "dangling_ghost") == nullptr &&
                    "dangling row must not be exposed");
         HARD_CHECK(find_leaf(leaves, "dangling_ghost_time") == nullptr &&
                    "dangling row in the time-base block must not be exposed");
+        HARD_CHECK(find_leaf(leaves, "dangling_ghost_scalar") == nullptr &&
+                   "dangling row in the scalar block must not be exposed");
 
         // The valid leaf is unaffected.
         const PanzerDB::Leaf* l = find_leaf(leaves, "s_f64");

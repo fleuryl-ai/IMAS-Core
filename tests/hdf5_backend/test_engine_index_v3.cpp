@@ -1,6 +1,6 @@
 // @file  test_engine_index_v3.cpp
 // @brief v3 index format contract (REVIEW_PERF point 13/14/16):
-//   * new files carry /index with an "index_version" attribute (v4 today, same
+//   * new files carry /index with an "index_version" attribute (v5 today, same
 //     7 packed u64 columns as v3), and an interned /path_table instead of
 //     row-aligned /paths;
 //   * repeated paths cost ONE path_table entry (dedup), not one per row;
@@ -92,7 +92,7 @@ int main() {
 
     hid_t f = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     HARD_CHECK(f >= 0);
-    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V4 && "new file must be stamped v4");
+    HARD_CHECK(read_index_version(f) == PANZER_INDEX_VERSION_V5 && "new file must be stamped v5");
     const hsize_t path_entries = dset_rows(f, "path_table");
     HARD_CHECK(path_entries > 0 && "v3 must own a /path_table");
     HARD_CHECK(dset_rows(f, "paths") == 0 && "v3 must NOT carry row-aligned /paths");

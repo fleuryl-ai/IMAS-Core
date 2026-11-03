@@ -163,9 +163,18 @@ std::string u64Text(uint64_t v) {
 // --------------------------------------------------------------------------
 
 const char* dataRawName(PanzerDB::DataType dt, uint8_t block) {
-    // v4 files keep time bases in their own FLOAT64 block; a leaf's offsets are
-    // relative to the block named by its Leaf::block, never to data_raw_f64.
+    // v4 files keep time bases in their own FLOAT64 block and v5 files keep
+    // per-step scalars in theirs; a leaf's offsets are relative to the block
+    // named by its Leaf::block, never to data_raw_f64.
     if (block == PanzerDB::RAW_BLOCK_TIME) return PANZER_TIME_DATASET;
+    if (block == PanzerDB::RAW_BLOCK_SCALAR) {
+        switch (dt) {
+            case PanzerDB::DataType::FLOAT64:    return PANZER_SCALAR_DATASET_F64;
+            case PanzerDB::DataType::INT32:      return PANZER_SCALAR_DATASET_I32;
+            case PanzerDB::DataType::COMPLEX128: return PANZER_SCALAR_DATASET_C128;
+            default: return nullptr;   // strings have no scalar block
+        }
+    }
     switch (dt) {
         case PanzerDB::DataType::FLOAT64:         return "data_raw_f64";
         case PanzerDB::DataType::INT32:           return "data_raw_i32";

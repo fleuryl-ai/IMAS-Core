@@ -51,6 +51,16 @@
  *   the whole block: reading it back then decompresses every chunk of the block. The row
  *   carries which block its offset belongs to (`Leaf::block`); see rawDatasetFor().
  *
+ * - **Per-step scalars stored apart** (v5): the same argument holds for any node that
+ *   stores ONE value per time step -- a 0-D signal over time such as
+ *   `global_quantities.ip`. Written slice by slice it is interleaved with the payloads,
+ *   one value per AoS element, so its 8000 rows sit one per 18001 slots across a
+ *   144 M-slot block and reading the series back decompresses every chunk of it
+ *   (measured: 143 990 000 elements read to recover 8 000 doubles, one extra pass over
+ *   the block, 799.8 MiB and 3.11 s on a whole-IDS get(); to_improve.md point 31).
+ *   Such rows go to a block of their own per type: `data_scalar_f64`,
+ *   `data_scalar_i32`, `data_scalar_c128`.
+ *
  * - **Array of Structures (AoS) Emulation**: PanzerDB emulates complex, nested data
  *   structures (Arrays of Structures) using a path-based system. For example, a path
  *   like "profiles_1d/0/ion/0/density" represents a specific data node within a
@@ -108,7 +118,13 @@ struct ChunkingConfig {
     // base still costs 16 chunks instead of the 2198 the scatter in data_raw_f64
     // used to touch.
     size_t data_chunk_time = 512;
-    
+
+    // Per-step-scalar block (data_scalar_*, v5) chunking. Same reasoning as the
+    // time-base block: such a node is appended one value per slice, and a flush
+    // re-compresses the tail chunk, so a small chunk keeps that cost negligible.
+    // The whole series is still one read: 8000 values is 16 chunks of 512.
+    size_t data_chunk_scalar = 512;
+
     // Path chunking
     size_t path_chunk_entries = 8192;         // 8k paths per chunk
     
@@ -165,15 +181,19 @@ inline constexpr uint64_t PANZER_INDEX_COLUMNS = 12;
 //   v2 (2): 12 u64 columns + /paths row-aligned (256B fixed C_S1 per row).
 //   v3 (3): 7 packed u64 columns + interned paths in /path_table (unique texts).
 //   v4 (4): v3 packing + a raw block of its own for time bases (Leaf::block).
-// New files are written v4; APPEND keeps the layout of the file it opens.
-// A pre-v4 build CANNOT read a v4 file: it does not recognise the stamp, so it
+//   v5 (5): v4 + a raw block of its own for one-value-per-step nodes
+//           (data_scalar_f64/_i32/_c128); Leaf::block widens to two bits.
+// New files are written v5; APPEND keeps the layout of the file it opens.
+// A pre-v4 build CANNOT read a v4 or v5 file: it does not recognise the stamp, so it
 // falls back to the v2 column map on a 7-column table and decodes garbage. That
 // is accepted on purpose (no v2 file is in the field); the reader here refuses
-// anything above PANZER_INDEX_VERSION_V4 so the same mistake cannot happen again
-// against a future format.
+// anything above PANZER_INDEX_VERSION_V5 so the same mistake cannot happen again
+// against a future format. A v4 build reading a v5 file would read the block bit as
+// 0 or 1 and send a scalar row to data_raw_f64 -- wrong numbers, hence the stamp.
 inline constexpr uint32_t PANZER_INDEX_VERSION_V2 = 2;
 inline constexpr uint32_t PANZER_INDEX_VERSION_V3 = 3;
 inline constexpr uint32_t PANZER_INDEX_VERSION_V4 = 4;
+inline constexpr uint32_t PANZER_INDEX_VERSION_V5 = 5;
 inline constexpr uint64_t PANZER_INDEX_COLUMNS_V3 = 7;
 inline constexpr uint32_t PANZER_NO_PARENT_ROW_V3 = 0xFFFFFFFFu;
 inline constexpr uint32_t PANZER_NO_PATH_ROW_V3 = 0xFFFFFFFFu;
@@ -186,17 +206,28 @@ inline constexpr uint32_t PANZER_NO_PATH_ROW_V3 = 0xFFFFFFFFu;
 // to read them; see to_improve.md point 24 and 30).
 inline constexpr const char *PANZER_TIME_DATASET = "data_time_f64";
 
+// Names of the raw blocks holding nodes that store one value per time step (v5),
+// one per numeric type. Same argument as PANZER_TIME_DATASET, same remedy: the
+// series keeps its own append cursor, so reading a whole series back is one
+// contiguous read instead of one value per chunk of the payload block.
+// See to_improve.md point 31.
+inline constexpr const char *PANZER_SCALAR_DATASET_F64  = "data_scalar_f64";
+inline constexpr const char *PANZER_SCALAR_DATASET_I32  = "data_scalar_i32";
+inline constexpr const char *PANZER_SCALAR_DATASET_C128 = "data_scalar_c128";
+
 // v3 row packing inside the 7 u64 columns (see PANZER_INDEX_COLUMNS_V3):
 //   col0 offset(u64) | col1 count(u64)
 //   col2 path_id(u32 low) | parent_id(u32 high, 0xFFFFFFFF = no parent)
 //   col3 time_index(u32 low) | (flags | ndim<<8 | block<<12)(u32 high)
 //   col4 shape[0] | shape[1]<<32   col5 shape[2] | shape[3]<<32   col6 shape[4] | shape[5]<<32
 // Leaf::flags stays (kind | dtype<<4); ndim is recovered from bits 8..11 of the
-// stored word and the raw block selector from bit 12, both masked out before
-// reaching the public Leaf. Bit 12 must NOT enter Leaf::flags: the data type is
-// read as flags>>4 all over the read path.
+// stored word and the raw block selector from bits 12..13 (PANZER_V3_BLOCK_BITS),
+// both masked out before reaching the public Leaf. Those bits must NOT enter
+// Leaf::flags: the data type is read as flags>>4 all over the read path.
+// Before v5 the selector only ever held 0 or 1, so bit 13 stayed clear.
 inline constexpr uint64_t PANZER_V3_NDIM_SHIFT = 8;
 inline constexpr uint64_t PANZER_V3_BLOCK_SHIFT = 12;
+inline constexpr uint64_t PANZER_V3_BLOCK_BITS = 0x3ULL;
 
 /**
  * @struct PathComponents
@@ -268,8 +299,9 @@ public:
         uint64_t count = 0;             // Number of stored elements (slice_volume * n_time_steps).
         uint64_t flags = 0;             // low 4 bits: node kind; upper bits: DataType. See struct doc.
         // Which raw block `offset` addresses: 0 = the block of this leaf's data type
-        // (data_raw_f64/_i32/_c128/_str), 1 = the time-base block (data_time_f64).
-        // Only v4 files can carry 1; every other layout leaves it at 0. Use
+        // (data_raw_f64/_i32/_c128/_str), 1 = the time-base block (data_time_f64),
+        // 2 = the per-step-scalar block (data_scalar_f64/_i32/_c128). Only v4 files
+        // can carry 1, only v5 files 2; every other layout leaves it at 0. Use
         // rawDatasetFor()/rawExtentFor() instead of picking a dataset by type.
         uint8_t block = 0;
         bool is_empty = false;          // Convenience flag mirroring (flags & 0xF) == 1.
@@ -334,6 +366,15 @@ private:
     // Time-base block (v4): the values of an IDS's time bases live here, in a
     // FLOAT64 block with its own append cursor. See PANZER_TIME_DATASET.
     mutable hid_t data_dset_time = -1; // time bases (double)
+    // Per-step-scalar blocks (v5): a node that stores one value per time step
+    // (a 0-D signal over time such as global_quantities.ip) is appended here,
+    // one block per numeric type, each with its own append cursor. Without it
+    // those rows sit one per AoS element inside data_raw_*, and reading the
+    // series back decompresses every chunk of that block.
+    // See PANZER_SCALAR_DATASET_F64 / _I32 / _C128 and to_improve.md point 31.
+    mutable hid_t data_dset_scalar_f64 = -1;  // per-step scalars (double)
+    mutable hid_t data_dset_scalar_i32 = -1;  // per-step scalars (int32)
+    mutable hid_t data_dset_scalar_c128 = -1; // per-step scalars (complex)
     // Span-table dataset (only for list elements > STRING_MAX_LEN-1; empty if all compact)
     hid_t list_spans_dset = -1;
     std::vector<uint64_t> list_spans_buffer;   // 4 u64s per entry (row_id, element_idx, slot_offset, slot_span)
@@ -346,6 +387,9 @@ private:
     hsize_t disk_size_c128 = 0;
     hsize_t disk_size_str = 0;
     hsize_t disk_size_time = 0;
+    hsize_t disk_size_scalar_f64 = 0;
+    hsize_t disk_size_scalar_i32 = 0;
+    hsize_t disk_size_scalar_c128 = 0;
 
     /**
      * @brief (Re)loads the on-disk size of every raw data dataset into disk_size_*.
@@ -390,6 +434,9 @@ private:
     std::vector<std::complex<double>> data_buffer_c128;
     std::vector<std::string> data_buffer_str;
     std::vector<double> data_buffer_time;   // time-base values (v4, see PANZER_TIME_DATASET)
+    std::vector<double> data_buffer_scalar_f64;   // per-step scalars (v5, double)
+    std::vector<int32_t> data_buffer_scalar_i32;  // per-step scalars (v5, int32)
+    std::vector<std::complex<double>> data_buffer_scalar_c128; // per-step scalars (v5, complex)
 
     std::vector<char> paths_buffer;       // Buffer for plain text paths (fixed size)
     std::vector<char> parent_paths_buffer;
@@ -783,19 +830,29 @@ public:
 
     /**
      * @brief Raw block a value lives in: 0 = the block of its data type,
-     *        1 = the time-base block (data_time_f64, v4 only).
+     *        1 = the time-base block (data_time_f64, v4 only),
+     *        2 = the per-step-scalar block (data_scalar_*, v5 only).
      */
-    enum RawBlock : uint8_t { RAW_BLOCK_TYPE = 0, RAW_BLOCK_TIME = 1 };
+    enum RawBlock : uint8_t { RAW_BLOCK_TYPE = 0, RAW_BLOCK_TIME = 1, RAW_BLOCK_SCALAR = 2 };
 
     /**
      * @brief Handle of the raw dataset holding a value of type `dtype` in block
      *        `block`. Since v4 a FLOAT64 value can sit in either block, so a type
      *        alone no longer identifies the dataset: every read must go through here.
      * @return The dataset handle, or -1 when the block does not exist in this file
-     *         (a v3 file has no time block, and a leaf should not point at one).
+     *         (a v3 file has no time block, a v4 file no scalar block, and a leaf
+     *         should not point at one in either case).
      */
     hid_t rawDatasetFor(DataType dtype, uint8_t block) const {
         if (block == RAW_BLOCK_TIME) return data_dset_time;
+        if (block == RAW_BLOCK_SCALAR) {
+            switch (dtype) {
+                case DataType::FLOAT64:    return data_dset_scalar_f64;
+                case DataType::INT32:      return data_dset_scalar_i32;
+                case DataType::COMPLEX128: return data_dset_scalar_c128;
+                default:                   return -1;  // strings stay in the type block
+            }
+        }
         switch (dtype) {
             case DataType::FLOAT64:         return data_dset_f64;
             case DataType::INT32:           return data_dset_i32;

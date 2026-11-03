@@ -133,6 +133,10 @@ al_add_hdf5_test(test_engine_index_v3)
 # v4 time-base block (data_time_f64): both time bases get their own raw block and
 # stay contiguous, and a stamped-ahead index_version is refused by name.
 al_add_hdf5_test(test_engine_time_base_layout)
+# v5 per-step-scalar block (data_scalar_*): a node with one value per time step
+# (global_quantities&ip) gets a block of its own instead of one slot per AoS
+# element in the payload, which is what made a whole-IDS get() sweep the payload twice.
+al_add_hdf5_test(test_engine_scalar_block)
 # Counters table that restoreTimeContext() rebuilds at open (aos_time_counters):
 # what getDynamicAOSSize / getAOSShape answer in READ, and where APPEND resumes.
 al_add_hdf5_test(test_engine_time_context)

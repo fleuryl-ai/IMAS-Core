@@ -66,12 +66,12 @@ ChunkingConfig PanzerDB::s_default_chunk_config;
 // An "index_version" stamp this build has no decoder for must be refused by name,
 // not adopted and decoded with the newest packing it happens to recognise: the
 // column meaning would silently shift and the reads would return wrong numbers.
-// v4 is the highest layout understood here; v3 stays readable, v5 is not.
+// v5 is the highest layout understood here; v3 and v4 stay readable, v6 is not.
 static void rejectUnknownIndexVersion(uint32_t v, const char* open_mode) {
-    if (v <= PANZER_INDEX_VERSION_V4) return;
+    if (v <= PANZER_INDEX_VERSION_V5) return;
     throw ALBackendException(std::string("PanzerDB: /index carries index_version=") +
                              std::to_string(v) + " in " + open_mode + " mode; this build reads at most v" +
-                             std::to_string(PANZER_INDEX_VERSION_V4) +
+                             std::to_string(PANZER_INDEX_VERSION_V5) +
                              " -- rebuild the Access Layer against a newer libal", LOG);
 }
 namespace {
@@ -308,6 +308,13 @@ void PanzerDB::init(OpenMode mode) {
         // list forgets is not an error: the create below fails on the leftover object
         // and the new rows would be appended to the previous life of the file.
         if (H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0) H5Ldelete(file_id, PANZER_TIME_DATASET, H5P_DEFAULT);
+        // Same for the v5 per-step-scalar blocks: three names, all recreated.
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT);
         if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
         if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) H5Ldelete(file_id, "path_table", H5P_DEFAULT);
@@ -323,9 +330,11 @@ void PanzerDB::init(OpenMode mode) {
         // rows that no longer exist, so it must not be resumed from.
         if (indexHandoff().key == panzer_file_name(file_id)) indexHandoff() = IndexHandoff{};
 
-        // V3/V4: new files use the packed 7-column /index + interned /path_table.
-        // v4 adds the time-base block (data_time_f64) and the Leaf::block selector.
-        index_version = PANZER_INDEX_VERSION_V4;
+        // V3/V4/V5: new files use the packed 7-column /index + interned /path_table.
+        // v4 adds the time-base block (data_time_f64) and the Leaf::block selector;
+        // v5 adds the per-step-scalar blocks (data_scalar_*) and widens that
+        // selector to two bits.
+        index_version = PANZER_INDEX_VERSION_V5;
         index_cols = PANZER_INDEX_COLUMNS_V3;
 
         // OPTIMIZATION: Create index dataset with optimal chunking
@@ -377,6 +386,23 @@ void PanzerDB::init(OpenMode mode) {
         // small chunk on purpose -- see ChunkingConfig::data_chunk_time.
         data_dset_time = createOptimizedDataset(PANZER_TIME_DATASET, H5T_IEEE_F64LE,
                                                 chunk_config.data_chunk_time, true, dapl);
+
+        // Per-step-scalar blocks (v5): a node that is 0-D in the IDS but carries one
+        // value per time step (global_quantities&ip is the case that started this).
+        // They grow like the time base instead of like the payload -- see
+        // PANZER_SCALAR_DATASET_F64. Strings are deliberately absent: their offset is
+        // a position in data_raw_str, which the read path resolves there.
+        data_dset_scalar_f64 = createOptimizedDataset(PANZER_SCALAR_DATASET_F64, H5T_IEEE_F64LE,
+                                                      chunk_config.data_chunk_scalar, true, dapl);
+        data_dset_scalar_i32 = createOptimizedDataset(PANZER_SCALAR_DATASET_I32, H5T_STD_I32LE,
+                                                      chunk_config.data_chunk_scalar, true, dapl);
+        {
+            hsize_t scalar_complex_dims[1] = {2};
+            hid_t scalar_complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, scalar_complex_dims);
+            data_dset_scalar_c128 = createOptimizedDataset(PANZER_SCALAR_DATASET_C128, scalar_complex_tid,
+                                                           chunk_config.data_chunk_scalar, true, dapl);
+            H5Tclose(scalar_complex_tid);
+        }
         
          // String dataset: FIXED-WIDTH, NUL-padded C1 (SWMR-safe; no vlen heap).
          // Element = STRING_MAX_LEN bytes; a value longer than STRING_MAX_LEN-1 is
@@ -423,12 +449,18 @@ void PanzerDB::init(OpenMode mode) {
         data_buffer_str.reserve(chunk_config.data_chunk_str);
         data_buffer_c128.reserve(chunk_config.data_chunk_c128);
         data_buffer_time.reserve(chunk_config.data_chunk_time);
+        data_buffer_scalar_f64.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_i32.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_c128.reserve(chunk_config.data_chunk_scalar);
 
         disk_size_f64 = 0;
         disk_size_i32 = 0;
         disk_size_c128 = 0;
         disk_size_str = 0;
         disk_size_time = 0;
+        disk_size_scalar_f64 = 0;
+        disk_size_scalar_i32 = 0;
+        disk_size_scalar_c128 = 0;
         
     } else if (mode == OpenMode::APPEND) {
         // Open existing datasets
@@ -452,7 +484,7 @@ void PanzerDB::init(OpenMode mode) {
                 if (at >= 0) {
                     uint32_t v = 0;
                     if (H5Aread(at, H5T_NATIVE_UINT32, &v) >= 0 && v > 0) {
-                        if (v > PANZER_INDEX_VERSION_V4) {
+                        if (v > PANZER_INDEX_VERSION_V5) {
                             // Nothing will run a destructor for an engine whose
                             // constructor throws, so the handles opened above have to
                             // go back before the refusal does.
@@ -484,6 +516,17 @@ void PanzerDB::init(OpenMode mode) {
         if (index_version >= PANZER_INDEX_VERSION_V4 &&
             H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0)
             data_dset_time = H5Dopen2(file_id, PANZER_TIME_DATASET, dapl);
+        // Same reasoning for the v5 per-step-scalar blocks: a v3 or v4 file keeps the
+        // layout it was written with, so these handles stay invalid on APPEND there and
+        // per-step scalars continue to go to the payload block with their block bit at 0.
+        if (index_version >= PANZER_INDEX_VERSION_V5) {
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+                data_dset_scalar_f64 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_F64, dapl);
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+                data_dset_scalar_i32 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_I32, dapl);
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+                data_dset_scalar_c128 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_C128, dapl);
+        }
         // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
         parent_paths_dset = H5I_INVALID_HID;
         if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", dapl);
@@ -500,6 +543,9 @@ void PanzerDB::init(OpenMode mode) {
         data_buffer_str.reserve(chunk_config.data_chunk_str);
         data_buffer_c128.reserve(chunk_config.data_chunk_c128);
         data_buffer_time.reserve(chunk_config.data_chunk_time);
+        data_buffer_scalar_f64.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_i32.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_c128.reserve(chunk_config.data_chunk_scalar);
 
     } else { // OpenMode::READ
         if (file_id < 0) throw std::runtime_error("Failed to open file for reading");
@@ -510,7 +556,7 @@ void PanzerDB::init(OpenMode mode) {
                 if (at >= 0) {
                     uint32_t v = 0;
                     if (H5Aread(at, H5T_NATIVE_UINT32, &v) >= 0 && v > 0) {
-                        if (v > PANZER_INDEX_VERSION_V4) {
+                        if (v > PANZER_INDEX_VERSION_V5) {
                             // As in APPEND: an engine whose constructor throws has no
                             // destructor to release what this open already holds.
                             H5Aclose(at);
@@ -538,6 +584,15 @@ void PanzerDB::init(OpenMode mode) {
         if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", H5P_DEFAULT);
         if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
         if (H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0) data_dset_time = H5Dopen2(file_id, PANZER_TIME_DATASET, H5P_DEFAULT);
+        // v5 blocks: opened by name, like the time base. Which of them a row points at
+        // is decided by that row's block bits, so a v5 file needs all three and a v3/v4
+        // file simply has none of them to open.
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+            data_dset_scalar_f64 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+            data_dset_scalar_i32 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+            data_dset_scalar_c128 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT);
         if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", H5P_DEFAULT);
         // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
         parent_paths_dset = H5I_INVALID_HID;
@@ -593,6 +648,21 @@ void PanzerDB::updateDiskSizes() {
         H5Sget_simple_extent_dims(space, &disk_size_time, NULL);
         H5Sclose(space);
     }
+    if (data_dset_scalar_f64 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_f64);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_f64, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_scalar_i32 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_i32);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_i32, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_scalar_c128 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_c128);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_c128, NULL);
+        H5Sclose(space);
+    }
 }
 
 uint64_t PanzerDB::rawExtentFor(hid_t dset_id) const {
@@ -618,9 +688,9 @@ void PanzerDB::readChunkingConfig() {
     }
     // Lire la configuration de chunking depuis le dataset existant.
     // Only data_raw_f64 is sampled: nothing on the read path is sized from this
-    // value (HDF5 fetches chunks itself), and the v4 time-base block carries its
-    // own chunk size in its own create plist, so an APPEND that extends
-    // data_time_f64 already uses the right geometry.
+    // value (HDF5 fetches chunks itself), and the v4 time-base block and the v5
+    // per-step-scalar blocks carry their own chunk size in their own create plist,
+    // so an APPEND that extends them already uses the right geometry.
     hid_t dcpl = H5Dget_create_plist(data_dset_f64);
     
     if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
@@ -683,6 +753,9 @@ void PanzerDB::configureReadCache() {
     reopen_dataset(data_dset_str, "data_raw_str");
     reopen_dataset(data_dset_c128, "data_raw_c128");
     reopen_dataset(data_dset_time, PANZER_TIME_DATASET);
+    reopen_dataset(data_dset_scalar_f64, PANZER_SCALAR_DATASET_F64);
+    reopen_dataset(data_dset_scalar_i32, PANZER_SCALAR_DATASET_I32);
+    reopen_dataset(data_dset_scalar_c128, PANZER_SCALAR_DATASET_C128);
     reopen_dataset(paths_dset, "paths");
     reopen_dataset(path_table_dset, "path_table");
     // M1: /parent_paths no longer exists; it is never reopened.
@@ -1196,6 +1269,39 @@ void PanzerDB::flush() {
         H5Sclose(filespace);
     }
 
+    // Per-step-scalar blocks (v5): three blocks, one per numeric type, appended with
+    // their own cursors like everything else the rows point at. Written as a loop-shaped
+    // helper rather than three copies because they differ only in type, and getting one
+    // of the three cursors wrong in a copy is exactly the bug that shape invites.
+    {
+        auto append_scalar_block = [&](hid_t dset, auto& buf, hsize_t& disk_size, hid_t mem_type) {
+            if (buf.empty() || dset < 0) return;
+            hsize_t n_new_data = buf.size();
+            filespace = H5Dget_space(dset);
+            hsize_t current_data_dims[1];
+            H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+            H5Sclose(filespace);
+
+            hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+            H5Dset_extent(dset, new_data_dims);
+
+            filespace = H5Dget_space(dset);
+            hsize_t data_offset[1] = {current_data_dims[0]};
+            H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+            memspace = H5Screate_simple(1, &n_new_data, NULL);
+            H5Dwrite(dset, mem_type, memspace, filespace, H5P_DEFAULT, buf.data());
+            disk_size = new_data_dims[0];
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+        };
+        append_scalar_block(data_dset_scalar_f64, data_buffer_scalar_f64, disk_size_scalar_f64, H5T_NATIVE_DOUBLE);
+        append_scalar_block(data_dset_scalar_i32, data_buffer_scalar_i32, disk_size_scalar_i32, H5T_NATIVE_INT);
+        hsize_t scalar_complex_dims[1] = {2};
+        hid_t scalar_complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, scalar_complex_dims);
+        append_scalar_block(data_dset_scalar_c128, data_buffer_scalar_c128, disk_size_scalar_c128, scalar_complex_tid);
+        H5Tclose(scalar_complex_tid);
+    }
+
     // --- Flush v3 interned path table (payload, before the index commit) ---
     flushPathTable();
 
@@ -1235,6 +1341,9 @@ void PanzerDB::flush() {
     data_buffer_str.clear();
     data_buffer_c128.clear();
     data_buffer_time.clear();
+    data_buffer_scalar_f64.clear();
+    data_buffer_scalar_i32.clear();
+    data_buffer_scalar_c128.clear();
     paths_buffer.clear();
     parent_paths_buffer.clear();
     leaves_cache_valid = false;
@@ -1431,11 +1540,15 @@ void PanzerDB::abandonOpenHandles() {
     if (data_dset_str >= 0) H5Dclose(data_dset_str);
     if (data_dset_c128 >= 0) H5Dclose(data_dset_c128);
     if (data_dset_time >= 0) H5Dclose(data_dset_time);
+    if (data_dset_scalar_f64 >= 0) H5Dclose(data_dset_scalar_f64);
+    if (data_dset_scalar_i32 >= 0) H5Dclose(data_dset_scalar_i32);
+    if (data_dset_scalar_c128 >= 0) H5Dclose(data_dset_scalar_c128);
     if (paths_dset >= 0) H5Dclose(paths_dset);
     if (path_table_dset >= 0) H5Dclose(path_table_dset);
     if (parent_paths_dset >= 0) H5Dclose(parent_paths_dset);
     list_spans_dset = index_dset = data_dset_f64 = data_dset_i32 = -1;
     data_dset_str = data_dset_c128 = data_dset_time = -1;
+    data_dset_scalar_f64 = data_dset_scalar_i32 = data_dset_scalar_c128 = -1;
     paths_dset = path_table_dset = parent_paths_dset = -1;
 
     if (should_close_loc_id) H5Gclose(file_id);
@@ -1459,6 +1572,9 @@ void PanzerDB::close() {
     if (data_dset_str >= 0) H5Dclose(data_dset_str);
     if (data_dset_c128 >= 0) H5Dclose(data_dset_c128);
     if (data_dset_time >= 0) H5Dclose(data_dset_time);
+    if (data_dset_scalar_f64 >= 0) H5Dclose(data_dset_scalar_f64);
+    if (data_dset_scalar_i32 >= 0) H5Dclose(data_dset_scalar_i32);
+    if (data_dset_scalar_c128 >= 0) H5Dclose(data_dset_scalar_c128);
     if (paths_dset >= 0) H5Dclose(paths_dset);
     if (path_table_dset >= 0) H5Dclose(path_table_dset);
     if (parent_paths_dset >= 0) H5Dclose(parent_paths_dset);
@@ -1739,8 +1855,9 @@ int PanzerDB::readSliceDirect(const Leaf& leaf,
 // Instantiation explicite
 template int PanzerDB::readSliceDirect<double>(const Leaf&, int64_t, double*) const;
 template int PanzerDB::readSliceDirect<int32_t>(const Leaf&, int64_t, int32_t*) const;
-template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_t, 
+template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_t,
                                                               std::complex<double>*) const;
+
 
 int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const {
     if (leaves.empty()) return 0;
@@ -1770,20 +1887,26 @@ int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buff
             return -1; // Not supported for union read (e.g. strings)
     }
 
-    // A v4 file splits the raw store by block (payload / time base), so a leaf
-    // list may straddle two datasets. Bucket by block -- in practice one bucket
-    // -- and give every leaf its slot in the caller's order regardless.
+    // A v4 file splits the raw store by block (payload / time base) and a v5 file
+    // adds the per-step-scalar block, so a leaf list may straddle up to three
+    // datasets. Bucket by block -- in practice one bucket -- and give every leaf
+    // its slot in the caller's order regardless.
+    // Sized by the width of the block field, not by the three blocks in use, so a
+    // row carrying a value this build never writes cannot index outside the array:
+    // rawDatasetFor() sends any unknown block to the payload block, which is also
+    // what the dangling-row guard in getLeaves() measured it against.
+    constexpr size_t bucket_count = (size_t)PANZER_V3_BLOCK_BITS + 1;   // 0..3
     std::vector<size_t> slot(leaves.size());
-    std::vector<size_t> bucket[2];
+    std::vector<size_t> bucket[bucket_count];
     size_t dst_elements = 0;
     for (size_t i = 0; i < leaves.size(); ++i) {
         slot[i] = dst_elements;
         dst_elements += leaves[i]->count;
-        bucket[leaves[i]->block ? 1 : 0].push_back(i);
+        bucket[leaves[i]->block].push_back(i);
     }
 
     char* const dst_base = static_cast<char*>(buffer);
-    for (size_t b = 0; b < 2; ++b) {
+    for (size_t b = 0; b < bucket_count; ++b) {
         const std::vector<size_t>& group = bucket[b];
         if (group.empty()) continue;
         hid_t dset_id = rawDatasetFor(dtype, (uint8_t)b);
@@ -1818,6 +1941,7 @@ int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buff
         }
         const hsize_t range = hi - lo;
 
+
         if (wanted > 0 && range / wanted > 64 && !scatter_warning_issued) {
             scatter_warning_issued = true;
             char dset_name[128];
@@ -1825,8 +1949,9 @@ int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buff
             std::cerr << "[PanzerDB] warning: reading " << range << " elements of "
                       << (nlen > 0 ? dset_name : "a raw data block") << " to recover " << wanted
                       << " (" << (range / wanted) << "x): these index rows are scattered"
-                      " across the block. Time bases get their own block in index v4"
-                      " (files written by this build); this file predates it."
+                      " across the block. A time base (index v4) and a per-step scalar"
+                      " (index v5) each get their own block in files written by this"
+                      " build; this file predates that."
                       " (first occurrence for this file)" << std::endl;
         }
 
@@ -2148,6 +2273,9 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         const uint64_t ext_c128 = rawExtentFor(data_dset_c128);
         const uint64_t ext_str  = rawExtentFor(data_dset_str);
         const uint64_t ext_time = rawExtentFor(data_dset_time);
+        const uint64_t ext_scalar_f64  = rawExtentFor(data_dset_scalar_f64);
+        const uint64_t ext_scalar_i32  = rawExtentFor(data_dset_scalar_i32);
+        const uint64_t ext_scalar_c128 = rawExtentFor(data_dset_scalar_c128);
 
         if (cached_leaves.capacity() < n_rows) cached_leaves.reserve(n_rows);
 
@@ -2161,17 +2289,22 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
             const uint64_t sflags    = row[3] >> 32;             // kind|dtype|ndim<<8|block<<12
             const uint64_t flags     = sflags & 0xFFULL;          // public flags (kind + dtype)
             const unsigned ndim      = (unsigned)((sflags >> PANZER_V3_NDIM_SHIFT) & 0xFULL);
-            const uint8_t  block     = (uint8_t)((sflags >> PANZER_V3_BLOCK_SHIFT) & 1ULL);
+            const uint8_t  block     = (uint8_t)((sflags >> PANZER_V3_BLOCK_SHIFT) & PANZER_V3_BLOCK_BITS);
             const uint64_t leaf_kind = flags & 0xFULL;
 
             // Dangling-row guardrail (same contract as the v2 path), against the
             // block this row actually addresses.
             if (leaf_kind == 0) {
-                const uint64_t extent = block ? ext_time
-                                              : (static_cast<DataType>(flags >> 4) == DataType::FLOAT64   ? ext_f64
-                                             : static_cast<DataType>(flags >> 4) == DataType::INT32      ? ext_i32
-                                             : static_cast<DataType>(flags >> 4) == DataType::COMPLEX128 ? ext_c128
-                                             : ext_str);
+                const DataType dtype = static_cast<DataType>(flags >> 4);
+                const uint64_t extent = block == RAW_BLOCK_TIME ? ext_time
+                                      : block == RAW_BLOCK_SCALAR ? (dtype == DataType::FLOAT64   ? ext_scalar_f64
+                                                                  : dtype == DataType::INT32      ? ext_scalar_i32
+                                                                  : dtype == DataType::COMPLEX128 ? ext_scalar_c128
+                                                                  : ext_str)
+                                      : (dtype == DataType::FLOAT64   ? ext_f64
+                                     : dtype == DataType::INT32      ? ext_i32
+                                     : dtype == DataType::COMPLEX128 ? ext_c128
+                                     : ext_str);
                 if (offset + count > extent) continue;
             }
             if (path_id >= n_paths) continue;   // corrupt: no text for that id
@@ -2967,21 +3100,47 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
     const bool time_block = block_row && index_version >= PANZER_INDEX_VERSION_V4 &&
                             data_dset_time >= 0;
 
+    // A per-step scalar -- one value per time step for a node that is 0-D in the
+    // IDS (global_quantities&ip is the case that costs the most, see to_improve.md
+    // point 31) -- has its own block in v5, so it grows like the time base instead
+    // of being scattered one value per 18 001 slots through the payload. Same
+    // layout rule as the time base: APPEND on a v3/v4 file has no such handle, so
+    // those files keep the old rows. Strings are excluded: their offset indexes
+    // data_raw_str, which the read path resolves by type.
+    hid_t scalar_dset;
+    if constexpr (std::is_same<T, double>::value)      scalar_dset = data_dset_scalar_f64;
+    else if constexpr (std::is_same<T, int32_t>::value) scalar_dset = data_dset_scalar_i32;
+    else                                                scalar_dset = data_dset_scalar_c128;
+    const bool scalar_block = !time_block && slice_size == 1 &&
+                              index_version >= PANZER_INDEX_VERSION_V5 && scalar_dset >= 0;
+
     const size_t n_values = slice_size * n_slices;
-    uint64_t start_offset;
+    // The block this row appends to and its cursor: the time base (v4) has one, a
+    // per-step scalar (v5) has one, everything else goes to the block of its type.
+    // Only a double can be a time base, hence the compile-time guard -- dtype
+    // FLOAT64 <=> T is double.
+    std::vector<T>* payload = &buffer;
+    uint64_t payload_disk_size = current_disk_size;
     if constexpr (std::is_same<T, double>::value) {
-        // dtype FLOAT64 <=> T is double, the only type the time block holds.
         if (time_block) {
-            start_offset = disk_size_time + data_buffer_time.size();
-            data_buffer_time.insert(data_buffer_time.end(), data, data + n_values);
-        } else {
-            start_offset = current_disk_size + buffer.size();
-            buffer.insert(buffer.end(), data, data + n_values);
+            payload = &data_buffer_time;
+            payload_disk_size = disk_size_time;
         }
-    } else {
-        start_offset = current_disk_size + buffer.size();
-        buffer.insert(buffer.end(), data, data + n_values);
     }
+    if (scalar_block) {
+        if constexpr (std::is_same<T, double>::value) {
+            payload = &data_buffer_scalar_f64;
+            payload_disk_size = disk_size_scalar_f64;
+        } else if constexpr (std::is_same<T, int32_t>::value) {
+            payload = &data_buffer_scalar_i32;
+            payload_disk_size = disk_size_scalar_i32;
+        } else {
+            payload = &data_buffer_scalar_c128;
+            payload_disk_size = disk_size_scalar_c128;
+        }
+    }
+    const uint64_t start_offset = payload_disk_size + payload->size();
+    payload->insert(payload->end(), data, data + n_values);
 
     uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
     const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
@@ -2993,7 +3152,7 @@ void PanzerDB::writeDataSlicesImpl(const std::string& name,
                     start_offset,               // Start offset
                     slice_size * n_slices,      // TOTAL Count
                     flags, parent_row, inst,
-                    time_block ? RAW_BLOCK_TIME : RAW_BLOCK_TYPE);
+                    time_block ? RAW_BLOCK_TIME : (scalar_block ? RAW_BLOCK_SCALAR : RAW_BLOCK_TYPE));
 
     last_level_had_write = true;
     

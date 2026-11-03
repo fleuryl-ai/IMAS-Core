@@ -1869,5 +1869,129 @@ garde `version >= 3`. `ctest` : **101/101**.
   découpe l'union en passes au lieu de la matérialiser d'un coup. L'avertissement, lui, nomme le fichier et son
   facteur d'amplification. Un pulse existant ne devient pas v4 tout seul.
 
+---
+
+## 31. Les scalaires par pas de temps dorment aussi dans `data_raw_f64` : un `get()` qui balaye 143 990 000 éléments pour 8 000 valeurs — layout v5 (2026-11-03)
+
+**Le symptôme.** Le point 30 s'arrêtait sur une ligne non expliquée : le `get()` de tout un IDS sur
+`tree_8000x2000_slice_v2` coûte **1 635,5 MiB en 4 427 `pread64`**, soit ~1,9 fois la taille du fichier
+(836 MiB), alors que le même `get()` sur `tree_8000x2000_put_v2` coûte **835,7 MiB en 2 320 appels** — une
+passe. Le point 30 attribuait ce surcroît à « l'entrelacement des feuilles dans `data_raw_f64` ». **C'était
+faux.** Le surcroît a un nom : `global_quantities&ip`, un scalaire par pas de temps.
+
+**Base mesurée — une sonde d'attribution posée avant de changer quoi que ce soit.** `PANZER_READ_PROBE=1`
+instrumente `readLeavesUnion()` (nombre d'appels, feuilles par visite, fenêtre `[lo,hi]` et `Σ count` par
+chemin, et les visites dont `étendue/Σ count` dépasse le seuil d'avertissement). Même bibliothèque, même
+machine, les deux fichiers relus l'un après l'autre :
+
+| ce que la sonde relève pendant le `get()` du fichier nommé | `tree_8000x2000_slice_v2_2026-11-02-v4` (layout v4) | `tree_8000x2000_slice_v2_2026-11-03-v5` (layout v5) |
+|---|---|---|
+| appels de `readLeavesUnion()` | 80 004 | 80 004 (inchangé) |
+| visites dispersées (`[PROBE-SCATTER]`) | **1**, étendue 143 990 000 pour 8 000 voulus, **3,17 s** | **0** |
+| fenêtre de `global_quantities&ip` (`[PROBE-PATH]`) | `lo=18000 hi=144008000` | `lo=0 hi=8000` |
+| paroi du `get()` dans ce même processus sondé | 11,39 s | 7,88 s |
+
+3,17 s sur les 11,39 s de la jambe : **un seul chemin d'index** sur les dix que compte le fichier.
+
+**Pourquoi un chemin de 8 000 doubles coûte plus que les 144 Mo de physique à côté.** `getAOSShape()` renvoie
+8 000 pour l'AoS dynamique, donc l'AL marche **élément par élément** : `global_quantities&ip` arrive en 8 000
+lignes de `count=1`, chacune dans son élément. Or un élément occupe **18 001** slots de `data_raw_f64`
+(2 000 points × 8 quantités + la base de temps de l'AoS) : les lignes se suivent à `off=18000`, `36001`,
+`54002`, `72003`, … Soit une fenêtre de 143 990 000 éléments pour 8 000 demandés — un facteur **17 998**.
+
+**La voie écartée, mesurée plutôt que supposée.** Côté reader, la seule idée qui tienne est de remplacer ces
+8 000 lignes par **une seule hyperslab à pas constant** (`block=1`, `stride=18001`, `count=8000`). Elle a été
+implémentée et chiffrée sur le même fichier v4 : valeurs identiques (`[DIGEST] TOTAL hash=a0499697f3d1d26d`),
+mais **1 671,4 MiB en 4 522 appels** contre 1 635,5 MiB en 4 427 — **+2,2 %**. La raison est dans
+l'arithmétique du chunk : 144 M d'éléments / un chunk de 65 536 = **2 198 chunks**, et 8 000 valeurs espacées
+de 18 001 en touchent **tous**. Aucune stratégie de lecture ne peut donc gagner ici ; l'expérience a été
+retirée du code. Le coût est un choix d'**écriture**.
+
+**Le correctif — un bloc pour les scalaires par pas de temps, estampillé v5.** Prolongement direct du bloc de
+temps du point 30 :
+
+- Datasets `data_scalar_f64` / `data_scalar_i32` / `data_scalar_c128` (`PANZER_SCALAR_DATASET_*`), chunk
+  `ChunkingConfig::data_chunk_scalar = 512` — même raison que pour le temps : la densité d'un bloc de scalaires
+  n'a rien à voir avec celle des valeurs.
+- Estampille `PANZER_INDEX_VERSION_V5 = 5`. Les portails de lecture restent `>= V3` ; une version **inconnue**
+  est refusée **par son nom** (`rejectUnknownIndexVersion()`), sur `READ` comme sur `APPEND`.
+- Le sélecteur de bloc passe de 1 à **2 bits** : il vit dans le mot packé de la colonne 3 de `/index`
+  (`PANZER_V3_BLOCK_SHIFT = 12`, masque `PANZER_V3_BLOCK_BITS = 0x3`), jamais dans `Leaf::flags` — les ~22 sites
+  qui lisent le dtype par `flags >> 4` ne sont pas touchés. `RawBlock` gagne `RAW_BLOCK_SCALAR = 2`.
+- **Règle de routage** (elle borne ce qui change de place) : seulement `writeDataSlices` avec
+  `slice_size == 1` — donc un scalaire par pas de temps, y compris de forme `{1}` — et seulement des types
+  numériques, et seulement si `index_version >= V5` **et** que le handle du bloc est valide. Les scalaires
+  statiques (`writeData`) et les chaînes ne bougent pas. Sur `APPEND` d'un fichier v3 ou v4, les handles restent
+  invalides et le bit de bloc reste à 0 : **un fichier garde le layout avec lequel il a été écrit.**
+- Côté lecteur : un bucket **par bloc** dans `readLeavesUnion()` (tableau dimensionné par la largeur du champ,
+  pas par le nombre de blocs connus — une valeur inconnue ne sort pas du tableau), garde d'extent par bloc dans
+  `getLeaves()`, et `view_publisher` nomme le dataset du bloc pour la VDS.
+
+**Le fichier, avant/après** (`structure.sh`, `h5ls`) :
+
+| la structure du fichier nommé | v4 (`tree_8000x2000_slice_v2_2026-11-02-v4`) | v5 (`tree_8000x2000_slice_v2_2026-11-03-v5`) |
+|---|---|---|
+| `data_raw_f64` | 144 008 000 éléments | **144 000 000** |
+| `data_scalar_f64` | absent | **8 000** |
+| `data_time_f64` | 16 000 | 16 000 (inchangé) |
+| lignes de `/index` | 96 006 | 96 006 (**inchangé** — v5 déplace des valeurs, pas des lignes) |
+| `core_profiles.h5` | 876 728 012 o | 876 388 102 o |
+
+`panzer_index.py` sur le fichier v5 : les 8 000 lignes de `global_quantities&ip` portent `blk=scalar` et des
+offsets **denses** `0, 1, 2, … 7999` — contre `18000, 36001, 54002, …` en v4.
+
+**Après** — même pilote, même géométrie, campagne taguée `2026-11-03-v5` (les arbres du 02/11 sont intacts) ;
+`readbytes.sh` compte un appel dans un processus neuf :
+
+| l'opération sur le fichier nommé (une fois, `strace -e pread64` + `/usr/bin/time -v`) | paroi | octets physiques sur `core_profiles.h5` | RSS crête |
+|---|---|---|---|
+| `get()` sur `tree_8000x2000_slice_v2_2026-11-03-v5` (v5) | 8,97 s | **835,8 MiB en 2 345 appels** | 1 356 156 kB |
+| le même `get()` sur `tree_8000x2000_slice_v2_2026-11-02-v4` (v4), relu aujourd'hui par la même bibliothèque | 12,88 s | 1 635,5 MiB en 4 427 appels | 1 375 384 kB |
+| `get()` sur `tree_8000x2000_put_v2_2026-11-03-v5` (v5) | 8,70 s | 835,7 MiB en 2 341 appels | 1 352 604 kB |
+| `getSlice()` sur `tree_8000x2000_slice_v2_2026-11-03-v5` (v5) | 0,67 s | 0,9 MiB en 95 appels | 58 388 kB |
+| `get()` sur `tree_8000x2000_slice_v1_2026-11-03-v5` (1.0, témoin) | 37,3 s | 929,1 MiB en 154 839 appels | 2 498 836 kB |
+| `getSlice()` sur `tree_8000x2000_slice_v1_2026-11-03-v5` (1.0, témoin) | 0,71 s | 0,3 MiB en 158 appels | 30 320 kB |
+
+835,8 MiB lus pour un fichier de 876 388 102 o (= 835,8 MiB) : le `get()` ne fait plus que **la passe du
+payload**. Le point 30 voyait juste sur le `getSlice()` et se trompait sur l'origine du surcroît du `get()`.
+
+Sur les jambes du pilote (3 passes de `get()` en processus neuf, médiane) :
+`tree_8000x2000_slice_v2` **10,53 s → 7,28 s** (−31 %) ; témoins inchangés — `tree_8000x2000_put_v2`
+7,37 → 7,45 s, `tree_8000x2000_slice_v1` 30,9 → 31,6 s, `tree_8000x2000_put_v1` 7,7 → 8,0 s.
+Sur la jambe de 100 `getSlice()` du même fichier v2, qui n'était pas en cause : 0,231 s → 0,221 s, pire appel
+89,31 → 80,85 ms, médiane des répétitions 1,146 → 1,139 ms.
+
+**Les valeurs ne bougent pas.** Les 19 lignes `[DIGEST] array=` et le `[DIGEST] TOTAL hash=a0499697f3d1d26d`
+sont identiques ligne à ligne entre les deux campagnes sur les **4** cellules `digest` de la géométrie
+(put/slice × v1/v2). Le nombre de lignes d'index ne bouge pas non plus.
+
+**Ce que la campagne ne prouve pas.** Les jambes d'écriture ont monté entre les deux campagnes
+(`put` v2 19,95 → 21,55 s, `slice` v1 41,72 → 62,67 s). Or la jambe 1.0 est **insensible** au layout v5 : cet
+écart vient de la machine partagée, pas du layout. Il est dit ici plutôt que corrigé, et il ne touche aucune des
+colonnes de lecture ci-dessus, qui comparent le même fichier relu par la même bibliothèque.
+
+**Gardes.** `tests/hdf5_backend/test_engine_scalar_block.cpp` (quatre sections : tranche à tranche — scalaire
+`double`, `int`, `complexe` à la racine **et** dans l'AoS —, `bulk` temporel qui doit rester une ligne de
+`count = N` dans le payload, `APPEND` sans écrasement, et `APPEND` sur un fichier rabaissé à `index_version=4`
+qui doit **garder** ses nouvelles lignes dans le payload avec `block=0`, y compris un `getWholeDynamicSignal`
+mélangeant bloc ancien et bloc neuf) ; `test_engine_commit_order_guardrail.cpp` injecte une troisième ligne
+pendante dans le bloc scalaire ; `test_index_golden` épingle désormais `block=` dans la surface et son oracle a
+été **recapturé** (seules les lignes de feuilles bougent, les offsets du payload statique sont intacts) ;
+`test_engine_index_v3.cpp` et `test_engine_time_base_layout.cpp` attendent l'estampille v5.
+`ctest` : **102/102**.
+
+**Reste ouvert.**
+- La sonde (`PANZER_READ_PROBE`, `[PROBE-*]`) n'est **plus dans le source** : elle vit dans
+  `probe_read_attribution.patch` (racine d'al-core, non commité). `git apply
+  probe_read_attribution.patch` la réinstalle, `git apply -R` l'ôte. Les chiffres ci-dessus ont
+  été pris avec elle ; la bibliothèque verte est celle **sans** sonde — `ctest` rend 102/102
+  dans les deux états, vérifié après le retrait.
+- Un pulse écrit avant v5 garde son layout et son balayage : il n'y a pas de migration, seulement le refus nommé
+  d'une version inconnue. Le chemin de conversion `upgrade` n'est pas un reclassement.
+- Les scalaires **statiques** (`writeData`) et les **chaînes** par pas de temps ne sont pas routés vers le bloc
+  scalaire. Non mesuré, donc non affirmé.
+- Le ratio par chemin des bases de temps reste à **2,00** (les deux bases de `core_profiles` partagent le bloc),
+  et le lookup de gap non normalisé (`profiles_1d//time`, hérité du point 30) reste hors périmètre.
+
 
 

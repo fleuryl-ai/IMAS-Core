@@ -7,7 +7,7 @@
 // data values (those are covered by the value-asserting engine/*al_* tests):
 //
 //   * PanzerDB::getLeaves()  -> every Leaf: path, parent_path, flags,
-//     time_index, offset, count, shape, is_empty
+//     time_index, offset, block, count, shape, is_empty
 //   * imas::direct_access::list_nodes(...) -> NodeInfo (path, type, dims, is_in_dynamic_aos)
 //   * PanzerDB::getAOSShape(aos_path)       -> size vector per AoS
 //   * PanzerDB::stripIndices(path)          -> schema of each instance path
@@ -183,6 +183,10 @@ std::string serialize_surface(const std::string& filename) {
            << " dtype=" << (lf->flags >> 4)
            << " time=" << lf->time_index
            << " off=" << lf->offset
+           // block names WHICH raw block `off` addresses: since v4 a FLOAT64 row
+           // can sit in the payload or the time-base block, and v5 adds a
+           // per-step-scalar block, so an offset alone is not interpretable.
+           << " block=" << unsigned(lf->block)
            << " cnt=" << lf->count
            << " shape=(" << dims_str(lf->shape_span()) << ")"
            << " empty=" << (lf->is_empty ? 1 : 0)
