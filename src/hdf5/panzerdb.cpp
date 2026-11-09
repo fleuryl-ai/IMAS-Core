@@ -210,19 +210,31 @@ PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_emp
     H5Pset_meta_block_size(fapl, 2 * 1024 * 1024);
 
     if (mode == OpenMode::WRITE) {
-        file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+        // SWMR_WRITE is stamped in the file at creation: it is what lets a separate
+        // process follow the file as it grows (measured: without it a reader only ever
+        // sees the state as of the writer's close(), with or without SWMR_READ).
+        file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC | H5F_ACC_SWMR_WRITE, H5P_DEFAULT, fapl);
     } else if (mode == OpenMode::APPEND) {
         // Check if file exists
         if (H5Fis_hdf5(filename.c_str()) > 0) {
-            // File exists, open in read/write
+            // File exists, open in read/write. No SWMR_WRITE here: the flag belongs to
+            // the file's creation, and files written before it existed must stay openable.
             file_id = H5Fopen(filename.c_str(), H5F_ACC_RDWR, fapl);
         } else {
             // File does not exist, create it
-            file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+            file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC | H5F_ACC_SWMR_WRITE, H5P_DEFAULT, fapl);
             mode = OpenMode::WRITE; // Switch to WRITE mode for initialization
         }
     } else { // OpenMode::READ
-        file_id = H5Fopen(filename.c_str(), H5F_ACC_RDONLY, fapl);
+        // HDF5 >= 1.14 takes a POSIX record lock on every open, and the writer's write
+        // lock makes a reader's RDONLY open fail with EAGAIN (H5FD__sec2_lock(): "unable
+        // to lock file"). It also flags a file as "being written" and refuses plain reads
+        // of it ("file is already open for write"). Both gates have to come down for the
+        // single-writer / multi-reader contract that flush()'s H5Fflush commit barrier
+        // exists to provide to be reachable at all. READ only: writer-vs-writer locking
+        // stays armed.
+        H5Pset_file_locking(fapl, false, true);
+        file_id = H5Fopen(filename.c_str(), H5F_ACC_RDONLY | H5F_ACC_SWMR_READ, fapl);
     }
     H5Pclose(fapl);
 

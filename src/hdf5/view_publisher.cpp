@@ -941,7 +941,14 @@ PublishStats publishImpl(const std::string& filename, const PublishOptions& opti
     //               it owns+manages that handle (auto-closed at scope exit).
     // This avoids a double-close: PanzerDB's close() closes a file handle it was
     // given, so we must not keep a shared handle that it also closes.
-    hid_t write_h = H5Fopen(filename.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    // HDF5 refuses concurrent handles on one file whose file-locking flags disagree
+    // ("file locking flag values don't match"), and the READ-mode PanzerDB below
+    // opens with locking off (SWMR readers must, see the PanzerDB constructor).
+    // So this handle has to ask for the same thing.
+    hid_t waf = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_file_locking(waf, false, true);
+    hid_t write_h = H5Fopen(filename.c_str(), H5F_ACC_RDWR, waf);
+    H5Pclose(waf);
     if (write_h < 0) h5err("cannot open for R/W: " + filename);
 
     PanzerDB db(filename, PanzerDB::OpenMode::READ, /*preserve_empty*/true);
