@@ -189,6 +189,12 @@ al_add_hdf5_test(test_al_core_sources_put_slice)
 al_add_hdf5_test(test_al_flux_loop_aos)
 al_add_hdf5_test(test_al_flux_loop_deep_data_slice)
 al_add_hdf5_test(test_al_flux_loop_deep_data_getslice)
+# inhomogeneous magnetics signal at flux_loop(j)/flux/data whose base is a
+# sibling of the payload inside `flux` (flux_loop(j)/flux/time): the reader used
+# to anchor the base on the AoS element and miss it -- see the fix in the
+# inhomogeneous static-AoS branch of IReadStrategy::getTimeValues
+# (src/hdf5/iread_strategy.h).
+al_add_hdf5_test(test_al_repro_flux_loop_flux_getslice)
 
 # dynamic-AoS behaviour
 al_add_hdf5_test(test_al_dynamic_aos_gap)

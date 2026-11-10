@@ -394,32 +394,59 @@ public:
         timed_ctx = timed_ctx->getParent();
     }
 
-    // If no dynamic parent is found, it could be a dynamic signal inside a static AoS.
-    // In this case, the time vector is also static relative to the current context.
+    // If no dynamic parent is found, this is a signal with its own time base
+    // nested inside a static AoS element.  The base lives in the SAME container as
+    // the payload -- a sibling of the data node.  A 1-D signal
+    // flux_loop(j)/flux/data therefore has its base at flux_loop(j)/flux/time,
+    // NOT at flux_loop(j)/time.  Derive the base from the declared name and anchor
+    // it on the data node's own container (mirroring the root-signal branch above),
+    // then fall back to the AoS element for bases that really are one level up, and
+    // finally to a common base at the root of the IDS.
     if (!timed_ctx) {
-        if (!timebasename_copy.empty()) {
-            // For homogeneous_time=0, the timebase can be relative to the static AoS element,
-            // or fall back to a common timebase at the root of the IDS.
+        // Base name = last segment of the timebase the caller declared
+        // (both "time" and "flux/time" yield "time"); the raw name dodges the
+        // context-path fold that a nested base would otherwise trigger.
+        const std::string raw_tb = timebasename;
+        const size_t tb_last = raw_tb.find_last_of("/&");
+        const std::string base_name =
+            (tb_last == std::string::npos) ? raw_tb : raw_tb.substr(tb_last + 1);
 
-            // 1. Try to find timebase relative to the current static AoS element.
-            std::replace(timebasename_copy.begin(), timebasename_copy.end(), '/', '&');
-            std::string local_timebase_path = buildFullPath(ctx, timebasename_copy);
+        if (!base_name.empty()) {
+            // Candidate storage paths for this element, most specific first:
+            //   (a) sibling of the payload  -- the declared location
+            //       flux_loop(j)/flux/data + "time" -> flux_loop(j)/flux/time
+            //   (b) relative to the AoS element   -- flux_loop(j)/time
+            const std::string data_flat = cleanFlatPath(dataset_path);
+            std::vector<std::string> candidates;
+            const size_t dsep = data_flat.find_last_of("/&");
+            if (dsep != std::string::npos && dsep > 0)
+                candidates.push_back(data_flat.substr(0, dsep) + "&" + base_name);
+            candidates.push_back(base_name);
 
-            // The key carries the AoS element index (buildFullPath), so each element
-            // gets its own base while repeated reads of one element stay cheap.
-            const std::string local_key = "ELEMENT:" + local_timebase_path;
-            auto local_it = time_values_cache.find(local_key);
-            if (local_it != time_values_cache.end()) return local_it->second;
+            // Cache the aggregate under a key that is stable per
+            // (element + data node + base name) so repeated reads of one element
+            // stay cheap, without a miss on the first candidate masking the rest.
+            const std::string element_id = buildFullPath(ctx, "");
+            const std::string key = "ELEMENT:" + element_id + "|" + data_flat + "|" + base_name;
+            auto it = time_values_cache.find(key);
+            if (it != time_values_cache.end())
+                return it->second;
 
-            time_values = panzer_db_ptr->getWholeDynamicSignal(local_timebase_path);
-
-
-            // 2. If not found locally, fall back to the root timebase.
-            if (time_values.empty()) {
-                time_values = panzer_db_ptr->getWholeDynamicSignal(timebasename_copy);
+            for (const std::string& cand : candidates) {
+                time_values = panzer_db_ptr->getWholeDynamicSignal(buildFullPath(ctx, cand));
+                if (!time_values.empty()) {
+                    time_values_cache[key] = time_values;
+                    return time_values;
+                }
             }
-            time_values_cache[local_key] = time_values;
-            return time_values;
+
+            // (c) Last resort: a common time base at the root of the IDS.
+            time_values = panzer_db_ptr->getWholeDynamicSignal(base_name);
+            if (!time_values.empty())
+                return time_values;
+            time_values_cache[key] = {};   // remember the miss, but answer empty
+
+            return time_values;            // no base resolved -> caller reports unavailable
         }
         return {}; // No timebase found
     }
