@@ -195,6 +195,13 @@ al_add_hdf5_test(test_al_flux_loop_deep_data_getslice)
 # inhomogeneous static-AoS branch of IReadStrategy::getTimeValues
 # (src/hdf5/iread_strategy.h).
 al_add_hdf5_test(test_al_repro_flux_loop_flux_getslice)
+# inhomogeneous 1-D signal under static AoS A > dynamic AoS B (base per element
+# A/i/B/j/time): second context in the "Unexpected time vector with size 0" family.
+al_add_hdf5_test(test_al_repro_nested_aos_signal_getslice)
+# ece IDS: static channel > DYNAMIC beam_tracing > static beam > 0-D power_initial,
+# inhomogeneous; reported failing from MATLAB ids_get_slice
+# ("Unexpected time vector with size 0").
+al_add_hdf5_test(test_al_repro_ece_beam_tracing_getslice)
 
 # dynamic-AoS behaviour
 al_add_hdf5_test(test_al_dynamic_aos_gap)
