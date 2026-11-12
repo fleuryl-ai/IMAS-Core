@@ -30,6 +30,17 @@
 //      dynamic AoS.
 //
 // Both variants failing is the reported defect; this test only pins them.
+//
+// The live HLI (MATLAB ids_get_slice, imas_mex_utils.c) opens the SAME tree
+// but declares the dynamic AoS with the DICTIONARY-ABSOLUTE timebase
+// ("channel/beam_tracing/time") while passing an EMPTY timebase at the 0-D leaf
+// (AL_TRACE_RD:  obj='power_initial' tbase='').  The timed-context branch of
+// getTimeValues derives the base name from timed_ctx->getTimebasePath(),
+// which after sanitisation reads "channel/beam_tracing&time"; extracting the
+// base name on '/' only yields "beam_tracing&time" instead of "time", so no
+// stored layout (canoncial sibling "…/beam_tracing&time" nor per-sample
+// "…/beam_tracing/t/time") is found and slice reads throw "size 0".  The
+// full_path variant below pins exactly this second axis of the defect.
 #include "al_context.h"
 #include "al_defs.h"
 #include "hdf5_backend.h"
@@ -180,6 +191,54 @@ static bool slice_read(const std::string& uri, int ch, int beam, double t_req, i
     return okret;
 }
 
+// ids_get_slice under the LIVE HLI context shape: the dynamic AoS is declared
+// with the DICTIONARY-ABSOLUTE timebase "channel/beam_tracing/time" (what
+// imas_mex_utils.c passes to al_open_dataobject) and the 0-D leaf is read with
+// the EMPTY timebase the HLI passes for it.  The timed-context branch must
+// still resolve the base's leaf name ("time") out of the full declared base
+// path, whatever the storage layout is.
+static bool slice_read_hli_shape(const std::string& uri, int ch, int beam, double t_req, int interp, const char* iname,
+                                 double& got, std::string& how) {
+    HDF5Backend backend;
+    DataEntryContext dec(uri);
+    OperationContext op(&dec, "ece", READ_OP, alconst::slice_op, t_req, interp);
+    bool c=false,bt=false,be=false;
+    ArraystructContext chCtx(&op, "channel", "");
+    // HLI: full dictionary path as the dynamic AoS's timebase declaration.
+    ArraystructContext btCtx(&chCtx, "beam_tracing", "channel/beam_tracing/time");
+    ArraystructContext beCtx(&btCtx, "beam", "");
+    got = -1e30;
+    bool okret = false;
+    auto unwind = [&](){
+        if (be) { try{backend.endAction(&beCtx);}catch(...){} }
+        if (bt) { try{backend.endAction(&btCtx);}catch(...){} }
+        if (c ) { try{backend.endAction(&chCtx);}catch(...){} }
+        try { backend.endAction(&op); } catch (...) {}
+        try { backend.closePulse(&dec, OPEN_PULSE); } catch (...) {}
+    };
+    try {
+        backend.openPulse(&dec, OPEN_PULSE);
+        backend.beginAction(&op);
+        int n=0;
+        backend.beginArraystructAction(&chCtx,&n); c=true;
+        for (int i=0;i<ch;++i) chCtx.nextIndex(1);
+        backend.beginArraystructAction(&btCtx,&n); bt=true;
+        backend.beginArraystructAction(&beCtx,&n); be=true;
+        for (int i=0;i<beam;++i) beCtx.nextIndex(1);
+        void* data=nullptr; int type=alconst::double_data, dim=0; int sz[H5S_MAX_RANK]={0};
+        backend.readData(&beCtx, "power_initial", "", &data, &type, &dim, sz);   // HLI passes ""
+        if (type==alconst::double_data && data) got = *(double*)data;
+        free(data);
+        how = "type=" + std::to_string(type) + " dim=" + std::to_string(dim);
+        okret = (type==alconst::double_data && data != nullptr);
+    } catch (const std::exception& e) {
+        how = std::string("THREW: ") + e.what();
+        if (std::string(e.what()).find("size 0") != std::string::npos) how += "   <<< SIZE-0 BUG";
+    }
+    unwind();
+    return okret;
+}
+
 int main() {
     int failures = 0;
     try {
@@ -236,6 +295,38 @@ int main() {
                 }
                 bool good = okret && how.find("size 0") == std::string::npos && std::fabs(got - expected) < 1e-9;
                 std::cout << "  [get_slice] ch" << p.ch << "/beam" << p.be << " t=" << p.t << " " << p.name
+                          << " : " << (okret ? ("val=" + std::to_string(got) + " | " + how) : how)
+                          << "  expected=" << expected
+                          << (good ? "   OK" : "   ** FAIL **") << "\n";
+                if (!good) ++failures;
+            }
+        }
+
+        // === LIVE-HLI shape: dynamic AoS declared with the dictionary-absolute
+        // === timebase ("channel/beam_tracing/time"), 0-D leaf read with the
+        // === empty timebase the HLI passes.  Must work on BOTH storage layouts.
+        for (auto& L : layouts) {
+            std::cout << "============================================================\n";
+            std::cout << "VARIANT: " << L.tag
+                      << " + HLI context (full-path declaration, empty leaf timebase)\n";
+            for (auto& p : probes) {
+                double got; std::string how;
+                bool okret = slice_read_hli_shape(L.uri, p.ch, p.be, p.t, p.interp, p.name, got, how);
+                double expected;
+                if (p.interp == alconst::linear_interp) {
+                    double tlo = base_t(1), thi = base_t(2);
+                    double f = std::min(1.0, std::max(0.0, (p.t - tlo) / (thi - tlo)));
+                    expected = (1.0 - f)*pval(p.ch,1,p.be) + f*pval(p.ch,2,p.be);
+                } else if (p.interp == alconst::previous_interp) {
+                    int ip = 0; for (int k = 1; k < N_T; ++k) if (base_t(k) <= p.t + 1e-9) ip = k;
+                    expected = pval(p.ch, ip, p.be);
+                } else {
+                    int ic = 0; for (int k = 1; k < N_T; ++k)
+                        if (std::fabs(base_t(k) - p.t) < std::fabs(base_t(ic) - p.t)) ic = k;
+                    expected = pval(p.ch, ic, p.be);
+                }
+                bool good = okret && how.find("size 0") == std::string::npos && std::fabs(got - expected) < 1e-9;
+                std::cout << "  [get_slice HLI] ch" << p.ch << "/beam" << p.be << " t=" << p.t << " " << p.name
                           << " : " << (okret ? ("val=" + std::to_string(got) + " | " + how) : how)
                           << "  expected=" << expected
                           << (good ? "   OK" : "   ** FAIL **") << "\n";

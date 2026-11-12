@@ -458,11 +458,15 @@ public:
     // Use smart sanitization
     timebase_name_str = sanitize_path(timed_ctx, timebase_name_str);
 
-    // Extract basename of timebase to handle both relative ("time") and absolute/generic ("path/to/time") paths
+    // Extract basename of timebase to handle both relative ("time") and absolute/generic
+    // ("path/to/time") paths.  The HLI (IMAS-MATLAB imas_mex_utils.c) declares a dynamic
+    // AoS with the DICTIONARY-ABSOLUTE base ("channel/beam_tracing/time"), which after
+    // sanitisation reads "channel/beam_tracing&time": the leaf's true name ("time") is
+    // separated by "/" AND by the dynamic-AoS "&" marker, so both must delimit the base.
     std::string timebase_basename = timebase_name_str;
-    size_t last_slash_tb = timebase_name_str.find_last_of('/');
-    if (last_slash_tb != std::string::npos) {
-        timebase_basename = timebase_name_str.substr(last_slash_tb + 1);
+    size_t last_delim_tb = timebase_name_str.find_last_of("/&");
+    if (last_delim_tb != std::string::npos) {
+        timebase_basename = timebase_name_str.substr(last_delim_tb + 1);
     }
 
     std::string cache_key = timed_aos_path + "/" + timebase_basename;
