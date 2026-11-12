@@ -20,6 +20,21 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
 
         timebase_name = cleanFlatPath(sanitize_path(timed_parent, timebase_name));
 
+        // Only the base's leaf NAME may be appended to the AoS path.  The HLI
+        // (IMAS-MATLAB imas_mex_utils.c) declares a dynamic AoS with the
+        // DICTIONARY-ABSOLUTE base ("channel/beam_tracing/time"); after sanitisation
+        // that reads "channel&beam_tracing&time", and appending the whole string
+        // ("channel/0/beam_tracing/channel&beam_tracing&time") matches no stored
+        // leaf, so the slice index resolves to -1 and the read is pinned to element
+        // index 0 — returning the FIRST slice's sub-structure instead of slice t.
+        // Reduce to the basename first, delimited by BOTH "/" and "&" (the same
+        // rule getTimeValues applies in commit f425866).
+        {
+            size_t tb_last = timebase_name.find_last_of("/&");
+            if (tb_last != std::string::npos) timebase_name = timebase_name.substr(tb_last + 1);
+            if (timebase_name.empty()) timebase_name = "time";
+        }
+
         std::string aos_path = getPath(timed_parent, false);
         std::string timebase_path = aos_path;
         if (!timebase_path.empty()) timebase_path += "/";

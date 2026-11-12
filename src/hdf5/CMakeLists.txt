@@ -202,6 +202,11 @@ al_add_hdf5_test(test_al_repro_nested_aos_signal_getslice)
 # inhomogeneous; reported failing from MATLAB ids_get_slice
 # ("Unexpected time vector with size 0").
 al_add_hdf5_test(test_al_repro_ece_beam_tracing_getslice)
+# ece slice-INDEX resolution: nested dynamic beam_tracing with a TIME-VARYING
+# per-slice beam count — ids_get_slice(t) must return slice t's AoS size, not
+# slice 0's (getSliceIndex falls back to element index 0 when the HLI declares
+# the base dictionary-absolute); same basename-extraction class as getTimeValues.
+al_add_hdf5_test(test_al_repro_ece_beamtracing_sliceindex_getslice)
 
 # dynamic-AoS behaviour
 al_add_hdf5_test(test_al_dynamic_aos_gap)
