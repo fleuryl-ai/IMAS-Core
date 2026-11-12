@@ -45,6 +45,13 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
         if (slice_idx < 0) {
             slice_idx = panzer_db_ptr->getTimeIndex(timebase_path, opCtx->getTime(), opCtx->getInterpmode());
         }
+        // The "timebase of a dynamic AoS" layout is stored with the "&" separator
+        // (e.g. "channel/0/beam_tracing&time"), the same convention getTimeValues
+        // settles on.  Fall back to it when the "/basename" child layout is absent.
+        if (slice_idx < 0) {
+            const std::string timebase_amp_path = aos_path + "&" + timebase_name;
+            slice_idx = panzer_db_ptr->getTimeIndex(timebase_amp_path, opCtx->getTime(), opCtx->getInterpmode());
+        }
     }
 
     std::string path_container = getPath(ctx, false, slice_idx);

@@ -478,6 +478,18 @@ public:
     std::string direct_tb_path = timed_aos_path + "/" + timebase_basename;
     const auto* direct_leaves = read_index_ptr->find_path(direct_tb_path);
 
+    // A dynamic AoS's own timebase is stored under the "&" separator
+    // (e.g. "channel/0/beam_tracing&time") — the same layout the "!timed_ctx"
+    // branch below already relies on, and exactly what the legacy reader builds
+    // ("tensorized_paths[i] + "&time"").  The "/time" child layout is the
+    // per-element form seen when the writer materialised a scalar per element.
+    // Neither layout must shadow the other without a lookup.
+    if (!direct_leaves || direct_leaves->empty()) {
+        const std::string direct_amp_path = timed_aos_path + "&" + timebase_basename;
+        const auto* amp_leaves = read_index_ptr->find_path(direct_amp_path);
+        if (amp_leaves && !amp_leaves->empty()) direct_leaves = amp_leaves;
+    }
+
     if (direct_leaves && !direct_leaves->empty()) {
         // Homogeneous case found in cache!
         for (const auto* leaf : *direct_leaves) {
