@@ -1780,7 +1780,21 @@ bool PanzerDB::reanchor(hid_t new_loc_id) {
         last_level_had_write = false;
         invalidateDynamicAOSCache();
     } else if (index_rows_loaded > 0 && rows_now != index_rows_loaded) {
-        return false;                                          // rows appended
+        if (rows_now < index_rows_loaded) return false;        // table shrank -> full rebuild (correct)
+        // READ + pure append (point 25): instead of refusing and forcing a full
+        // decode + ReadIndex rebuild over every row (the O(rows) x slices cost of a
+        // putSlice loop), read just the newly-appended tail into the existing
+        // leaf cache. The dataset handles this engine opened outlive the group the
+        // AL closes, so getLeaves() reaches them without reopening: it takes its
+        // own handoff branch (index_rows_loaded>0 < n_rows), appends
+        // [index_rows_loaded, n_rows) and bumps leaf_cache_gen. The persistent
+        // ReadIndex then extends with only the new leaves (ensure_current), and
+        // because we did not rebuild the engine, restoreTimeContext() is not
+        // re-run either. Guards: a shrink or a prefix that does not match the
+        // claimed loaded count falls back to a full rebuild (safe, unchanged).
+        if (cached_leaves.size() != index_rows_loaded) return false;
+        invalidateLeafCache();
+        (void)getLeaves();
     }
 
     if (should_close_loc_id && new_loc_id != file_id) {
@@ -2289,7 +2303,16 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         const uint64_t ext_scalar_i32  = rawExtentFor(data_dset_scalar_i32);
         const uint64_t ext_scalar_c128 = rawExtentFor(data_dset_scalar_c128);
 
-        if (cached_leaves.capacity() < n_rows) cached_leaves.reserve(n_rows);
+        // Reserve with headroom (grow geometrically, floor 16): a tail-append loop
+        // (putSlice, point 25) otherwise reserves to exactly n_rows each step, which
+        // reallocates every append and dangles the ReadIndex's const Leaf*, forcing a
+        // full index rebuild per slice. Doubling keeps the buffer base stable across
+        // appends so the index can extend in place (ReadIndex::extend_indexes).
+        if (cached_leaves.capacity() < n_rows) {
+            size_t want = cached_leaves.capacity() ? cached_leaves.capacity() * 2 : size_t(16);
+            if (want < static_cast<size_t>(n_rows)) want = static_cast<size_t>(n_rows);
+            cached_leaves.reserve(want);
+        }
 
         for (uint64_t i = start_row; i < n_rows; ++i) {
             const uint64_t* row = &idx[(i - start_row) * PANZER_INDEX_COLUMNS_V3];
@@ -2438,11 +2461,12 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     // loop below fills from each row's (parent_id, kind, full path).
 
     // 3. Iterate over each row and build Leaf objects
-    // Only reserve if we are starting from scratch or growing significantly
+    // Reserve with headroom (grow geometrically, point 25) so a tail-append loop
+    // does not reallocate every step and dangle the ReadIndex's const Leaf*.
     if (cached_leaves.capacity() < n_rows) {
-        cached_leaves.reserve(n_rows);
-        // Note: reserving map/lookup is not standard but we can hint if needed,
-        // but standard containers manage this.
+        size_t want = cached_leaves.capacity() ? cached_leaves.capacity() * 2 : size_t(16);
+        if (want < static_cast<size_t>(n_rows)) want = static_cast<size_t>(n_rows);
+        cached_leaves.reserve(want);
     }
 
     // M1: reconstruct each row's parent_path without a /parent_paths dataset.  The

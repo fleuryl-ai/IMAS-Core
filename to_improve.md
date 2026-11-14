@@ -1993,5 +1993,89 @@ pendante dans le bloc scalaire ; `test_index_golden` épingle désormais `block=
 - Le ratio par chemin des bases de temps reste à **2,00** (les deux bases de `core_profiles` partagent le bloc),
   et le lookup de gap non normalisé (`profiles_1d//time`, hérité du point 30) reste hors périmètre.
 
+## 32. `put_slice` V2 : le moteur de lecture se reconstruit à chaque tranche — le reanchor READ devient incrémental (2026-11-14)
+
+**Le résidu du point 25.** Le point 25 a rendu *plat* le cycle de vie du **writer** (un moteur
+APPEND pour la session, `close()` hors du chemin par opération), et a chiffré ce qui restait :
+**999 moteurs READ pendant les 1000 `putSlice`** — la boucle `core_profiles::putSlice` lit
+`ids_properties/homogeneous_time` avant **chaque** écriture (`readIdsTimeMode` → `al_read_data`
+→ `HDF5Reader_v2::select_strategy`). La session de lecture existe déjà (point 24) mais sa garde
+refuse à chaque coup : entre deux lectures le writer a ajoutée 12 lignes, donc
+`reanchor()` renvoie `false`, et `select_strategy()` relance `session_db.reset()` + un
+`PanzerDB(READ)` neuf + un `ReadIndex::build_indexes()` — un décodage **et** une reconstruction
+d'index sur **toutes** les lignes, à chaque tranche → O(lignes) par slice, O(N²) total.
+
+**La bonne piste était déjà écrite dans le point 25** : pas « relâcher la garde » (c'est la
+défense SWMR qui garantit que quelqu'un d'autre n'a pas bougé la table), mais recharger
+`/index` **en incrémental** — ce que le point 21 fait déjà *entre* moteurs d'un même fichier.
+C'est exactement le correctif posé ici, pas un contournement.
+
+**Le correctif.** Le reanchor READ accepte un **append pur** (la table n'a fait que grandir,
+le `/index` n'a pas été recréé, le préfixe des lignes déjà chargées est intact) :
+
+- `PanzerDB::reanchor` (panzerdb.cpp) — la branche `index_rows_loaded > 0 && rows_now !=
+  index_rows_loaded` ne renvoie plus `false` dans le cas append : elle vérifie
+  `rows_now >= index_rows_loaded` **et** `cached_leaves.size() == index_rows_loaded`, puis
+  `invalidateLeafCache(); (void)getLeaves();`. `getLeaves()` prend sa propre branche
+  handoff (lecture des seules lignes `[index_rows_loaded, n_rows)`) et bump
+  `leaf_cache_gen`. Les garde-fous restent : rétrécissement, ou préfixe incohérent avec le
+  compte chargé → `false` → reconstruction complète, inchangée.
+- `ReadIndex` (iread_strategy.h) — `build_indexes()` tamponne maintenant
+  `covered_base` (la base du buffer de feuilles) et `covered_count` (le nombre couvert).
+  `ensure_current()` ajoute une **voie rapide** : si le buffer n'a fait que *grandir sur
+  place* (base inchangée, donc chaque `const Leaf*` déjà tenue est encore valide), il appelle
+  `extend_indexes(start, end)` qui insère seulement les feuilles neuves et re-trie
+  *uniquement* les deux buckets (`path_cache`, `name_index`) qu'elles touchent. Tout
+  déplacement de buffer ou rétrécissement retombe sur `build_indexes()`. O(appels), pas
+  O(toutes les feuilles), par slice.
+- `PanzerDB::getLeaves` (panzerdb.cpp, deux branches) — le `reserve(n_rows)` exact était
+  réallocé à **chaque** append (danglousant les `const Leaf*` de l'index et forçant une
+  reconstruction complète à chaque slice). Il passe à une croissance **géométrique**
+  (`capacity ? capacity*2 : 16`, borne inférieure à `n_rows`) : la **base** du buffer reste
+  stable d'un append à l'autre, ce qui est précisément ce que `ensure_current()` attend pour
+  prendre la voie rapide.
+
+Le chemin de reconstruction complète, la garde `same_object` (recreation de `/index`), le
+`leaf_lookup`, et le layout ne bougent pas.
+
+**Mesurez le bon pilote.** Le pilote C A/B (`slcwrite_c`, `analysis_put_slice_v2/`) **n'est
+pas le charge** : sa lecture par slice est un `al_read_data(homogeneous_time)` direct (point 2),
+qui ne passe pas par le moteur `PanzerDB`/`select_strategy` — donc le reanchor READ n'y joue
+jamais, et y ramp les deux bras sont portés par le **commit du writer** sur AFS (recompression
+du chunk, point 23) et non par la lecture. Le charge du point 25 est le pilote **C++**
+(`slcwrite`, `core_profiles::putSlice` → `readIdsTimeMode` → AL complet → `reanchor` READ),
+c'est lui qui est re-mesuré.
+
+**Avant/après** (`slcwrite`, 4000 slices × 1000 points, AFS, même fill, médianes et totaux
+re-computés des journaux), V1 sert de témoin car il est insensible au reanchor READ :
+
+| colonne (4000 × 1000) | V2 avant | V2 après | V1 avant | V1 après |
+|---|---|---|---|---|
+| médiane par slice | 4,78 ms | **3,29 ms** | 3,97 ms | 3,92 ms |
+| total 4000 slices | 21 830 ms | **15 998 ms** | 17 446 ms | 18 277 ms |
+| 1er / dernier quantile | 2,89 / 15,54 ms | 2,05 / 13,11 ms | 3,92 / 11,40 | 3,87 / 9,58 |
+
+L'écart s'inverse : **V2 était 1,20× plus lent que V1 (4,78 vs 3,97 ms), il est désormais plus
+rapide (3,29 vs 3,92 ms)** ; le V1 (contrôle, insensible au correctif) bouge de 17 446 → 18 277
+ms, dans le bruit de la machine partagée. C'est le résidu « 999 moteurs READ » du point 25
+(~11,5 s des 21,8 s) qui est retiré.
+
+**Garde / correction.** `ctest` al-core : **106/106** dans l'état corrigé comme dans l'état de
+base. Les tests d'exemple IMAS-Cpp passent **126/128** ; les 2 échecs (`cpp-TestSuite`,
+`example-cpp-test_core_profiles_get`) sont **pré-existants** — le premier abort sur la même
+erreur de forme `control_surface` avec les modifications reverdies, le deuxième faute du fichier
+`master.h5` de fixture — et ne sont pas portés par ce correctif.
+
+**Reste ouvert.**
+- Le ramp **writer** (recompression du chunk de queue, point 23 / AFS) survit et reste le
+  plancher commun V1/V2 : le 1er quantile V2 après = 2,05 ms (déjà sous le 1er quantile V1 =
+  3,92 ms) est ce qui le domine côté écriture ; le reanchor READ ne le touche pas.
+- La voie incrémentale n'est prise que si le buffer de feuilles grandit **sur place** ; une
+  réallocation (taille initiale trop basse, ou append qui franchit la capacité) retombe sur une
+  reconstruction complète — correct mais O(lignes) pour ce slice-là. La croissance géométrique
+  le rend rare mais pas impossible.
+- Le `restoreTimeContext()` O(lignes) côté **APPEND** (point 25 prop. 3) n'est pas traité ici :
+  il est hors de la voie READ de ce charge et n'est pas dans les symboles chauds re-mesurés.
+
 
 

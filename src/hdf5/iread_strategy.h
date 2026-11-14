@@ -54,6 +54,15 @@ class ReadIndex {
     std::shared_ptr<PanzerDB> panzer_db_ptr; // Keeps the indexed engine alive.
     uint64_t built_generation = 0;           // leaf_cache_generation() when built.
 
+    // Base address and count of the leaf buffer covered by the maps, stamped by
+    // build_indexes(). Lets ensure_current() extend with only the appended tail
+    // (to_improve.md point 25) whenever the leaf buffer grew in place (the Leaf*
+    // we already hold stay valid) instead of a full rebuild over all leaves — the
+    // O(leaves) × slices cost being removed. A moved buffer (stale pointers) or a
+    // shrink falls through to build_indexes().
+    const PanzerDB::Leaf* covered_base = nullptr;
+    size_t covered_count = 0;
+
     /**
      * @brief Cache for fast access path -> leaves.
      * Key: Full path (string view).
@@ -99,6 +108,8 @@ public:
 
         const auto& leaves = panzer_db_ptr->getLeaves();
         built_generation = panzer_db_ptr->leaf_cache_generation();
+        covered_base = leaves.data();
+        covered_count = leaves.size();
 
         // Pre-reserve to avoid reallocations
         path_cache.reserve(leaves.size());
@@ -149,8 +160,69 @@ public:
      */
     bool ensure_current() {
         if (is_current()) return false;
+        if (panzer_db_ptr) {
+            const auto& leaves = panzer_db_ptr->getLeaves();
+            // Fast path (point 25): the engine only appended a tail — the leaf
+            // buffer is the same object and grew in place (base unchanged), so
+            // every Leaf* we already hold is still valid. Insert the new leaves
+            // and re-sort only the buckets they touch: O(appended) instead of
+            // O(all leaves) per slice. Any buffer move or shrink falls through.
+            if (covered_count > 0 &&
+                leaves.size() > covered_count &&
+                leaves.data() == covered_base) {
+                extend_indexes(covered_count, leaves.size(), leaves);
+                return true;
+            }
+        }
         build_indexes();
         return true;
+    }
+
+    /**
+     * @brief Inserts the appended tail `leaves[start..end)` into the existing maps.
+     *
+     * Used only by ensure_current() after it has verified the leaf buffer grew in
+     * place (base unchanged, count larger), so the leaves already indexed remain
+     * valid and only [start, end) is new. Re-sorts exactly the buckets that
+     * received a new leaf.
+     */
+    void extend_indexes(size_t start, size_t end, const std::vector<PanzerDB::Leaf>& leaves) {
+        const auto by_time = [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
+            return a->time_index < b->time_index;
+        };
+        // Collect the keys we are about to touch and sort them after all the
+        // insertions. (Storing pointers into the map's values is unsafe: a later
+        // operator[] can trigger a rehash and move the buckets.) The string_view
+        // keys point into the leaves' path text, which is stable while the leaves
+        // are alive (guaranteed by the caller's in-place-growth precondition).
+        std::vector<std::string_view> touched_paths;
+        std::vector<std::string_view> touched_names;
+        touched_paths.reserve(end - start);
+        touched_names.reserve(end - start);
+        for (size_t i = start; i < end; ++i) {
+            const PanzerDB::Leaf& leaf = leaves[i];
+            path_cache[leaf.path].push_back(&leaf);
+            touched_paths.push_back(leaf.path);
+
+            const std::string_view p = leaf.path;
+            const auto slash = p.rfind('/');
+            const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
+            name_index[key].push_back(&leaf);
+            touched_names.push_back(key);
+        }
+        // Re-sort only the buckets that received a new leaf. A path can equal a
+        // name key and appear twice; stable_sort is idempotent so a duplicate
+        // re-sort is harmless.
+        for (const auto& p : touched_paths) {
+            auto& bucket = path_cache.find(p)->second;
+            std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        }
+        for (const auto& n : touched_names) {
+            auto& bucket = name_index.find(n)->second;
+            std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        }
+        covered_count = end;
+        built_generation = panzer_db_ptr->leaf_cache_generation();
     }
 
     /**
