@@ -121,7 +121,7 @@ void HDF5Reader_v2::select_strategy(OperationContext *ctx, hid_t gid) {
             timerange_strategy.reset();
             read_strategy = nullptr;
             session_db = std::make_shared<PanzerDB>(gid, PanzerDB::OpenMode::READ);
-            session_index = std::make_shared<ReadIndex>(session_db);
+            session_index = std::make_shared<ReadIndex>(session_db);   // build_indexes() in ctor
         }
         session_gid = gid;
         anchor_may_be_stale = false;

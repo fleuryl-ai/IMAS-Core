@@ -15,6 +15,7 @@
 #include "aos_path_helpers.h"
 #include <set>
 #include <map>
+#include <unordered_set>
 
 // Sentinel for the cached ids_properties&homogeneous_time flag (valid values: -1, 0, 1)
 constexpr int HOMOG_TIME_UNRESOLVED = -2;
@@ -31,6 +32,9 @@ class Context;
   do {                   \
   } while (0)
 #endif
+
+#include <set>
+#include <map>
 
 /**
  * @class ReadIndex
@@ -50,6 +54,37 @@ class Context;
  * write+flush on the same engine, ...) forces a rebuild of these maps instead of
  * leaving them dangling (to_improve.md point 6).
  */
+// --- Thread-local cache of the path/name maps so a new ReadIndex (created
+// every putSlice because the AL makes a fresh HDF5Reader_v2 per operation)
+// can start from the already-built state instead of rebuilding O(n) hash
+// entries from scratch. The cache is valid while (a) leaves.data() matches
+// the recorded base and (b) leaves.size() >= covered_count (the file only
+// grows in the putSlice loop). The pointers in the cached maps are const
+// Leaf* into that buffer, so a moved buffer invalidates the cache and
+// forces a full rebuild (correct, no dangling pointers). The maps are
+// shared_ptr so a per-slice ReadIndex can alias the same map instance
+// without copying the (O(number-of-leaves)) vector of Leaf* pointers per
+// key out of the cache and back — that copy was ~0.75 ms/slice at 80k.
+using LeafMap = std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>>;
+struct ThreadLocalReadIndexCache {
+    const void* base = nullptr;     // leaves.data() at the moment of caching
+    size_t covered_count = 0;       // number of leaves the maps cover
+    std::shared_ptr<LeafMap> path_cache;
+    std::shared_ptr<LeafMap> name_index;
+
+    bool matches(const void* cur_base, size_t cur_count) const {
+        return base == cur_base && covered_count > 0 && covered_count <= cur_count;
+    }
+    void clear() {
+        base = nullptr;
+        covered_count = 0;
+        path_cache.reset();
+        name_index.reset();
+    }
+};
+inline ThreadLocalReadIndexCache g_ri_cache_inst;
+inline ThreadLocalReadIndexCache& g_ri_cache() { return g_ri_cache_inst; }
+
 class ReadIndex {
     std::shared_ptr<PanzerDB> panzer_db_ptr; // Keeps the indexed engine alive.
     uint64_t built_generation = 0;           // leaf_cache_generation() when built.
@@ -67,8 +102,11 @@ class ReadIndex {
      * @brief Cache for fast access path -> leaves.
      * Key: Full path (string view).
      * Value: Vector of pointers to leaves sharing this path (different time_index).
+     * shared_ptr: the per-slice instance aliases the thread-local cache's map (the
+     * same object) so extend/build mutate it in place instead of the O(n)
+     * copy-out/copy-back a value member forced every slice.
      */
-    std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> path_cache;
+    std::shared_ptr<LeafMap> path_cache;
 
     /**
      * @brief Index by dataset NAME (last path segment) -> leaves.
@@ -83,7 +121,7 @@ class ReadIndex {
      * `path_cache` references, so the string_view keys stay valid for the
      * PanzerDB lifetime.
      */
-    std::unordered_map<std::string_view, std::vector<const PanzerDB::Leaf*>> name_index;
+    std::shared_ptr<LeafMap> name_index;
 
 public:
     /**
@@ -101,8 +139,6 @@ public:
      * @brief Builds the path + dataset-name indexes over the current leaf cache.
      */
     void build_indexes() {
-        path_cache.clear();
-        name_index.clear();
         built_generation = 0;
         if (!panzer_db_ptr) return;
 
@@ -111,13 +147,33 @@ public:
         covered_base = leaves.data();
         covered_count = leaves.size();
 
-        // Pre-reserve to avoid reallocations
-        path_cache.reserve(leaves.size());
-        name_index.reserve(leaves.size() / 16 + 16);
+        auto& gc = g_ri_cache();
+
+        // Cache hit: same leaf buffer, only a tail appended. Alias the cache's maps
+        // (shared_ptr, O(1) — NOT a value copy of the O(number-of-leaves) vectors of
+        // Leaf* that was ~0.75 ms/slice at 80k with value members) and extend in
+        // place, mutating the very maps the cache holds.
+        if (gc.matches((const void*)leaves.data(), leaves.size())) {
+            path_cache = gc.path_cache;   // shared_ptr alias
+            name_index = gc.name_index;
+            if (gc.covered_count < leaves.size())
+                extend_indexes(gc.covered_count, leaves.size(), leaves);  // O(tail), mutates the shared maps
+            gc.covered_count = leaves.size();
+            return;
+        }
+
+        // Miss: fresh build. Allocate the two maps and put them in shared_ptr; the
+        // per-slice instance and the thread-local cache alias the SAME objects, so
+        // no copy of the Leaf* vectors ever crosses the instance<->cache boundary.
+        path_cache = std::make_shared<LeafMap>();
+        name_index = std::make_shared<LeafMap>();
+
+        // Reserve to avoid reallocations while filling.
+        path_cache->reserve(leaves.size());
+        name_index->reserve(leaves.size() / 16 + 16);
 
         for (const auto& leaf : leaves) {
-            // Store the pointer to the leaf in the map
-            path_cache[leaf.path].push_back(&leaf);
+            (*path_cache)[leaf.path].push_back(&leaf);
 
             // Also index by the last path segment (dataset name). `leaf.path` has no
             // '/' in its last segment's key because dataset names use '&' (see
@@ -125,7 +181,7 @@ public:
             const std::string_view p = leaf.path;
             const auto slash = p.rfind('/');
             const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
-            name_index[key].push_back(&leaf);
+            (*name_index)[key].push_back(&leaf);
         }
 
         // Time-ordered buckets: reading one AoS element of a dynamic signal used
@@ -135,11 +191,17 @@ public:
         const auto by_time = [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
             return a->time_index < b->time_index;
         };
-        for (auto& [path, bucket] : path_cache) std::stable_sort(bucket.begin(), bucket.end(), by_time);
-        for (auto& [name, bucket] : name_index) std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        for (auto& [path, bucket] : *path_cache) std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        for (auto& [name, bucket] : *name_index) std::stable_sort(bucket.begin(), bucket.end(), by_time);
 
-        DEBUG_PRINT("Path index built with " << path_cache.size() << " unique paths, "
-                  << name_index.size() << " dataset names.");
+        // Hand ownership to the thread-local cache (shared_ptr alias, O(1)).
+        gc.base = (const void*)leaves.data();
+        gc.covered_count = leaves.size();
+        gc.path_cache = path_cache;
+        gc.name_index = name_index;
+
+        DEBUG_PRINT("Path index built with " << path_cache->size() << " unique paths, "
+                  << name_index->size() << " dataset names.");
     }
 
     /**
@@ -177,7 +239,6 @@ public:
         build_indexes();
         return true;
     }
-
     /**
      * @brief Inserts the appended tail `leaves[start..end)` into the existing maps.
      *
@@ -199,27 +260,63 @@ public:
         std::vector<std::string_view> touched_names;
         touched_paths.reserve(end - start);
         touched_names.reserve(end - start);
+        // Pre-append size of each key, so after the loop we can check that the
+        // newly appended block is a non-decreasing suffix in O(appended) instead
+        // of scanning the whole O(number-of-slices) bucket every slice — what the
+        // old std::is_sorted(bucket) guard used to do (O(n) per touched key/slice).
+        std::unordered_map<std::string_view, size_t> old_path;
+        std::unordered_map<std::string_view, size_t> old_name;
+        old_path.reserve(end - start + 1);
+        old_name.reserve(end - start + 1);
+        LeafMap& pmap = *path_cache;
+        LeafMap& nmap = *name_index;
         for (size_t i = start; i < end; ++i) {
             const PanzerDB::Leaf& leaf = leaves[i];
-            path_cache[leaf.path].push_back(&leaf);
+            {
+                auto pit = pmap.find(leaf.path);
+                if (old_path.find(leaf.path) == old_path.end())
+                    old_path.emplace(leaf.path, pit == pmap.end() ? 0 : pit->second.size());
+                pmap[leaf.path].push_back(&leaf);
+            }
             touched_paths.push_back(leaf.path);
 
             const std::string_view p = leaf.path;
             const auto slash = p.rfind('/');
             const std::string_view key = (slash == std::string_view::npos) ? p : p.substr(slash + 1);
-            name_index[key].push_back(&leaf);
+            {
+                auto nit = nmap.find(key);
+                if (old_name.find(key) == old_name.end())
+                    old_name.emplace(key, nit == nmap.end() ? 0 : nit->second.size());
+                nmap[key].push_back(&leaf);
+            }
             touched_names.push_back(key);
         }
-        // Re-sort only the buckets that received a new leaf. A path can equal a
-        // name key and appear twice; stable_sort is idempotent so a duplicate
-        // re-sort is harmless.
+        // A touched key's bucket was sorted before this call (build_indexes and
+        // every prior extend keep it in that state), so it stays sorted iff the
+        // newly-appended block is a non-decreasing suffix — O(appended), small.
+        // putSlice appends each signal's latest time, so this always holds and no
+        // sort is needed at all; an out-of-order tail (rare) falls back to a full
+        // stable_sort of that single bucket (correct, unchanged result).
+        auto keep_sorted = [](std::vector<const PanzerDB::Leaf*>& b, size_t oldsz, const auto& by_time) {
+            if (oldsz > 0 && b[oldsz]->time_index < b[oldsz - 1]->time_index) return false;
+            for (size_t i = oldsz + 1; i < b.size(); ++i)
+                if (b[i]->time_index < b[i - 1]->time_index) return false;
+            return true;
+        };
+        std::unordered_set<std::string_view> seen;
+        seen.reserve(touched_paths.size() * 2 + 1);
         for (const auto& p : touched_paths) {
-            auto& bucket = path_cache.find(p)->second;
-            std::stable_sort(bucket.begin(), bucket.end(), by_time);
+            if (!seen.insert(p).second) continue;  // a path can appear twice
+            auto& bucket = pmap.find(p)->second;
+            if (!keep_sorted(bucket, old_path[p], by_time))
+                std::stable_sort(bucket.begin(), bucket.end(), by_time);
         }
-        for (const auto& n : touched_names) {
-            auto& bucket = name_index.find(n)->second;
-            std::stable_sort(bucket.begin(), bucket.end(), by_time);
+        seen.clear();
+        for (const auto& nm : touched_names) {
+            if (!seen.insert(nm).second) continue;  // a name key can appear under several paths
+            auto& bucket = nmap.find(nm)->second;
+            if (!keep_sorted(bucket, old_name[nm], by_time))
+                std::stable_sort(bucket.begin(), bucket.end(), by_time);
         }
         covered_count = end;
         built_generation = panzer_db_ptr->leaf_cache_generation();
@@ -229,8 +326,9 @@ public:
      * @brief Leaves stored under exactly this path, or nullptr when absent.
      */
     const std::vector<const PanzerDB::Leaf*>* find_path(std::string_view path) const {
-        const auto it = path_cache.find(path);
-        return (it == path_cache.end()) ? nullptr : &it->second;
+        if (!path_cache) return nullptr;
+        const auto it = path_cache->find(path);
+        return (it == path_cache->end()) ? nullptr : &it->second;
     }
 
     /**
@@ -252,8 +350,9 @@ public:
      * @brief Leaves whose last path segment is this dataset name, or nullptr.
      */
     const std::vector<const PanzerDB::Leaf*>* find_name(std::string_view name) const {
-        const auto it = name_index.find(name);
-        return (it == name_index.end()) ? nullptr : &it->second;
+        if (!name_index) return nullptr;
+        const auto it = name_index->find(name);
+        return (it == name_index->end()) ? nullptr : &it->second;
     }
 };
 

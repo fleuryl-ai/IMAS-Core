@@ -258,6 +258,15 @@ PanzerDB::PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty, bool close_
 void PanzerDB::init(OpenMode mode) {
     this->mode = mode; // Ensure member mode is set
 
+    // Optional SWMR commit-barrier batching: PANZER_FLUSH_EVERY=N spreads the
+    // global H5Fflush over N flush() calls (1 = one barrier per flush, the
+    // historical behaviour; unset = 1). close() always forces the final barrier,
+    // so a cleanly closed file is complete either way.
+    if (const char* env = std::getenv("PANZER_FLUSH_EVERY")) {
+        size_t n = std::strtoul(env, nullptr, 10);
+        swmr_flush_every = n < 1 ? 1 : n;
+    }
+
     // --- DEBUT DU PATCH: AUTO-DETECTION DU GROUPE RACINE ---
     if (mode == OpenMode::READ || mode == OpenMode::APPEND) {
         bool is_at_root = H5Lexists(file_id, "index", H5P_DEFAULT) > 0;
@@ -1040,70 +1049,91 @@ std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_ve
     return result;
 }
 
+namespace {
+// Thread-local fold cache for restoreTimeContext() (declared here because
+// PanzerDB.cpp is one translation unit; thread_local keeps two putSlice threads
+// from clobbering each other's buffers). Its key is the leaf-buffer address +
+// the covered count — the exact invariant the ReadIndex cache in
+// iread_strategy.h keys on — so it only ever "inherits" the folded map when the
+// same buffer grew in place (a putSlice loop only appends), and any moved buffer,
+// a different file, or a table that shrank all miss and force a correct full fold.
+struct RestoreTimeFold {
+    const void* base = nullptr;                                  // leaves.data() last folded
+    size_t covered_count = 0;                                    // leaves the map covers
+    std::unordered_map<std::string, uint64_t> counters;          // folded-so-far map
+};
+}  // namespace
+
 void PanzerDB::restoreTimeContext() {
     if (mode != OpenMode::APPEND && mode != OpenMode::READ) return;
 
-    // const& on purpose: this table is the cached index (one Leaf per /index row,
-    // each with its own shape vector); copying it per APPEND/READ open was O(N).
     const auto& leaves = getLeaves();
+    const size_t n = leaves.size();
+    const void* base = leaves.data();
 
-    // 1. Initialize counters for explicit Dynamic AoS
-    for (const auto& leaf : leaves) {
-        if (leaf.flags == 3) {
-            aos_time_counters[std::string(leaf.path)] = 0;
-        }
-    }
-    
-    // 2. Iterate over DATA leaves
-    //
-    // Per-leaf allocation is what made this loop expensive (measured 11,3 ms for
-    // 171 165 leaves on the cp fixture, for a table that ends up holding 29
-    // entries): the prefix test built "aos + \"/\"" per (leaf x root) and the
-    // counter update built a key string per leaf. Both are avoided here — the
-    // scratch key below keeps its capacity between iterations, so assign() does
-    // not allocate once the longest path has been seen.
-    std::string key;
-    for (const auto& leaf : leaves) {
-        if (leaf.flags == 2 || leaf.flags == 3) continue;
+    // Fold leaves [begin, end) into the per-signal max time counter (the two
+    // passes the original body used, now parameterised by range so a repeat open
+    // of a grown buffer folds only the appended tail):
+    //   pass 1 — every Dynamic-AoS root (flags==3) in the range initialises to 0;
+    //   pass 2 — every data leaf lifts its own counter and its nearest AOS parent.
+    // Roots are zeroed before any data leaf can lift them, so a freshly-created
+    // root in the range stays "no file data" (hasFileData -> second > 0 is false)
+    // until its payload is counted — identical to the original whole-table order.
+    auto fold = [this](const Leaf* begin, const Leaf* end) {
+        for (const Leaf* it = begin; it != end; ++it)
+            if (it->flags == 3) aos_time_counters[std::string(it->path)] = 0;
+        // The scratch key keeps its capacity across iterations, so operator[] does
+        // not allocate once the longest path has been seen (the original cost).
+        std::string key;
+        for (const Leaf* it = begin; it != end; ++it) {
+            if (it->flags == 2 || it->flags == 3) continue;
+            uint64_t slice_volume = 1;
+            for (auto dim : it->shape_span()) if (dim > 0) slice_volume *= dim;
+            if (slice_volume == 0) slice_volume = 1;
+            uint64_t n_steps = it->count / slice_volume;
+            if (n_steps == 0 && it->count > 0) n_steps = 1;
+            const uint64_t next_time = it->time_index + n_steps;
 
-        // Dynamically calculate the number of time steps stored in this leaf
-        uint64_t slice_volume = 1;
-        for (auto dim : leaf.shape_span()) {
-            if (dim > 0) slice_volume *= dim;
-        }
-
-        if (slice_volume == 0) slice_volume = 1;
-
-        uint64_t n_steps_in_leaf = leaf.count / slice_volume;
-        if (n_steps_in_leaf == 0 && leaf.count > 0) n_steps_in_leaf = 1;
-
-        uint64_t next_time = leaf.time_index + n_steps_in_leaf;
-
-        // Find dynamic AOS parent
-        const std::string* parent_aos = nullptr;
-        // OPTIMIZATION: Iterate over cached roots instead of all counters to avoid O(N^2)
-        for (const auto& aos_path : cached_dynamic_aos_roots) {
-            // Check if leaf path starts with AOS path + "/"
-            // e.g. leaf="profiles_1d/0/ion/...", aos="profiles_1d"
-            if (leaf.path.size() > aos_path.size() && leaf.path[aos_path.size()] == '/' &&
-                leaf.path.compare(0, aos_path.size(), aos_path) == 0) {
-                // Take the longest match (most nested)
-                if (!parent_aos || aos_path.length() > parent_aos->length()) {
+            // Nearest (longest) Dynamic-AoS root this leaf hangs under.
+            const std::string* parent_aos = nullptr;
+            for (const auto& aos_path : cached_dynamic_aos_roots)
+                if (it->path.size() > aos_path.size() && it->path[aos_path.size()] == '/' &&
+                    it->path.compare(0, aos_path.size(), aos_path) == 0 &&
+                    (!parent_aos || aos_path.length() > parent_aos->length()))
                     parent_aos = &aos_path;
-                }
+
+            key.assign(it->path.data(), it->path.size());
+            uint64_t& own = aos_time_counters[key];
+            if (next_time > own) own = next_time;
+            if (parent_aos) {
+                uint64_t& parent = aos_time_counters[*parent_aos];
+                if (next_time > parent) parent = next_time;
             }
         }
+    };
 
-        // Update counter for standalone data
-        key.assign(leaf.path.data(), leaf.path.size());
-        uint64_t& own = aos_time_counters[key];
-        if (next_time > own) own = next_time;
-
-        // Update counter for parent AOS
-        if (parent_aos) {
-            uint64_t& parent = aos_time_counters[*parent_aos];
-            if (next_time > parent) parent = next_time;
-        }
+    // The per-signal max time counter over a leaf table is a non-decreasing
+    // function of the leaves appended to the same stable buffer: a putSlice loop
+    // only ever grows it, each slice holding that signal's highest time, so the
+    // map folded for the earlier leaves is unchanged once the tail is folded in.
+    // A repeat open therefore inherits the previous fold and pays O(appended)
+    // instead of O(N) per slice; the map copy itself is O(n_paths) (a handful of
+    // keys), not O(N leaves). Keyed on the leaf-buffer address + covered count —
+    // the same invariant the ReadIndex cache keys on — so a moved buffer, a
+    // different file, or a table that shrank all miss and hit the full-fold
+    // fallback, which is always correct and refreshes the cache.
+    static thread_local RestoreTimeFold rc;
+    if (rc.base == base && rc.covered_count > 0 && rc.covered_count <= n) {
+        aos_time_counters = rc.counters;                                  // O(map size)
+        fold(leaves.data() + rc.covered_count, leaves.data() + n);        // O(appended tail)
+        rc.counters = aos_time_counters;                                  // keep it current
+        rc.covered_count = n;
+    } else {
+        aos_time_counters.clear();
+        fold(leaves.data(), leaves.data() + n);                           // full O(N)
+        rc.base = base;
+        rc.covered_count = n;
+        rc.counters = aos_time_counters;
     }
 
     // Snapshot the file-derived counters (before this session writes anything) so
@@ -1360,14 +1390,19 @@ void PanzerDB::flush() {
     parent_paths_buffer.clear();
     leaves_cache_valid = false;
 
-    // SWMR commit barrier. The H5Dwrite calls above only update HDF5's in-memory file
-    // image; they are NOT visible to another process yet. Push the whole file image to
-    // the OS (page cache / disk) so this commit becomes visible, as one unit: a reader
-    // on the same file sees either the previous committed state or the complete new
-    // state, never a torn mix of index row + payload. This single GLOBAL flush is what
-    // makes the "index row = commit point" protocol hold across processes.
-    if (file_id >= 0) {
-        H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+    // SWMR commit barrier (batched). The H5Dwrite calls above only update HDF5's
+    // in-memory file image; they are NOT visible to another process yet. The global
+    // H5Fflush below is what makes "index row = commit point" hold across processes:
+    // a reader sees either the previous committed state or the complete new state,
+    // never a torn mix of index row + payload. It costs a push of the dirty file
+    // image, so it runs on every N-th flush (PANZER_FLUSH_EVERY; 1 = every flush)
+    // and again, unconditionally, on close().
+    swmr_flushes_since_barrier++;
+    if (swmr_flushes_since_barrier >= swmr_flush_every) {
+        swmr_flushes_since_barrier = 0;
+        if (file_id >= 0) {
+            H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+        }
     }
 
 }
@@ -1573,6 +1608,14 @@ void PanzerDB::close() {
     if (file_id < 0) return;
 
     flush();
+    // If barrier batching (PANZER_FLUSH_EVERY > 1) is in effect, flush() may have
+    // left a partial batch without its global barrier — force it now, before the
+    // handles and the file go away, so a cleanly closed file always commits its
+    // last slices.
+    if (swmr_flushes_since_barrier > 0) {
+        swmr_flushes_since_barrier = 0;
+        H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+    }
     // Park the decoded index before the handles go away: the next engine opened on
     // this file resumes from it instead of re-reading the whole table. Uses the
     // identity noted in init(), because the AL may have closed our group already.
@@ -2145,9 +2188,7 @@ void PanzerDB::beginArray(ArrayLevel& level) {
 }
 
 const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(readability-const-return-type)
-    if (leaves_cache_valid) {
-        return cached_leaves;
-    }
+    if (leaves_cache_valid) return cached_leaves;
 
     // Cache is invalid, rebuild it directly in class member.
     // The generation is bumped HERE (not at invalidation): this is the exact point
@@ -2242,9 +2283,14 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
         const uint64_t path_base = start_row > 0 ? index_paths_loaded : 0;
         const uint64_t new_paths = n_paths > path_base ? n_paths - path_base : 0;
 
-        cached_paths_blocks.emplace_back((size_t)new_paths * PATH_MAX_LEN);
-        std::vector<char>& pt_data = cached_paths_blocks.back();
+        // Append the block only when there are actually new paths to read.
+        // getLeaves() is called with a fresh engine every slice (putSlice loop),
+        // and the AL pools engines, so a zero-length block emplaced on each call
+        // (new_paths == 0) would accumulate one per slice, growing /path_table's
+        // view to O(n) and making per-leaf path_slot lookup O(n) as well.
         if (new_paths > 0) {
+            cached_paths_blocks.emplace_back((size_t)new_paths * PATH_MAX_LEN);
+            std::vector<char>& pt_data = cached_paths_blocks.back();
             hid_t str_type = H5Tcopy(H5T_C_S1);
             H5Tset_size(str_type, PATH_MAX_LEN);
             H5Tset_strpad(str_type, H5T_STR_NULLPAD);
@@ -2593,10 +2639,25 @@ const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(reada
     index_last_count = tail[cnt_c];
 
     rebuildDynamicRootTimeIndex();
-
     leaves_cache_valid = true;
     return cached_leaves;
 }
+
+namespace {
+// Per-root dynamic-AoS max-end cache for rebuildDynamicRootTimeIndex() (declared
+// here: PanzerDB.cpp is one translation unit). Keyed on the FILE identity
+// (index_file_name) + the row count covered, NOT the leaf-buffer address: engines
+// in a putSlice loop each decode their own fresh buffer (the base pointer is
+// unstable), but they all read the SAME append-only /index, so rows [0, K] are
+// identical content across engines and the per-root max over them is reusable. A
+// different file or a different row count misses; a shrink would violate
+// covered_count <= n, so it falls back to the correct full fold (and refreshes).
+struct DynRootTimeCache {
+    std::string file;                       // index_file_name at cache time
+    size_t covered_count = 0;               // leaf rows the max covers
+    std::unordered_map<std::string, uint64_t> max_end;   // root (owned copy) -> exclusive end
+};
+}  // namespace
 
 void PanzerDB::rebuildDynamicRootTimeIndex() const {
     max_time_at_dynamic_root.clear();
@@ -2610,34 +2671,80 @@ void PanzerDB::rebuildDynamicRootTimeIndex() const {
     // This also makes getAOSShape correct for dynamic AoS that only contain
     // nested static AoS (e.g. time_slice/ggd/theta/values) where none of the
     // direct children carry a time index.
-    for (const auto& root : cached_dynamic_aos_roots) {
-        const std::string prefix = root + "/";
-        uint64_t max_end = 0;
-        bool found = false;
-        for (const auto& leaf : cached_leaves) {
-            if ((leaf.flags & 0xF) != 0) continue; // data leaves only
-            if (leaf.path.compare(0, prefix.size(), prefix) != 0) continue;
-            // Steps in this leaf: slots divided by one slice's volume. A
-            // STRING_CHUNKED scalar's slots are chunks of ONE value, not steps.
-            const uint64_t dtype = leaf.flags >> 4;
-            uint64_t steps = 1;
-            if (dtype != (uint64_t)DataType::STRING_CHUNKED) {
-                uint64_t slice_volume = 1;
-                for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
-                if (slice_volume > 0 && leaf.count > slice_volume) {
-                    steps = leaf.count / slice_volume;
-                }
-            }
-            const uint64_t end = leaf.time_index + steps;
-            if (!found || end > max_end) {
-                max_end = end;
-                found = true;
-            }
+    // max_time_at_dynamic_root[root] is the exclusive end of the time range covered
+    // by the root's descendant DATA leaves, i.e. a running MAX over the leaves — a
+    // non-decreasing function of the leaves appended to the same stable buffer
+    // (a putSlice loop only ever grows it, each slice holding that root's highest
+    // time). So a repeat open of a grown buffer inherits the earlier per-root max
+    // and folds only the appended tail in O(roots x tail), instead of the
+    // O(roots x N) scan over every leaf this function used to do on EVERY decode
+    // (gl_rebuild: the last O(n) term of the putSlice loop). Same (leaf-buffer
+    // address + covered count) key invariant as the two sibling caches, so a moved
+    // buffer / different file / shrink misses and does the correct full fold.
+    static thread_local DynRootTimeCache rc;
+
+    const size_t n = cached_leaves.size();
+    const std::string& fname = index_file_name;   // stable file identity across engines
+
+    // Exclusive end of the time range a single leaf covers [time_index, +steps).
+    auto leaf_end = [](const Leaf& leaf) -> uint64_t {
+        const uint64_t dtype = leaf.flags >> 4;
+        uint64_t steps = 1;
+        if (dtype != (uint64_t)DataType::STRING_CHUNKED) {  // STRING_CHUNKED: slots = chunks of one value, not steps
+            uint64_t slice_volume = 1;
+            for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+            if (slice_volume > 0 && leaf.count > slice_volume) steps = leaf.count / slice_volume;
         }
-        if (found) {
-            max_time_at_dynamic_root[std::string_view(root)] = max_end;
+        return leaf.time_index + steps;
+    };
+
+    // Running max of leaf_end over a root's descendant data leaves in [start, end),
+    // seeding from `acc` when the root was already found (the covered earlier leaves).
+    auto foldRange = [&](size_t start, size_t end, std::unordered_map<std::string, uint64_t>& acc) {
+        for (const auto& root : cached_dynamic_aos_roots) {
+            const std::string prefix = root + "/";
+            auto it = acc.find(root);
+            bool found = (it != acc.end());
+            uint64_t cur = found ? it->second : 0;
+            for (size_t i = start; i < end; ++i) {
+                const auto& leaf = cached_leaves[i];
+                if ((leaf.flags & 0xF) != 0) continue;               // data leaves only
+                if (leaf.path.compare(0, prefix.size(), prefix) != 0) continue;
+                const uint64_t e = leaf_end(leaf);
+                if (!found || e > cur) { cur = e; found = true; }
+            }
+            if (found) { if (it != acc.end()) it->second = cur; else acc.emplace(root, cur); }
         }
+    };
+
+    // Reuse only when we are looking at the SAME FILE (same append-only /index)
+    // and the row count has only grown: rows [0, covered] were already aggregated
+    // into `rc.max_end` by an earlier decode of that file, so we only fold the
+    // newly-appended tail [covered, n) instead of rescanning all n leaves.
+    //
+    // IMPORTANT: publish to the member BEFORE moving acc into the cache, so the
+    // publish loop has a live map to iterate over (std::move leaves acc empty).
+    std::unordered_map<std::string, uint64_t> acc;
+    if (rc.file == fname && rc.covered_count > 0 && rc.covered_count <= n) {
+        acc = rc.max_end;                                                 // O(roots)
+        foldRange(rc.covered_count, n, acc);                               // O(roots x tail)
+    } else {
+        foldRange(0, n, acc);                                              // O(roots x N)
     }
+
+    // Publish to the member: keys are stable string_views into cached_dynamic_aos_roots
+    // (owned by the leaf decode this cache was built from), never the `acc` copies.
+    // Publish first, THEN update the cache (the cache holds a copy that outlives acc).
+    max_time_at_dynamic_root.clear();
+    for (const auto& root : cached_dynamic_aos_roots) {
+        auto it = acc.find(root);
+        if (it != acc.end())
+            max_time_at_dynamic_root[std::string_view(root)] = it->second;
+    }
+
+    rc.file = fname;
+    rc.covered_count = n;
+    rc.max_end = std::move(acc);
 }
 
 template<typename T>

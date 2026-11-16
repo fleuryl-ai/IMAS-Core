@@ -336,8 +336,13 @@ public:
     };
 
 private:
-    
+
     hid_t file_id = -1;
+    // SWMR commit barrier batching (see setSWMRFlushEvery()): flush() pays the
+    // global H5Fflush on every N-th call; close() forces the last one. Seeded from
+    // the PANZER_FLUSH_EVERY environment variable (1 = the historical behaviour).
+    size_t swmr_flush_every = 1;
+    size_t swmr_flushes_since_barrier = 0;
     /// The file THIS engine opened (filename constructor), kept open for its whole
     /// lifetime even when init() descends into the group holding /index: closing it
     /// is this engine's job, and leaving it registered makes HDF5 segfault at
@@ -932,6 +937,19 @@ public:
       * @return The current OpenMode (READ, WRITE, or APPEND).
       */
     OpenMode getOpenMode() const { return mode; }
+
+    /**
+     * @brief Sets how many flush() operations the SWMR commit barrier spans (N >= 1).
+     *
+     * By default (N = 1, and with PANZER_FLUSH_EVERY unset) every flush() ends with
+     * a global H5Fflush commit barrier. With N > 1 the barrier fires only on every
+     * N-th flush (and always on close()), so an in-flight batch of slices is NOT
+     * visible to concurrent SWMR readers until the batch completes — the visibility
+     * delay is bounded to N slices. close() forces the final barrier regardless of
+     * N, so a cleanly closed file always carries its complete content.
+     */
+    void setSWMRFlushEvery(size_t n) { swmr_flush_every = n < 1 ? 1 : n; }
+    size_t swmrFlushEvery() const { return swmr_flush_every; }
 
 
 
