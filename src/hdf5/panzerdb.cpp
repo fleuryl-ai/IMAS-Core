@@ -1,0 +1,5325 @@
+#include "panzerdb.h"
+#include "data_interpolation.h"
+#include <iostream>
+#include <numeric>
+#include <algorithm>
+#include <unordered_map>
+#include <map>
+#include <stdexcept>
+#include <unordered_set>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <string_view>
+#include <sstream>
+#include <string>
+#include <type_traits>
+#include <map>
+
+/*
+ * ###############################################################################
+ * # Important Points to Understand
+ * ###############################################################################
+ *
+ * 1.  **Columnar Storage & Indexing**:
+ *     - PanzerDB does not store data in a hierarchical HDF5 structure (groups/datasets).
+ *       Instead, it flattens data into a few large 1D datasets based on type
+ *       (e.g., `data_raw_f64` for doubles, `data_raw_i32` for integers).
+ *     - A central `index` table stores metadata for every logical node (path, shape,
+ *       time index, offset in the raw dataset). This allows for extremely fast
+ *       writes (append-only) and flexible reads.
+ *
+ * 2.  **Dynamic vs. Static AoS (Array of Structures)**:
+ *     - **Static AoS**: Fixed size, known at creation. The index in the path
+ *       (e.g., `profiles_1d/0/ion`) is explicit.
+ *     - **Dynamic AoS**: Time-evolving structures. The "time" dimension is implicit
+ *       in the structure's growth. The code handles "time steps" by creating new
+ *       entries in the index for the same path but with an incremented `time_index`.
+ *
+ * 3.  **Optimization Strategies**:
+ *     - **Write Buffering**: Data is accumulated in memory (`data_buffer_f64`, etc.)
+ *       and flushed to disk in large chunks to minimize HDF5 I/O overhead.
+ *     - **Direct Hyperslab Reads**: `readSliceDirect` reads specific data slices
+ *       directly from the HDF5 file into the user's buffer without intermediate copies.
+ *     - **Batched Reads**: `readLeavesUnion` combines multiple non-contiguous data
+ *       chunks (e.g., a time series scattered across the file) into a single HDF5
+ *       read operation using `H5S_SELECT_OR`.
+ *     - **Caching**: The `getLeaves` method caches the entire index table in memory.
+ *
+ * 4.  **Path Substitution**:
+ *     - When reading dynamic data (e.g., `readDataByIndex`), the code must often
+ *       translate a logical path like `A/0/B` (requested at time `t=1`) into the
+ *       actual stored path `A/1/B`. This is handled by finding the "Dynamic AoS Root"
+ *       and substituting the index.
+ */
+
+constexpr size_t PATH_MAX_LEN = 256;
+
+// Fixed maximum bytes for a single string element in the data_raw_str column
+// (variable-length -> fixed-width conversion, SWMR-safe like `paths`).
+// A string value longer than (STRING_MAX_LEN - 1) bytes is rejected at write time.
+constexpr size_t STRING_MAX_LEN = 512;
+
+// Process-wide chunking override (see setDefaultChunkingConfig).
+ChunkingConfig PanzerDB::s_default_chunk_config;
+
+// An "index_version" stamp this build has no decoder for must be refused by name,
+// not adopted and decoded with the newest packing it happens to recognise: the
+// column meaning would silently shift and the reads would return wrong numbers.
+// v5 is the highest layout understood here; v3 and v4 stay readable, v6 is not.
+static void rejectUnknownIndexVersion(uint32_t v, const char* open_mode) {
+    if (v <= PANZER_INDEX_VERSION_V5) return;
+    throw ALBackendException(std::string("PanzerDB: /index carries index_version=") +
+                             std::to_string(v) + " in " + open_mode + " mode; this build reads at most v" +
+                             std::to_string(PANZER_INDEX_VERSION_V5) +
+                             " -- rebuild the Access Layer against a newer libal", LOG);
+}
+namespace {
+// The AL hands a timebase over as a path string, and not in one spelling: the
+// enclosing AoS's arrives as "/time" (beginArray keeps what the context gives),
+// a standalone write arrives as "&time" (write_ND_Data converts separators for
+// dataset names). Both name the node whose index path is "time", so which row is
+// the time base cannot be decided by string equality on the spelling that
+// happens to arrive. Strip the separator convention, keep the path.
+std::string normalisedTimebase(const std::string& timebase) {
+    std::string out = timebase;
+    std::replace(out.begin(), out.end(), '&', '/');
+    while (!out.empty() && out.front() == '/') out.erase(0, 1);
+    return out;
+}
+// Time span covered by one index row: [time_index, time_index + steps). Shares
+// the arithmetic with PanzerDB::isTimeInLeaf so the ordering check done while the
+// index cache is built cannot drift away from the predicate it guards.
+uint64_t row_time_steps(const PanzerDB::Leaf& leaf)
+{
+    size_t slice_volume = 1;
+    for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+    size_t n_steps = (slice_volume > 0) ? (leaf.count / slice_volume) : 1;
+    if (n_steps == 0) n_steps = 1;
+    return n_steps;
+}
+
+// Rows of one path may be narrowed by binary search only while every adjacent
+// pair keeps increasing, non-overlapping time spans of data rows; anything else
+// (meta rows interleaved, appended out of order, overlapping chunks) is recorded
+// in time_lookup_unsafe_paths and keeps the original row-by-row lookup.
+void note_row_order(std::string_view path, const PanzerDB::Leaf& prev, const PanzerDB::Leaf& cur,
+                    std::unordered_set<std::string_view>& unsafe_paths)
+{
+    if ((prev.flags & 0xF) != 0 || (cur.flags & 0xF) != 0) {
+        unsafe_paths.insert(path);
+        return;
+    }
+    if (cur.time_index < prev.time_index + row_time_steps(prev)) unsafe_paths.insert(path);
+}
+
+// ── Helpers for the index handoff (see PanzerDB::indexHandoff) ──────────────
+// Name of the file an id belongs to (works for a group id too): identifies the file
+// a parked decode came from, so another file never adopts it.
+std::string panzer_file_name(hid_t file_id) {
+    if (file_id < 0) return std::string();
+    const ssize_t n = H5Fget_name(file_id, nullptr, 0);
+    if (n <= 0) return std::string();
+    std::string name(static_cast<size_t>(n) + 1, '\0');
+    if (H5Fget_name(file_id, name.data(), name.size()) < 0) return std::string();
+    name.resize(static_cast<size_t>(n));
+    return name;
+}
+
+// Identity token of an open object; opaque, only compared with H5Otoken_cmp.
+bool panzer_object_token(hid_t obj_id, H5O_token_t& out) {
+    if (obj_id < 0) return false;
+    H5O_info2_t info;
+    if (H5Oget_info3(obj_id, &info, H5O_INFO_BASIC) < 0) return false;
+    out = info.token;
+    return true;
+}
+
+// True when obj_id is the very object the parked token was taken from. HDF5
+// hands a new token to a recreated dataset, which is exactly the case the
+// handoff must reject.
+bool panzer_same_object(hid_t obj_id, const H5O_token_t& parked_token) {
+    if (H5O_IS_TOKEN_UNDEF(parked_token)) return false;
+    H5O_token_t now;
+    if (!panzer_object_token(obj_id, now)) return false;
+    int cmp = 0;
+    if (H5Otoken_cmp(obj_id, &now, &parked_token, &cmp) < 0) return false;
+    return cmp == 0;
+}
+
+uint64_t panzer_index_rows(hid_t index_dset) {
+    if (index_dset < 0) return 0;
+    hid_t space = H5Dget_space(index_dset);
+    if (space < 0) return 0;
+    hsize_t dims[2] = {0, 0};
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+    return dims[0];
+}
+
+// (offset, count) of one /index row read from disk. Same column mapping as
+// getLeaves(): 14 columns in legacy files, 12 in v2, 7 packed in v3.
+bool panzer_index_row(hid_t index_dset, uint64_t row, uint64_t& offset, uint64_t& count) {
+    if (index_dset < 0) return false;
+    hid_t fspace = H5Dget_space(index_dset);
+    if (fspace < 0) return false;
+    hsize_t dims[2] = {0, 0};
+    const int ndims = H5Sget_simple_extent_ndims(fspace);
+    H5Sget_simple_extent_dims(fspace, dims, nullptr);
+    if (ndims != 2 || row >= dims[0] || dims[1] == 0) { H5Sclose(fspace); return false; }
+
+    const uint64_t ncols = dims[1];
+    unsigned off_c = 0, cnt_c = 0;
+    if (ncols == PANZER_INDEX_COLUMNS_V3) { off_c = 0; cnt_c = 1; }
+    else if (ncols == PANZER_INDEX_COLUMNS) { off_c = 8; cnt_c = 9; }
+    else { off_c = 9; cnt_c = 10; }   // legacy 14 columns
+
+    uint64_t values[14] = {0};
+    const hsize_t start[2] = {row, 0};
+    const hsize_t block[2] = {1, ncols};
+    H5Sselect_hyperslab(fspace, H5S_SELECT_SET, start, nullptr, block, nullptr);
+    const hsize_t mem_dims[2] = {1, ncols};
+    hid_t mspace = H5Screate_simple(2, mem_dims, nullptr);
+    const herr_t rc = H5Dread(index_dset, H5T_NATIVE_UINT64, mspace, fspace, H5P_DEFAULT, values);
+    H5Sclose(mspace);
+    H5Sclose(fspace);
+    if (rc < 0) return false;
+    offset = values[off_c];
+    count = values[cnt_c];
+    return true;
+}
+} // namespace
+
+bool PanzerDB::s_has_default_chunk_config = false;
+
+// PanzerDB constructor modification
+PanzerDB::PanzerDB(const std::string& filename, OpenMode mode, bool preserve_empty)
+    : preserve_empty_nodes(preserve_empty)
+{
+     // OPTIMIZATION: File Access Property List (FAPL) for massive writes
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    
+    // 1. Alignment on file system blocks (e.g., Lustre stripe size = 4MB)
+    // Any object > 4KB will be aligned on a 4MB boundary.
+    H5Pset_alignment(fapl, 4096, 4 * 1024 * 1024);
+    
+    // 2. Use the latest HDF5 format (better chunk indexing)
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
+    
+    // 3. Aggregate metadata in 2MB blocks to reduce IOPS
+    H5Pset_meta_block_size(fapl, 2 * 1024 * 1024);
+
+    if (mode == OpenMode::WRITE) {
+        // SWMR_WRITE is stamped in the file at creation: it is what lets a separate
+        // process follow the file as it grows (measured: without it a reader only ever
+        // sees the state as of the writer's close(), with or without SWMR_READ).
+        file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC | H5F_ACC_SWMR_WRITE, H5P_DEFAULT, fapl);
+    } else if (mode == OpenMode::APPEND) {
+        // Check if file exists
+        if (H5Fis_hdf5(filename.c_str()) > 0) {
+            // File exists, open in read/write. No SWMR_WRITE here: the flag belongs to
+            // the file's creation, and files written before it existed must stay openable.
+            file_id = H5Fopen(filename.c_str(), H5F_ACC_RDWR, fapl);
+        } else {
+            // File does not exist, create it
+            file_id = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC | H5F_ACC_SWMR_WRITE, H5P_DEFAULT, fapl);
+            mode = OpenMode::WRITE; // Switch to WRITE mode for initialization
+        }
+    } else { // OpenMode::READ
+        // HDF5 >= 1.14 takes a POSIX record lock on every open, and the writer's write
+        // lock makes a reader's RDONLY open fail with EAGAIN (H5FD__sec2_lock(): "unable
+        // to lock file"). It also flags a file as "being written" and refuses plain reads
+        // of it ("file is already open for write"). Both gates have to come down for the
+        // single-writer / multi-reader contract that flush()'s H5Fflush commit barrier
+        // exists to provide to be reachable at all. READ only: writer-vs-writer locking
+        // stays armed.
+        H5Pset_file_locking(fapl, false, true);
+        file_id = H5Fopen(filename.c_str(), H5F_ACC_RDONLY | H5F_ACC_SWMR_READ, fapl);
+    }
+    H5Pclose(fapl);
+
+    if (file_id < 0) throw std::runtime_error("Failed to open or create file: " + filename);
+    // This constructor opened the file, so it owns it: init() may descend into the
+    // group holding /index and work there, but the file handle stays open — and has
+    // to be closed — until close(). See close().
+    owned_file_id = file_id;
+    init(mode);
+}
+
+PanzerDB::PanzerDB(hid_t loc_id, OpenMode mode, bool preserve_empty, bool close_loc_id_on_exit)
+    : file_id(loc_id), preserve_empty_nodes(preserve_empty), should_close_loc_id(close_loc_id_on_exit)
+{
+    if (file_id < 0) throw std::runtime_error("Invalid loc_id provided to constructor.");
+    // In this case, file_id is actually a loc_id (group)
+    init(mode);
+}
+
+// init function modification
+void PanzerDB::init(OpenMode mode) {
+    this->mode = mode; // Ensure member mode is set
+
+    // Optional SWMR commit-barrier batching: PANZER_FLUSH_EVERY=N spreads the
+    // global H5Fflush over N flush() calls (1 = one barrier per flush, the
+    // historical behaviour; unset = 1). close() always forces the final barrier,
+    // so a cleanly closed file is complete either way.
+    if (const char* env = std::getenv("PANZER_FLUSH_EVERY")) {
+        size_t n = std::strtoul(env, nullptr, 10);
+        swmr_flush_every = n < 1 ? 1 : n;
+    }
+
+    // --- DEBUT DU PATCH: AUTO-DETECTION DU GROUPE RACINE ---
+    if (mode == OpenMode::READ || mode == OpenMode::APPEND) {
+        bool is_at_root = H5Lexists(file_id, "index", H5P_DEFAULT) > 0;
+        if (!is_at_root) {
+            H5G_info_t group_info;
+            if (H5Gget_info(file_id, &group_info) >= 0) {
+                for (hsize_t i = 0; i < group_info.nlinks; ++i) {
+                    char name[256];
+                    H5Lget_name_by_idx(file_id, ".", H5_INDEX_NAME, H5_ITER_INC, i, name, sizeof(name), H5P_DEFAULT);
+
+                    // Tente d'ouvrir le lien comme un groupe, en supprimant temporairement les erreurs HDF5
+                    H5E_auto2_t old_func;
+                    void *old_client_data;
+                    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_client_data);
+                    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+                    hid_t group_id = H5Gopen2(file_id, name, H5P_DEFAULT);
+                    H5Eset_auto2(H5E_DEFAULT, old_func, old_client_data);
+
+                    if (group_id >= 0) {
+                        if (H5Lexists(group_id, "index", H5P_DEFAULT) > 0) {
+                            // Found the right group (the one holding the index).
+                            if (should_close_loc_id) {
+                                if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
+                                else H5Gclose(file_id);
+                            }
+                            file_id = group_id; // Use this group as the new root
+                            should_close_loc_id = true; // Ensure this new handle will be closed
+                            break; 
+                        }
+                        H5Gclose(group_id);
+                    }
+                }
+            }
+        }
+    }
+    // --- FIN DU PATCH ---
+
+    std::string usage_hint = "time_series";  // default
+    if (mode == OpenMode::READ) {
+        usage_hint = "interactive";  // read mode favors fast access
+    }
+
+    configureChunking(usage_hint);
+    if (s_has_default_chunk_config) chunk_config = s_default_chunk_config;
+
+     // OPTIMIZATION: Create a DAPL (Dataset Access Property List) with a large cache
+    // Applies to both creation (WRITE) and opening (APPEND/READ)
+    hid_t dapl = H5Pcreate(H5P_DATASET_ACCESS);
+    H5Pset_chunk_cache(dapl, chunk_config.chunk_cache_nslots, 
+                       chunk_config.chunk_cache_size, chunk_config.chunk_cache_w0);
+
+    if (mode == OpenMode::WRITE) {
+        // Delete existing datasets
+        if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) H5Ldelete(file_id, "index", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_f64", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_i32", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_str", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) H5Ldelete(file_id, "data_raw_c128", H5P_DEFAULT);
+        // The time-base block is recreated like the four payload blocks. A name this
+        // list forgets is not an error: the create below fails on the leftover object
+        // and the new rows would be appended to the previous life of the file.
+        if (H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0) H5Ldelete(file_id, PANZER_TIME_DATASET, H5P_DEFAULT);
+        // Same for the v5 per-step-scalar blocks: three names, all recreated.
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+            H5Ldelete(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT);
+        if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "paths", H5P_DEFAULT);
+        if (H5Lexists(file_id, "parent_paths", H5P_DEFAULT) > 0) H5Ldelete(file_id, "parent_paths", H5P_DEFAULT);
+        if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) H5Ldelete(file_id, "path_table", H5P_DEFAULT);
+        // Every dataset this branch recreates has to be in this list: a WRITE engine handed a
+        // loc_id does not truncate the file (only the by-name constructor does, H5F_ACC_TRUNC),
+        // so a name left here makes the create below fail and its rows come from the previous
+        // life of the file. For /list_spans that is silent corruption: the spans carry the
+        // element boundaries of a list, and row ids restart at 0, so the stale rows describe
+        // the new data.
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) H5Ldelete(file_id, "list_spans", H5P_DEFAULT);
+
+        // A WRITE open throws the table away: anything parked for this file describes
+        // rows that no longer exist, so it must not be resumed from.
+        if (indexHandoff().key == panzer_file_name(file_id)) indexHandoff() = IndexHandoff{};
+
+        // V3/V4/V5: new files use the packed 7-column /index + interned /path_table.
+        // v4 adds the time-base block (data_time_f64) and the Leaf::block selector;
+        // v5 adds the per-step-scalar blocks (data_scalar_*) and widens that
+        // selector to two bits.
+        index_version = PANZER_INDEX_VERSION_V5;
+        index_cols = PANZER_INDEX_COLUMNS_V3;
+
+        // OPTIMIZATION: Create index dataset with optimal chunking
+        hsize_t dims[2] = {0, (hsize_t)index_cols};
+        hsize_t maxdims[2] = {H5S_UNLIMITED, (hsize_t)index_cols};
+        hsize_t chunk[2] = {chunk_config.index_chunk_rows, (hsize_t)index_cols};
+        
+        hid_t space = H5Screate_simple(2, dims, maxdims);
+        hid_t plist = H5Pcreate(H5P_DATASET_CREATE);
+        H5Pset_chunk(plist, 2, chunk);
+        
+        // Compression for the index
+        // NOTE: HDF5 applies filters in add-order. The compressor must be added
+        // LAST (shuffle before deflate): if deflate is added first, the shuffle
+        // filter ends up applied AFTER the compressed bytes, contributing nothing.
+        if (chunk_config.enable_compression) {
+            H5Pset_shuffle(plist);  // Improves compression (applied first, to raw bytes)
+            H5Pset_deflate(plist, chunk_config.compression_level);
+        }
+        
+        H5Pset_fill_time(plist, H5D_FILL_TIME_NEVER);
+        H5Pset_alloc_time(plist, H5D_ALLOC_TIME_INCR);
+        
+        index_dset = H5Dcreate2(file_id, "index", H5T_STD_U64LE, space, 
+                                H5P_DEFAULT, plist, dapl);
+        H5Pclose(plist);
+        H5Sclose(space);
+
+        // Format version stamp (point 16): explicit instead of inferring the
+        // column count from the extent. Legacy/v2 files simply lack this attribute.
+        {
+            hid_t vs = H5Screate(H5S_SCALAR);
+            hid_t at = H5Acreate2(index_dset, "index_version", H5T_STD_U32LE, vs,
+                                  H5P_DEFAULT, H5P_DEFAULT);
+            if (at >= 0) {
+                H5Awrite(at, H5T_NATIVE_UINT32, &index_version);
+                H5Aclose(at);
+            }
+            H5Sclose(vs);
+        }
+        
+         // OPTIMIZATION: Create data datasets with optimal chunking
+        data_dset_f64 = createOptimizedDataset("data_raw_f64", H5T_IEEE_F64LE, 
+                                                chunk_config.data_chunk_f64, true, dapl);
+        data_dset_i32 = createOptimizedDataset("data_raw_i32", H5T_STD_I32LE,
+                                                chunk_config.data_chunk_i32, true, dapl);
+
+        // Time-base block (v4). Same FLOAT64 type and filter order as data_raw_f64,
+        // small chunk on purpose -- see ChunkingConfig::data_chunk_time.
+        data_dset_time = createOptimizedDataset(PANZER_TIME_DATASET, H5T_IEEE_F64LE,
+                                                chunk_config.data_chunk_time, true, dapl);
+
+        // Per-step-scalar blocks (v5): a node that is 0-D in the IDS but carries one
+        // value per time step (global_quantities&ip is the case that started this).
+        // They grow like the time base instead of like the payload -- see
+        // PANZER_SCALAR_DATASET_F64. Strings are deliberately absent: their offset is
+        // a position in data_raw_str, which the read path resolves there.
+        data_dset_scalar_f64 = createOptimizedDataset(PANZER_SCALAR_DATASET_F64, H5T_IEEE_F64LE,
+                                                      chunk_config.data_chunk_scalar, true, dapl);
+        data_dset_scalar_i32 = createOptimizedDataset(PANZER_SCALAR_DATASET_I32, H5T_STD_I32LE,
+                                                      chunk_config.data_chunk_scalar, true, dapl);
+        {
+            hsize_t scalar_complex_dims[1] = {2};
+            hid_t scalar_complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, scalar_complex_dims);
+            data_dset_scalar_c128 = createOptimizedDataset(PANZER_SCALAR_DATASET_C128, scalar_complex_tid,
+                                                           chunk_config.data_chunk_scalar, true, dapl);
+            H5Tclose(scalar_complex_tid);
+        }
+        
+         // String dataset: FIXED-WIDTH, NUL-padded C1 (SWMR-safe; no vlen heap).
+         // Element = STRING_MAX_LEN bytes; a value longer than STRING_MAX_LEN-1 is
+         // rejected at write time (see flush()). Mirrors the `paths` column.
+        hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+        H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+        H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+        H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
+        data_dset_str = createOptimizedDataset("data_raw_str", str_type_fixed,
+                                                chunk_config.data_chunk_str, true, dapl);
+        H5Tclose(str_type_fixed);
+        
+        // Complex dataset
+        hsize_t complex_dims[1] = {2};
+        hid_t complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, complex_dims);
+        data_dset_c128 = createOptimizedDataset("data_raw_c128", complex_tid, 
+                                                 chunk_config.data_chunk_c128, true, dapl);
+        H5Tclose(complex_tid);
+        
+        // V3: /path_table holds one fixed-length entry per UNIQUE path text
+        // (deduplicated by the writer). Replaces the row-aligned /paths dataset
+        // of v2 (256B per index row -> a few entries per distinct signal).
+        hid_t str_type = H5Tcopy(H5T_C_S1);
+        H5Tset_size(str_type, PATH_MAX_LEN);
+        H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+
+        path_table_dset = createOptimizedDataset("path_table", str_type,
+                                                 chunk_config.path_chunk_entries, true, dapl);
+        H5Tclose(str_type);
+        paths_dset = H5I_INVALID_HID;
+        // M1: /parent_paths is no longer materialised; parent_path is reconstructed
+        // on read from (parent_id, kind, full path).  See getLeaves().
+        parent_paths_dset = H5I_INVALID_HID;
+
+        // Span-table dataset (u64, 1-D, unlimited, chunked): 4 u64s per entry
+        // (row_id, element_idx, slot_offset, slot_span). Only written for list
+        // elements exceeding STRING_MAX_LEN-1; empty dataset is fine.
+        ensureListSpansDataset();
+
+        // Optimized buffers
+        index_buffer.reserve(chunk_config.index_chunk_rows * index_cols);
+        data_buffer_f64.reserve(chunk_config.data_chunk_f64);
+        data_buffer_i32.reserve(chunk_config.data_chunk_i32);
+        data_buffer_str.reserve(chunk_config.data_chunk_str);
+        data_buffer_c128.reserve(chunk_config.data_chunk_c128);
+        data_buffer_time.reserve(chunk_config.data_chunk_time);
+        data_buffer_scalar_f64.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_i32.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_c128.reserve(chunk_config.data_chunk_scalar);
+
+        disk_size_f64 = 0;
+        disk_size_i32 = 0;
+        disk_size_c128 = 0;
+        disk_size_str = 0;
+        disk_size_time = 0;
+        disk_size_scalar_f64 = 0;
+        disk_size_scalar_i32 = 0;
+        disk_size_scalar_c128 = 0;
+        
+    } else if (mode == OpenMode::APPEND) {
+        // Open existing datasets
+        if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) index_dset = H5Dopen2(file_id, "index", dapl);
+        // APPEND: continue row ids from the on-disk /index row count so new parent
+        // references stay aligned with the order a later READ observes.
+        next_row_id = 0;
+        if (index_dset >= 0) {
+            hid_t ispace = H5Dget_space(index_dset);
+            hsize_t idims[2] = {0, 0};
+            H5Sget_simple_extent_dims(ispace, idims, nullptr);
+            H5Sclose(ispace);
+            next_row_id = idims[0];
+            // Appended rows must reuse the file's layout (legacy 14-col files
+            // keep it; v2 files continue with 12; v3 files with the packed 7).
+            if (idims[1] > 0) index_cols = idims[1];
+            // Format version: attribute when present, otherwise infer from the
+            // column count (12/14 -> v2/legacy, 7 -> v3/v4 packing).
+            if (H5Aexists(index_dset, "index_version") > 0) {
+                hid_t at = H5Aopen(index_dset, "index_version", H5P_DEFAULT);
+                if (at >= 0) {
+                    uint32_t v = 0;
+                    if (H5Aread(at, H5T_NATIVE_UINT32, &v) >= 0 && v > 0) {
+                        if (v > PANZER_INDEX_VERSION_V5) {
+                            // Nothing will run a destructor for an engine whose
+                            // constructor throws, so the handles opened above have to
+                            // go back before the refusal does.
+                            H5Aclose(at);
+                            H5Pclose(dapl);
+                            abandonOpenHandles();
+                            rejectUnknownIndexVersion(v, "APPEND");
+                        }
+                        index_version = v;
+                    }
+                    H5Aclose(at);
+                }
+            } else if (idims[1] == PANZER_INDEX_COLUMNS_V3) {
+                index_version = PANZER_INDEX_VERSION_V3;
+            }
+        }
+        if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) data_dset_f64 = H5Dopen2(file_id, "data_raw_f64", dapl);
+        if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) data_dset_i32 = H5Dopen2(file_id, "data_raw_i32", dapl);
+        if (index_version >= PANZER_INDEX_VERSION_V3) {
+            if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) path_table_dset = H5Dopen2(file_id, "path_table", dapl);
+            loadPathTable();
+        } else if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) paths_dset = H5Dopen2(file_id, "paths", dapl);
+        if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", dapl);
+        if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", dapl);
+        // A v3 file has no time-base block and APPEND keeps the layout of the file it
+        // opens, so this handle stays invalid and time bases keep going to
+        // data_raw_f64 there -- the block bit of their rows stays 0, which is what a
+        // reader of any version expects.
+        if (index_version >= PANZER_INDEX_VERSION_V4 &&
+            H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0)
+            data_dset_time = H5Dopen2(file_id, PANZER_TIME_DATASET, dapl);
+        // Same reasoning for the v5 per-step-scalar blocks: a v3 or v4 file keeps the
+        // layout it was written with, so these handles stay invalid on APPEND there and
+        // per-step scalars continue to go to the payload block with their block bit at 0.
+        if (index_version >= PANZER_INDEX_VERSION_V5) {
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+                data_dset_scalar_f64 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_F64, dapl);
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+                data_dset_scalar_i32 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_I32, dapl);
+            if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+                data_dset_scalar_c128 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_C128, dapl);
+        }
+        // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
+        parent_paths_dset = H5I_INVALID_HID;
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", dapl);
+        leaves_cache_valid = false;
+
+        // NOUVEAU: Lire la configuration de chunking du fichier existant
+        readChunkingConfig();
+        updateDiskSizes();
+        
+        // Optimized buffers
+        index_buffer.reserve(chunk_config.index_chunk_rows * index_cols);
+        data_buffer_f64.reserve(chunk_config.data_chunk_f64);
+        data_buffer_i32.reserve(chunk_config.data_chunk_i32);
+        data_buffer_str.reserve(chunk_config.data_chunk_str);
+        data_buffer_c128.reserve(chunk_config.data_chunk_c128);
+        data_buffer_time.reserve(chunk_config.data_chunk_time);
+        data_buffer_scalar_f64.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_i32.reserve(chunk_config.data_chunk_scalar);
+        data_buffer_scalar_c128.reserve(chunk_config.data_chunk_scalar);
+
+    } else { // OpenMode::READ
+        if (file_id < 0) throw std::runtime_error("Failed to open file for reading");
+        if (H5Lexists(file_id, "index", H5P_DEFAULT) > 0) index_dset = H5Dopen2(file_id, "index", H5P_DEFAULT);
+        if (index_dset >= 0) {
+            if (H5Aexists(index_dset, "index_version") > 0) {
+                hid_t at = H5Aopen(index_dset, "index_version", H5P_DEFAULT);
+                if (at >= 0) {
+                    uint32_t v = 0;
+                    if (H5Aread(at, H5T_NATIVE_UINT32, &v) >= 0 && v > 0) {
+                        if (v > PANZER_INDEX_VERSION_V5) {
+                            // As in APPEND: an engine whose constructor throws has no
+                            // destructor to release what this open already holds.
+                            H5Aclose(at);
+                            H5Pclose(dapl);
+                            abandonOpenHandles();
+                            rejectUnknownIndexVersion(v, "READ");
+                        }
+                        index_version = v;
+                    }
+                    H5Aclose(at);
+                }
+            } else {
+                hid_t ispace = H5Dget_space(index_dset);
+                hsize_t idims[2] = {0, 0};
+                H5Sget_simple_extent_dims(ispace, idims, nullptr);
+                H5Sclose(ispace);
+                if (idims[1] == PANZER_INDEX_COLUMNS_V3) index_version = PANZER_INDEX_VERSION_V3;
+            }
+        }
+        if (H5Lexists(file_id, "data_raw_f64", H5P_DEFAULT) > 0) data_dset_f64 = H5Dopen2(file_id, "data_raw_f64", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_i32", H5P_DEFAULT) > 0) data_dset_i32 = H5Dopen2(file_id, "data_raw_i32", H5P_DEFAULT);
+        if (index_version >= PANZER_INDEX_VERSION_V3) {
+            if (H5Lexists(file_id, "path_table", H5P_DEFAULT) > 0) path_table_dset = H5Dopen2(file_id, "path_table", H5P_DEFAULT);
+        } else if (H5Lexists(file_id, "paths", H5P_DEFAULT) > 0) paths_dset = H5Dopen2(file_id, "paths", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_c128", H5P_DEFAULT) > 0) data_dset_c128 = H5Dopen2(file_id, "data_raw_c128", H5P_DEFAULT);
+        if (H5Lexists(file_id, "data_raw_str", H5P_DEFAULT) > 0) data_dset_str = H5Dopen2(file_id, "data_raw_str", H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_TIME_DATASET, H5P_DEFAULT) > 0) data_dset_time = H5Dopen2(file_id, PANZER_TIME_DATASET, H5P_DEFAULT);
+        // v5 blocks: opened by name, like the time base. Which of them a row points at
+        // is decided by that row's block bits, so a v5 file needs all three and a v3/v4
+        // file simply has none of them to open.
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT) > 0)
+            data_dset_scalar_f64 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_F64, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT) > 0)
+            data_dset_scalar_i32 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_I32, H5P_DEFAULT);
+        if (H5Lexists(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT) > 0)
+            data_dset_scalar_c128 = H5Dopen2(file_id, PANZER_SCALAR_DATASET_C128, H5P_DEFAULT);
+        if (H5Lexists(file_id, "list_spans", H5P_DEFAULT) > 0) list_spans_dset = H5Dopen2(file_id, "list_spans", H5P_DEFAULT);
+        // M1: /parent_paths is reconstructed on read; an orphaned one is ignored.
+        parent_paths_dset = H5I_INVALID_HID;
+        leaves_cache_valid = false;
+
+        // NOUVEAU: Lire la configuration de chunking
+        readChunkingConfig();
+
+        // NOUVEAU: Configurer le cache HDF5 pour lectures optimales
+        configureReadCache();
+
+    }
+
+    H5Pclose(dapl);
+    // Identity of what this engine reads, noted while the handles are alive: the AL
+    // may close the group we hang on before close() runs.
+    index_file_name = panzer_file_name(file_id);
+    if (!panzer_object_token(index_dset, index_token)) index_token = H5O_TOKEN_UNDEF;
+    // The AL drops and rebuilds this engine around every operation, so on a read
+    // session the parked state is normally adopted whole. When it covers every row
+    // the table has, the counters restoreTimeContext() walks the full leaf table to
+    // rebuild came across with it, and that walk is pure rework.
+    // An APPEND engine runs it anyway: that function also takes the file_time_base
+    // snapshot the writer uses to tell a fresh signal from a continuing one, and the
+    // handoff does not carry that snapshot.
+    const bool adopted_whole_table = adoptIndexHandoff();
+    if (!adopted_whole_table || mode == OpenMode::APPEND) restoreTimeContext();
+}
+
+void PanzerDB::updateDiskSizes() {
+    if (data_dset_f64 >= 0) {
+        hid_t space = H5Dget_space(data_dset_f64);
+        H5Sget_simple_extent_dims(space, &disk_size_f64, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_i32 >= 0) {
+        hid_t space = H5Dget_space(data_dset_i32);
+        H5Sget_simple_extent_dims(space, &disk_size_i32, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_c128 >= 0) {
+        hid_t space = H5Dget_space(data_dset_c128);
+        H5Sget_simple_extent_dims(space, &disk_size_c128, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_str >= 0) {
+        hid_t space = H5Dget_space(data_dset_str);
+        H5Sget_simple_extent_dims(space, &disk_size_str, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_time >= 0) {
+        hid_t space = H5Dget_space(data_dset_time);
+        H5Sget_simple_extent_dims(space, &disk_size_time, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_scalar_f64 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_f64);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_f64, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_scalar_i32 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_i32);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_i32, NULL);
+        H5Sclose(space);
+    }
+    if (data_dset_scalar_c128 >= 0) {
+        hid_t space = H5Dget_space(data_dset_scalar_c128);
+        H5Sget_simple_extent_dims(space, &disk_size_scalar_c128, NULL);
+        H5Sclose(space);
+    }
+}
+
+uint64_t PanzerDB::rawExtentFor(hid_t dset_id) const {
+    if (dset_id < 0) return 0;
+    hid_t space = H5Dget_space(dset_id);
+    if (space < 0) return 0;
+    hsize_t ext[1] = {0};
+    H5Sget_simple_extent_dims(space, ext, nullptr);
+    H5Sclose(space);
+    return ext[0];
+}
+
+// ============================================================================
+// READING THE PERSISTED CHUNKING CONFIGURATION
+// ============================================================================
+
+void PanzerDB::readChunkingConfig() {
+    if (data_dset_f64 < 0) {
+        // Can't read config if the primary dataset doesn't exist.
+        // Default config will be used.
+        std::cout << "[PanzerDB] Warning: data_raw_f64 not found. Using default chunking config for read." << std::endl;
+        return;
+    }
+    // Lire la configuration de chunking depuis le dataset existant.
+    // Only data_raw_f64 is sampled: nothing on the read path is sized from this
+    // value (HDF5 fetches chunks itself), and the v4 time-base block and the v5
+    // per-step-scalar blocks carry their own chunk size in their own create plist,
+    // so an APPEND that extends them already uses the right geometry.
+    hid_t dcpl = H5Dget_create_plist(data_dset_f64);
+    
+    if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
+        hsize_t chunk_dims[1];
+        H5Pget_chunk(dcpl, 1, chunk_dims);
+        chunk_config.data_chunk_f64 = chunk_dims[0];
+        
+        // Check whether compression is active
+        if (H5Pget_nfilters(dcpl) > 0) {
+            chunk_config.enable_compression = true;
+        }
+    }
+    
+    H5Pclose(dcpl);
+    
+    /*std::cout << "[PanzerDB] Read chunking config from file:" << std::endl;
+    std::cout << "  Data chunk (f64): " << chunk_config.data_chunk_f64 << " elements" << std::endl;
+    std::cout << "  Compression: " << (chunk_config.enable_compression ? "enabled" : "disabled") << std::endl;*/
+}
+
+// ============================================================================
+// CONFIGURING THE READ (CHUNK) CACHE
+// ============================================================================
+
+void PanzerDB::configureReadCache() {
+    // Configurer le cache HDF5 pour optimiser les lectures via DAPL (Dataset Access Property List)
+    // This applies the cache to datasets already open or about to be opened.
+
+    hid_t dapl = H5Pcreate(H5P_DATASET_ACCESS);
+    if (dapl < 0) {
+        std::cerr << "[PanzerDB] Warning: H5Pcreate failed. Read cache not configured." << std::endl;
+        return;
+    }
+
+    // OPTIMISATION: Cache de chunk (Raw Data Chunk Cache)
+    if (H5Pset_chunk_cache(dapl, 
+                           chunk_config.chunk_cache_nslots, 
+                           chunk_config.chunk_cache_size, 
+                           chunk_config.chunk_cache_w0) < 0) {
+        std::cerr << "[PanzerDB] Warning: H5Pset_chunk_cache failed." << std::endl;
+        H5Pclose(dapl);
+        return;
+    }
+    
+    // Helper to reopen a dataset with the new DAPL
+    auto reopen_dataset = [&](hid_t& dset_id, const char* name) {
+        if (dset_id >= 0) {
+            H5Dclose(dset_id);
+            dset_id = -1;
+        }
+        if (H5Lexists(file_id, name, H5P_DEFAULT) > 0) {
+            dset_id = H5Dopen2(file_id, name, dapl);
+        }
+    };
+
+    // Appliquer aux datasets principaux
+    reopen_dataset(index_dset, "index");
+    reopen_dataset(data_dset_f64, "data_raw_f64");
+    reopen_dataset(data_dset_i32, "data_raw_i32");
+    reopen_dataset(data_dset_str, "data_raw_str");
+    reopen_dataset(data_dset_c128, "data_raw_c128");
+    reopen_dataset(data_dset_time, PANZER_TIME_DATASET);
+    reopen_dataset(data_dset_scalar_f64, PANZER_SCALAR_DATASET_F64);
+    reopen_dataset(data_dset_scalar_i32, PANZER_SCALAR_DATASET_I32);
+    reopen_dataset(data_dset_scalar_c128, PANZER_SCALAR_DATASET_C128);
+    reopen_dataset(paths_dset, "paths");
+    reopen_dataset(path_table_dset, "path_table");
+    // M1: /parent_paths no longer exists; it is never reopened.
+
+    H5Pclose(dapl);
+
+    /*std::cout << "[PanzerDB] Read cache configured (DAPL applied to datasets):" << std::endl;
+    std::cout << "  Chunk cache: " << (chunk_config.chunk_cache_size / 1024 / 1024) << " MB" << std::endl;
+    std::cout << "  Cache slots: " << chunk_config.chunk_cache_nslots << std::endl;*/
+}
+
+// ============================================================================
+// AUTOMATIC USAGE-PATTERN DETECTION
+// ============================================================================
+
+void PanzerDB::configureChunking(const std::string& usage_hint) {
+    // Patterns d'usage typiques:
+    // - "time_series": many sequential writes, time-slice reads
+    // - "array_of_structures": many nested AoS, structure-based access
+    // - "bulk_write": single massive write, rare reads
+    // - "interactive": frequent, small reads/writes
+    
+    if (usage_hint == "time_series") {
+        // Optimized for sequential writes and time-slice reads
+        chunk_config.index_chunk_rows = 4096;      // smaller chunks for better access
+        chunk_config.data_chunk_f64 = 65536;       // 512 KB par chunk
+        chunk_config.data_chunk_i32 = 131072;      // 512 KB par chunk
+        chunk_config.data_chunk_c128 = 32768;      // 512 KB par chunk (16 bytes/elem)
+        chunk_config.data_chunk_str = 128;         // 128 x 512B = 64 KB per chunk (fixed-width)
+        chunk_config.path_chunk_entries = 4096;    // ~1 MB (256 bytes/entry)
+        chunk_config.enable_compression = true;
+        chunk_config.compression_level = 1;        // light compression
+        
+    } else if (usage_hint == "array_of_structures") {
+        // Optimized for AoS with many small structures
+        chunk_config.index_chunk_rows = 16384;     // Plus gros index chunks
+        chunk_config.data_chunk_f64 = 32768;       // Plus petits data chunks
+        chunk_config.data_chunk_i32 = 65536;
+        chunk_config.data_chunk_c128 = 16384;      // 256 KB
+        chunk_config.data_chunk_str = 64;          // 64 x 512B = 32 KB per chunk (fixed-width)
+        chunk_config.path_chunk_entries = 4096;
+        chunk_config.enable_compression = true;
+        chunk_config.compression_level = 1;
+        
+    } else if (usage_hint == "bulk_write") {
+        // Optimized for massive single writes
+        chunk_config.index_chunk_rows = 32768;     // very large chunks
+        chunk_config.data_chunk_f64 = 524288;      // 4 MB par chunk
+        chunk_config.data_chunk_i32 = 1048576;     // 4 MB par chunk
+        chunk_config.data_chunk_c128 = 262144;     // 4 MB par chunk
+        chunk_config.data_chunk_str = 1024;        // 1024 x 512B = 512 KB per chunk (fixed-width)
+        chunk_config.path_chunk_entries = 16384;   // ~4 MB
+        chunk_config.enable_compression = true;
+        chunk_config.compression_level = 1;        // light compression (speed)
+        
+    } else if (usage_hint == "interactive") {
+        // Optimized for frequent, small accesses
+        chunk_config.index_chunk_rows = 1024;      // Petits chunks
+        chunk_config.data_chunk_f64 = 8192;        // 64 KB par chunk
+        chunk_config.data_chunk_i32 = 16384;       // 64 KB par chunk
+        chunk_config.data_chunk_c128 = 4096;       // 64 KB par chunk
+        chunk_config.data_chunk_str = 64;          // 64 x 512B = 32 KB per chunk (fixed-width)
+        chunk_config.path_chunk_entries = 1024;    // ~256 KB
+        chunk_config.enable_compression = false;   // Pas de compression
+        
+    } else {
+        // Default configuration (balanced)
+        chunk_config.index_chunk_rows = 8192;
+        chunk_config.data_chunk_f64 = 131072;
+        chunk_config.data_chunk_i32 = 262144;
+        chunk_config.data_chunk_c128 = 65536;
+        chunk_config.data_chunk_str = 128;         // 128 x 512B = 64 KB per chunk (fixed-width)
+        chunk_config.path_chunk_entries = 4096;
+        chunk_config.enable_compression = true;
+        chunk_config.compression_level = 1;
+    }
+    
+    /*std::cout << "[PanzerDB] Chunking configured for: " << usage_hint << std::endl;
+    std::cout << "  Index chunk: " << chunk_config.index_chunk_rows << " rows" << std::endl;
+    std::cout << "  Data chunk (f64): " << chunk_config.data_chunk_f64 
+              << " elements (" << (chunk_config.data_chunk_f64 * 8 / 1024) << " KB)" << std::endl;
+    std::cout << "  Compression: " << (chunk_config.enable_compression ? "enabled" : "disabled")
+              << " (level " << chunk_config.compression_level << ")" << std::endl; */
+}
+
+// ============================================================================
+// OPTIMIZED DATASET CREATION
+// ============================================================================
+
+hid_t PanzerDB::createOptimizedDataset(const std::string& name,
+                                        hid_t type,
+                                        size_t chunk_size,
+                                        bool enable_compression,
+                                        hid_t dapl) {
+    // Create the dataspace (1-D, extensible)
+    hsize_t dims[1] = {0};
+    hsize_t maxdims[1] = {H5S_UNLIMITED};
+    hid_t space = H5Screate_simple(1, dims, maxdims);
+    
+    // Create and configure the property list
+    hid_t plist = H5Pcreate(H5P_DATASET_CREATE);
+    
+    // OPTIMISATION 1: Chunking
+    hsize_t chunk[1] = {chunk_size};
+    H5Pset_chunk(plist, 1, chunk);
+    
+    // OPTIMISATION 2: Compression (GZIP)
+    // NOTE: HDF5 applies filters in add-order. The compressor (deflate) MUST be
+    // added LAST; shuffle must come first so it runs on the raw bytes. If deflate
+    // is added first, shuffle ends up applied to already-compressed output and
+    // contributes nothing (measured: +20% file size on reflectometer_profile).
+    if (enable_compression && chunk_config.enable_compression) {
+        H5T_class_t type_class = H5Tget_class(type);
+        if (type_class == H5T_INTEGER || type_class == H5T_FLOAT || type_class == H5T_ARRAY) {
+            H5Pset_shuffle(plist);  // Improves compression of numeric data
+        }
+        H5Pset_deflate(plist, chunk_config.compression_level);
+    }
+    
+    // OPTIMIZATION 3: fill value (avoids costly initialization)
+    if (H5Tget_class(type) == H5T_STRING && H5Tis_variable_str(type) > 0) {
+        // For variable-length strings, it's mandatory to set a fill value.
+        // Setting it to NULL is the standard way to indicate no fill.
+        const char* fill_ptr = nullptr;
+        H5Pset_fill_value(plist, type, &fill_ptr);
+    } else {
+        H5Pset_fill_time(plist, H5D_FILL_TIME_NEVER);
+    }
+    // OPTIMISATION 4: Allocation strategy
+    // Allocate space progressively rather than all at once
+    H5Pset_alloc_time(plist, H5D_ALLOC_TIME_INCR);
+    
+    // Create the dataset
+    hid_t dset = H5Dcreate2(file_id, name.c_str(), type, space, 
+                            H5P_DEFAULT, plist, dapl);
+    
+    // Cleanup
+    H5Pclose(plist);
+    H5Sclose(space);
+    
+    return dset;
+}
+
+// ============================================================================
+// PUBLIC CONFIGURATION API
+// ============================================================================
+
+void PanzerDB::setChunkingHint(const std::string& hint) {
+    if (mode != OpenMode::WRITE) {
+        std::cerr << "[PanzerDB] Warning: Chunking hint ignored in non-WRITE mode" << std::endl;
+        return;
+    }
+    configureChunking(hint);
+}
+
+void PanzerDB::setCompressionLevel(int level) {
+    if (level < 0 || level > 9) {
+        throw std::invalid_argument("Compression level must be 0-9");
+    }
+    chunk_config.compression_level = level;
+    chunk_config.enable_compression = (level > 0);
+}
+
+void PanzerDB::disableCompression() {
+    chunk_config.enable_compression = false;
+}
+
+void PanzerDB::setDefaultChunkingConfig(const ChunkingConfig& cfg) {
+    s_default_chunk_config = cfg;
+    s_has_default_chunk_config = true;
+}
+
+void PanzerDB::clearDefaultChunkingConfig() {
+    s_has_default_chunk_config = false;
+}
+
+void PanzerDB::setReadCache(size_t nbytes, size_t nslots, double w0) {
+    chunk_config.chunk_cache_size = nbytes;
+    chunk_config.chunk_cache_nslots = nslots;
+    chunk_config.chunk_cache_w0 = w0;
+    if (mode == OpenMode::READ) configureReadCache();
+}
+
+
+// ============================================================================
+// CHUNKING STATISTICS
+// ============================================================================
+
+ChunkingStats PanzerDB::getChunkingStats() const {
+    ChunkingStats stats;
+    
+    // Obtenir les statistiques du dataset f64
+    hid_t dcpl = H5Dget_create_plist(data_dset_f64);
+    
+    if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
+        hsize_t chunk_dims[1];
+        H5Pget_chunk(dcpl, 1, chunk_dims);
+        
+        // Obtenir la taille du dataset
+        hid_t space = H5Dget_space(data_dset_f64);
+        hsize_t dims[1];
+        H5Sget_simple_extent_dims(space, dims, NULL);
+        H5Sclose(space);
+        
+        // Calculer nombre de chunks
+        stats.total_chunks_written = (dims[0] + chunk_dims[0] - 1) / chunk_dims[0];
+        stats.total_bytes_written = dims[0] * sizeof(double);
+        
+        // Compressed size (approximation)
+        if (chunk_config.enable_compression) {
+            // Typical ratio for numeric data with gzip
+            stats.compression_ratio = 40;  // 40% de la taille originale
+        }
+    }
+    
+    H5Pclose(dcpl);
+    
+    return stats;
+}
+
+void PanzerDB::printChunkingStats() const {
+    auto stats = getChunkingStats();
+    
+    std::cout << "\n=== PanzerDB Chunking Statistics ===" << std::endl;
+    std::cout << "Chunks written: " << stats.total_chunks_written << std::endl;
+    std::cout << "Bytes written:  " << stats.total_bytes_written / 1024 / 1024 << " MB" << std::endl;
+    
+    if (chunk_config.enable_compression) {
+        size_t compressed_size = (stats.total_bytes_written * stats.compression_ratio) / 100;
+        std::cout << "Compressed to:  " << compressed_size / 1024 / 1024 << " MB" << std::endl;
+        std::cout << "Compression:    " << stats.compression_ratio << "%" << std::endl;
+        std::cout << "Space saved:    " << (100 - stats.compression_ratio) << "%" << std::endl;
+    }
+    std::cout << "====================================\n" << std::endl;
+}
+
+// Optimized construction of path_prefix from the stack
+std::string PanzerDB::buildPathFromStack(const std::vector<ArrayLevel>& stack_vector) const {
+    if (stack_vector.empty()) return "";
+    
+    // OPTIMIZATION 1: precompute the total size for a single allocation
+    size_t total_size = 0;
+    for (size_t i = 0; i < stack_vector.size(); ++i) {
+        total_size += stack_vector[i].name.length();
+        if (i > 0) {
+            // max length of a uint64_t in decimal = 20 characters
+            total_size += 20;  // Pour l'index (ex: "/12345")
+        }
+        total_size += 1;  // Pour le '/'
+    }
+    
+    // OPTIMISATION 2: Allocation unique
+    std::string result;
+    result.reserve(total_size + 10); // +10 de marge
+    
+    // OPTIMIZATION 3: build without reallocation
+    for (size_t i = 0; i < stack_vector.size(); ++i) {
+        if (i > 0) {
+            // Append the previous level's index
+            result += '/';
+            // use to_string, which is optimized
+            result += std::to_string(stack_vector[i-1].current_index);
+        }
+        if (!result.empty()) {
+            result += '/';
+        }
+        result += stack_vector[i].name;
+    }
+    
+    return result;
+}
+
+namespace {
+// Thread-local fold cache for restoreTimeContext() (declared here because
+// PanzerDB.cpp is one translation unit; thread_local keeps two putSlice threads
+// from clobbering each other's buffers). Its key is the leaf-buffer address +
+// the covered count — the exact invariant the ReadIndex cache in
+// iread_strategy.h keys on — so it only ever "inherits" the folded map when the
+// same buffer grew in place (a putSlice loop only appends), and any moved buffer,
+// a different file, or a table that shrank all miss and force a correct full fold.
+struct RestoreTimeFold {
+    const void* base = nullptr;                                  // leaves.data() last folded
+    size_t covered_count = 0;                                    // leaves the map covers
+    std::unordered_map<std::string, uint64_t> counters;          // folded-so-far map
+};
+}  // namespace
+
+void PanzerDB::restoreTimeContext() {
+    if (mode != OpenMode::APPEND && mode != OpenMode::READ) return;
+
+    const auto& leaves = getLeaves();
+    const size_t n = leaves.size();
+    const void* base = leaves.data();
+
+    // Fold leaves [begin, end) into the per-signal max time counter (the two
+    // passes the original body used, now parameterised by range so a repeat open
+    // of a grown buffer folds only the appended tail):
+    //   pass 1 — every Dynamic-AoS root (flags==3) in the range initialises to 0;
+    //   pass 2 — every data leaf lifts its own counter and its nearest AOS parent.
+    // Roots are zeroed before any data leaf can lift them, so a freshly-created
+    // root in the range stays "no file data" (hasFileData -> second > 0 is false)
+    // until its payload is counted — identical to the original whole-table order.
+    auto fold = [this](const Leaf* begin, const Leaf* end) {
+        for (const Leaf* it = begin; it != end; ++it)
+            if (it->flags == 3) aos_time_counters[std::string(it->path)] = 0;
+        // The scratch key keeps its capacity across iterations, so operator[] does
+        // not allocate once the longest path has been seen (the original cost).
+        std::string key;
+        for (const Leaf* it = begin; it != end; ++it) {
+            if (it->flags == 2 || it->flags == 3) continue;
+            uint64_t slice_volume = 1;
+            for (auto dim : it->shape_span()) if (dim > 0) slice_volume *= dim;
+            if (slice_volume == 0) slice_volume = 1;
+            uint64_t n_steps = it->count / slice_volume;
+            if (n_steps == 0 && it->count > 0) n_steps = 1;
+            const uint64_t next_time = it->time_index + n_steps;
+
+            // Nearest (longest) Dynamic-AoS root this leaf hangs under.
+            const std::string* parent_aos = nullptr;
+            for (const auto& aos_path : cached_dynamic_aos_roots)
+                if (it->path.size() > aos_path.size() && it->path[aos_path.size()] == '/' &&
+                    it->path.compare(0, aos_path.size(), aos_path) == 0 &&
+                    (!parent_aos || aos_path.length() > parent_aos->length()))
+                    parent_aos = &aos_path;
+
+            key.assign(it->path.data(), it->path.size());
+            uint64_t& own = aos_time_counters[key];
+            if (next_time > own) own = next_time;
+            if (parent_aos) {
+                uint64_t& parent = aos_time_counters[*parent_aos];
+                if (next_time > parent) parent = next_time;
+            }
+        }
+    };
+
+    // The per-signal max time counter over a leaf table is a non-decreasing
+    // function of the leaves appended to the same stable buffer: a putSlice loop
+    // only ever grows it, each slice holding that signal's highest time, so the
+    // map folded for the earlier leaves is unchanged once the tail is folded in.
+    // A repeat open therefore inherits the previous fold and pays O(appended)
+    // instead of O(N) per slice; the map copy itself is O(n_paths) (a handful of
+    // keys), not O(N leaves). Keyed on the leaf-buffer address + covered count —
+    // the same invariant the ReadIndex cache keys on — so a moved buffer, a
+    // different file, or a table that shrank all miss and hit the full-fold
+    // fallback, which is always correct and refreshes the cache.
+    static thread_local RestoreTimeFold rc;
+    if (rc.base == base && rc.covered_count > 0 && rc.covered_count <= n) {
+        aos_time_counters = rc.counters;                                  // O(map size)
+        fold(leaves.data() + rc.covered_count, leaves.data() + n);        // O(appended tail)
+        rc.counters = aos_time_counters;                                  // keep it current
+        rc.covered_count = n;
+    } else {
+        aos_time_counters.clear();
+        fold(leaves.data(), leaves.data() + n);                           // full O(N)
+        rc.base = base;
+        rc.covered_count = n;
+        rc.counters = aos_time_counters;
+    }
+
+    // Snapshot the file-derived counters (before this session writes anything) so
+    // the writer can tell a FRESH signal from a CONTINUING one when deciding
+    // whether the timebase catch-up anchor (time_next - n_slices) should apply.
+    // APPEND only. The snapshot is read exclusively through hasFileData(), called only
+    // from the signal write paths: in READ it is dead weight (43 598 entries copied on
+    // the equilibrium fixture), and in WRITE it is always empty anyway — init() deletes
+    // /index before this runs, so the counters it would copy are none.
+    if (mode == OpenMode::APPEND) file_time_base = aos_time_counters;
+}
+
+PanzerDB::~PanzerDB() { close(); }
+
+void PanzerDB::flush() {
+    if (index_buffer.empty()) return;
+
+    // Commit ordering (crash-safe): write the payloads (paths, data_raw_*) FIRST
+    // and advance /index LAST. A reader discovers rows only through /index, so a
+    // crash before the index write leaves only harmless unindexed payload,
+    // whereas the old index-first order could leave a dangling index row pointing
+    // past the materialised data_raw_* extent (a corrupt read). The final
+    // H5Fflush below remains the cross-process SWMR commit barrier.
+    hid_t filespace, memspace;
+
+    // --- Flush Paths Buffer (v2/legacy row-aligned table) ---
+    if (!paths_buffer.empty()) {
+        hsize_t n_new_paths = paths_buffer.size() / PATH_MAX_LEN;
+        filespace = H5Dget_space(paths_dset);
+        hsize_t current_path_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_path_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_path_dims[1] = {current_path_dims[0] + n_new_paths};
+        H5Dset_extent(paths_dset, new_path_dims);
+        
+        filespace = H5Dget_space(paths_dset);
+        hsize_t path_offset[1] = {current_path_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, path_offset, NULL, &n_new_paths, NULL);
+        memspace = H5Screate_simple(1, &n_new_paths, NULL);
+        H5Dwrite(paths_dset, H5Dget_type(paths_dset), memspace, filespace, H5P_DEFAULT, paths_buffer.data());
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    // M1: the /parent_paths dataset is no longer written; the parent path of each
+    // row is reconstructed on read from the row's parent_id + kind + full path
+    // (see getLeaves).  /paths still carries the full path text.
+
+    // --- Flush Data Buffers (one for each type) ---
+    if (!data_buffer_f64.empty()) {
+        hsize_t n_new_data = data_buffer_f64.size();
+        filespace = H5Dget_space(data_dset_f64);
+        hsize_t current_data_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+        H5Dset_extent(data_dset_f64, new_data_dims);
+        
+        filespace = H5Dget_space(data_dset_f64);
+        hsize_t data_offset[1] = {current_data_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+        memspace = H5Screate_simple(1, &n_new_data, NULL);
+        H5Dwrite(data_dset_f64, H5T_NATIVE_DOUBLE, memspace, filespace, H5P_DEFAULT, data_buffer_f64.data());
+        disk_size_f64 = new_data_dims[0];
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+    // Time-base block (v4). Same append shape as the payload blocks, with its own
+    // cursor: that is what keeps a base written one slice at a time contiguous,
+    // instead of one value per payload block in data_raw_f64. Still a payload, so
+    // it is committed before /index like everything else the rows point at.
+    if (!data_buffer_time.empty()) {
+        hsize_t n_new_data = data_buffer_time.size();
+        filespace = H5Dget_space(data_dset_time);
+        hsize_t current_data_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+        H5Dset_extent(data_dset_time, new_data_dims);
+
+        filespace = H5Dget_space(data_dset_time);
+        hsize_t data_offset[1] = {current_data_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+        memspace = H5Screate_simple(1, &n_new_data, NULL);
+        H5Dwrite(data_dset_time, H5T_NATIVE_DOUBLE, memspace, filespace, H5P_DEFAULT, data_buffer_time.data());
+        disk_size_time = new_data_dims[0];
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+    if (!data_buffer_i32.empty()) {
+        hsize_t n_new_data = data_buffer_i32.size();
+        filespace = H5Dget_space(data_dset_i32);
+        hsize_t current_data_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+        H5Dset_extent(data_dset_i32, new_data_dims);
+        
+        filespace = H5Dget_space(data_dset_i32);
+        hsize_t data_offset[1] = {current_data_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+        memspace = H5Screate_simple(1, &n_new_data, NULL);
+        H5Dwrite(data_dset_i32, H5T_NATIVE_INT, memspace, filespace, H5P_DEFAULT, data_buffer_i32.data());
+        disk_size_i32 = new_data_dims[0];
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    if (!data_buffer_str.empty()) {
+        hsize_t n_new_data = data_buffer_str.size();
+
+        // SWMR-safe fixed-width write: validate, then memcpy into a flat NUL-padded
+        // buffer (one STRING_MAX_LEN-byte slot per element). This mirrors the `paths`
+        // column and avoids the vlen heap (which is not SWMR-safe and is excluded from
+        // HDF5's official SWMR feature).
+        std::vector<char> flat(n_new_data * STRING_MAX_LEN, 0);
+        for (hsize_t i = 0; i < n_new_data; ++i) {
+            const std::string& s = data_buffer_str[i];
+            // Strings are already validated to <= STRING_MAX_LEN-1 at write time;
+            // the min() is a defensive bound so a copy can never overflow the slot.
+            size_t n = std::min(s.size(), (size_t)STRING_MAX_LEN);
+            if (n)
+                memcpy(flat.data() + (size_t)i * STRING_MAX_LEN, s.data(), n);
+        }
+
+        filespace = H5Dget_space(data_dset_str);
+        hsize_t current_data_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+        H5Dset_extent(data_dset_str, new_data_dims);
+
+        filespace = H5Dget_space(data_dset_str);
+        hsize_t data_offset[1] = {current_data_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+        memspace = H5Screate_simple(1, &n_new_data, NULL);
+
+        hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+        H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+        H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+        H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
+        H5Dwrite(data_dset_str, str_type_fixed, memspace, filespace, H5P_DEFAULT, flat.data());
+        H5Tclose(str_type_fixed);
+        disk_size_str = new_data_dims[0];
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    if (!data_buffer_c128.empty()) {
+        hsize_t n_new_data = data_buffer_c128.size();
+        filespace = H5Dget_space(data_dset_c128);
+        hsize_t current_data_dims[1];
+        H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+        H5Dset_extent(data_dset_c128, new_data_dims);
+
+        filespace = H5Dget_space(data_dset_c128);
+        hsize_t data_offset[1] = {current_data_dims[0]};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+        memspace = H5Screate_simple(1, &n_new_data, NULL);
+
+        hsize_t complex_dims[1] = {2};
+        hid_t complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, complex_dims);
+        H5Dwrite(data_dset_c128, complex_tid, memspace, filespace, H5P_DEFAULT, data_buffer_c128.data());
+        disk_size_c128 = new_data_dims[0];
+        H5Tclose(complex_tid);
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    // Per-step-scalar blocks (v5): three blocks, one per numeric type, appended with
+    // their own cursors like everything else the rows point at. Written as a loop-shaped
+    // helper rather than three copies because they differ only in type, and getting one
+    // of the three cursors wrong in a copy is exactly the bug that shape invites.
+    {
+        auto append_scalar_block = [&](hid_t dset, auto& buf, hsize_t& disk_size, hid_t mem_type) {
+            if (buf.empty() || dset < 0) return;
+            hsize_t n_new_data = buf.size();
+            filespace = H5Dget_space(dset);
+            hsize_t current_data_dims[1];
+            H5Sget_simple_extent_dims(filespace, current_data_dims, NULL);
+            H5Sclose(filespace);
+
+            hsize_t new_data_dims[1] = {current_data_dims[0] + n_new_data};
+            H5Dset_extent(dset, new_data_dims);
+
+            filespace = H5Dget_space(dset);
+            hsize_t data_offset[1] = {current_data_dims[0]};
+            H5Sselect_hyperslab(filespace, H5S_SELECT_SET, data_offset, NULL, &n_new_data, NULL);
+            memspace = H5Screate_simple(1, &n_new_data, NULL);
+            H5Dwrite(dset, mem_type, memspace, filespace, H5P_DEFAULT, buf.data());
+            disk_size = new_data_dims[0];
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+        };
+        append_scalar_block(data_dset_scalar_f64, data_buffer_scalar_f64, disk_size_scalar_f64, H5T_NATIVE_DOUBLE);
+        append_scalar_block(data_dset_scalar_i32, data_buffer_scalar_i32, disk_size_scalar_i32, H5T_NATIVE_INT);
+        hsize_t scalar_complex_dims[1] = {2};
+        hid_t scalar_complex_tid = H5Tarray_create2(H5T_IEEE_F64LE, 1, scalar_complex_dims);
+        append_scalar_block(data_dset_scalar_c128, data_buffer_scalar_c128, disk_size_scalar_c128, scalar_complex_tid);
+        H5Tclose(scalar_complex_tid);
+    }
+
+    // --- Flush v3 interned path table (payload, before the index commit) ---
+    flushPathTable();
+
+    // --- Flush Span Table (before index, after data payloads) ---
+    // Same SWMR safety order as the data buffers: span entries must be visible
+    // before the index rows that reference them.
+    flushListSpans();
+
+    // --- Flush Index Buffer (LAST — this is the commit marker) ---
+    // Written after every payload so a crash can only leave unindexed slack in
+    // data_raw_*, never an index row that points past the written data.
+    {
+        hsize_t n_new_rows = index_buffer.size() / index_cols;
+        hsize_t current_dims[2];
+        filespace = H5Dget_space(index_dset);
+        H5Sget_simple_extent_dims(filespace, current_dims, NULL);
+        H5Sclose(filespace);
+
+        hsize_t new_dims[2] = {current_dims[0] + n_new_rows, (hsize_t)index_cols};
+        H5Dset_extent(index_dset, new_dims);
+
+        filespace = H5Dget_space(index_dset);
+        hsize_t offset[2] = {current_dims[0], 0};
+        hsize_t slab_dims[2] = {n_new_rows, (hsize_t)index_cols};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, NULL, slab_dims, NULL);
+
+        hsize_t mem_dims[2] = {n_new_rows, (hsize_t)index_cols};
+        memspace = H5Screate_simple(2, mem_dims, NULL);
+        H5Dwrite(index_dset, H5T_NATIVE_UINT64, memspace, filespace, H5P_DEFAULT, index_buffer.data());
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    index_buffer.clear();
+    data_buffer_f64.clear();
+    data_buffer_i32.clear();
+    data_buffer_str.clear();
+    data_buffer_c128.clear();
+    data_buffer_time.clear();
+    data_buffer_scalar_f64.clear();
+    data_buffer_scalar_i32.clear();
+    data_buffer_scalar_c128.clear();
+    paths_buffer.clear();
+    parent_paths_buffer.clear();
+    leaves_cache_valid = false;
+
+    // SWMR commit barrier (batched). The H5Dwrite calls above only update HDF5's
+    // in-memory file image; they are NOT visible to another process yet. The global
+    // H5Fflush below is what makes "index row = commit point" hold across processes:
+    // a reader sees either the previous committed state or the complete new state,
+    // never a torn mix of index row + payload. It costs a push of the dirty file
+    // image, so it runs on every N-th flush (PANZER_FLUSH_EVERY; 1 = every flush)
+    // and again, unconditionally, on close().
+    swmr_flushes_since_barrier++;
+    if (swmr_flushes_since_barrier >= swmr_flush_every) {
+        swmr_flushes_since_barrier = 0;
+        if (file_id >= 0) {
+            H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+        }
+    }
+
+}
+
+// ── Span-table helpers ─────────────────────────────────────────────────────────
+
+// The span table is not optional once a list element needs more than one slot: the spans ARE
+// its element boundaries. So it is created on demand rather than only at a WRITE open, which
+// leaves an APPEND into a file written before the table existed with nowhere to put them.
+// Chunked is not a tuning choice here: an unlimited extent cannot be contiguous.
+void PanzerDB::ensureListSpansDataset() {
+    if (list_spans_dset >= 0) return;
+
+    hsize_t max[1]   = {H5S_UNLIMITED};
+    hsize_t init[1]  = {0};
+    hsize_t chunk[1] = {4096};   // 4096 u64 = 32 kB per chunk
+    hid_t sp  = H5Screate_simple(1, init, max);
+    hid_t pl  = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(pl, 1, chunk);
+    list_spans_dset = H5Dcreate2(file_id, "list_spans", H5T_STD_U64LE, sp,
+                                  H5P_DEFAULT, pl, H5P_DEFAULT);
+    H5Pclose(pl);
+    H5Sclose(sp);
+
+    if (list_spans_dset < 0)
+        throw ALBackendException("Cannot create the /list_spans dataset: a list element longer "
+                                 "than one slot cannot be stored without it.", LOG);
+}
+
+void PanzerDB::appendListSpan(uint64_t row_id, uint64_t element_idx,
+                               uint64_t slot_offset, uint64_t slot_span) {
+    // The producer of the buffer, and a write path that may report a failure -- unlike the
+    // flush, which can be reached from the destructor. A queued span therefore always has a
+    // table waiting for it.
+    ensureListSpansDataset();
+    list_spans_buffer.push_back(row_id);
+    list_spans_buffer.push_back(element_idx);
+    list_spans_buffer.push_back(slot_offset);
+    list_spans_buffer.push_back(slot_span);
+}
+
+void PanzerDB::flushListSpans() {
+    if (list_spans_buffer.empty()) return;
+    // Dropping them would be silent corruption, so it is not an option: they still have
+    // nowhere to go only if creating the table just failed, which is an error, not a no-op.
+    ensureListSpansDataset();
+
+    hsize_t n_new = list_spans_buffer.size();
+    hsize_t current_dims[1] = {0};
+    hid_t space = H5Dget_space(list_spans_dset);
+    H5Sget_simple_extent_dims(space, current_dims, nullptr);
+    H5Sclose(space);
+
+    hsize_t new_dims[1] = {current_dims[0] + n_new};
+    H5Dset_extent(list_spans_dset, new_dims);
+
+    space = H5Dget_space(list_spans_dset);
+    hsize_t offset[1] = {current_dims[0]};
+    H5Sselect_hyperslab(space, H5S_SELECT_SET, offset, nullptr, &n_new, nullptr);
+    hid_t memspace = H5Screate_simple(1, &n_new, nullptr);
+    H5Dwrite(list_spans_dset, H5T_NATIVE_UINT64, memspace, space, H5P_DEFAULT, list_spans_buffer.data());
+    H5Sclose(memspace);
+    H5Sclose(space);
+
+    list_spans_buffer.clear();
+}
+
+// ── v3 path-interning helpers ──────────────────────────────────────────────────
+
+uint32_t PanzerDB::intern_path(const std::string& full_path) {
+    auto it = path_id_map.find(full_path);
+    if (it != path_id_map.end()) return it->second;
+
+    if (next_path_id >= PANZER_NO_PATH_ROW_V3) {
+        throw ALBackendException("v3 path table id space (u32) exhausted.", LOG);
+    }
+    const uint32_t id = next_path_id++;
+    path_id_map.emplace(full_path, id);
+
+    size_t required = path_text_buffer.size() + PATH_MAX_LEN;
+    if (path_text_buffer.capacity() < required) {
+        size_t new_cap = std::max(required, path_text_buffer.capacity() * BUFFER_GROWTH_FACTOR);
+        path_text_buffer.reserve(new_cap);
+    }
+    const size_t cur = path_text_buffer.size();
+    path_text_buffer.resize(cur + PATH_MAX_LEN, 0);
+    strncpy(path_text_buffer.data() + cur, full_path.c_str(), PATH_MAX_LEN - 1);
+    return id;
+}
+
+void PanzerDB::flushPathTable() {
+    if (path_text_buffer.empty() || path_table_dset < 0) return;
+
+    const hsize_t n_new = path_text_buffer.size() / PATH_MAX_LEN;
+    hsize_t current_dims[1] = {0};
+    hid_t space = H5Dget_space(path_table_dset);
+    H5Sget_simple_extent_dims(space, current_dims, nullptr);
+    H5Sclose(space);
+
+    hsize_t new_dims[1] = {current_dims[0] + n_new};
+    H5Dset_extent(path_table_dset, new_dims);
+
+    space = H5Dget_space(path_table_dset);
+    hsize_t offset[1] = {current_dims[0]};
+    H5Sselect_hyperslab(space, H5S_SELECT_SET, offset, nullptr, &n_new, nullptr);
+    hid_t memspace = H5Screate_simple(1, &n_new, nullptr);
+
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, PATH_MAX_LEN);
+    H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+    H5Dwrite(path_table_dset, str_type, memspace, space, H5P_DEFAULT, path_text_buffer.data());
+    H5Tclose(str_type);
+    H5Sclose(memspace);
+    H5Sclose(space);
+
+    path_text_buffer.clear();
+}
+
+void PanzerDB::loadPathTable() {
+    path_id_map.clear();
+    next_path_id = 0;
+    if (path_table_dset < 0) return;
+
+    hsize_t dims[1] = {0};
+    hid_t space = H5Dget_space(path_table_dset);
+    if (space < 0) return;
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+
+    const uint64_t n = dims[0];
+    if (n == 0) return;
+
+    std::vector<char> raw(n * PATH_MAX_LEN, 0);
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, PATH_MAX_LEN);
+    H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+    herr_t ok = H5Dread(path_table_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data());
+    H5Tclose(str_type);
+    if (ok < 0) return;
+
+    path_id_map.reserve(static_cast<size_t>(n) * 2);
+    for (uint64_t i = 0; i < n; ++i) {
+        const char* slot = raw.data() + (size_t)i * PATH_MAX_LEN;
+        path_id_map.emplace(std::string(slot), static_cast<uint32_t>(i));
+    }
+    next_path_id = static_cast<uint32_t>(n);
+}
+
+void PanzerDB::loadListSpans() const {
+    if (list_spans_loaded) return;
+    list_spans_loaded = true;   // set early: safe against self-referential calls
+    if (list_spans_dset < 0) return;   // dataset absent → no span data
+
+    hsize_t dims[1] = {0};
+    hid_t space = H5Dget_space(list_spans_dset);
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+
+    hsize_t n = dims[0];
+    if (n == 0) return;
+
+    std::vector<uint64_t> raw(n);
+    H5Dread(list_spans_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data());
+
+    for (size_t i = 0; i + 3 < n; i += 4) {
+        cached_list_spans[raw[i]].push_back(
+            { raw[i + 1], raw[i + 2], raw[i + 3] });
+    }
+    // Ensure stable ordering by element_idx (writer writes them in order, but be safe)
+    for (auto& [rid, v] : cached_list_spans) {
+        std::sort(v.begin(), v.end(), [] (const SpanEntry& a, const SpanEntry& b) {
+            return a.element_idx < b.element_idx;
+        });
+    }
+}
+
+void PanzerDB::abandonOpenHandles() {
+    if (list_spans_dset >= 0) H5Dclose(list_spans_dset);
+    if (index_dset >= 0) H5Dclose(index_dset);
+    if (data_dset_f64 >= 0) H5Dclose(data_dset_f64);
+    if (data_dset_i32 >= 0) H5Dclose(data_dset_i32);
+    if (data_dset_str >= 0) H5Dclose(data_dset_str);
+    if (data_dset_c128 >= 0) H5Dclose(data_dset_c128);
+    if (data_dset_time >= 0) H5Dclose(data_dset_time);
+    if (data_dset_scalar_f64 >= 0) H5Dclose(data_dset_scalar_f64);
+    if (data_dset_scalar_i32 >= 0) H5Dclose(data_dset_scalar_i32);
+    if (data_dset_scalar_c128 >= 0) H5Dclose(data_dset_scalar_c128);
+    if (paths_dset >= 0) H5Dclose(paths_dset);
+    if (path_table_dset >= 0) H5Dclose(path_table_dset);
+    if (parent_paths_dset >= 0) H5Dclose(parent_paths_dset);
+    list_spans_dset = index_dset = data_dset_f64 = data_dset_i32 = -1;
+    data_dset_str = data_dset_c128 = data_dset_time = -1;
+    data_dset_scalar_f64 = data_dset_scalar_i32 = data_dset_scalar_c128 = -1;
+    paths_dset = path_table_dset = parent_paths_dset = -1;
+
+    if (should_close_loc_id) H5Gclose(file_id);
+    else if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
+    if (owned_file_id >= 0 && owned_file_id != file_id) H5Fclose(owned_file_id);
+    owned_file_id = file_id = -1;
+}
+
+void PanzerDB::close() {
+    if (file_id < 0) return;
+
+    flush();
+    // If barrier batching (PANZER_FLUSH_EVERY > 1) is in effect, flush() may have
+    // left a partial batch without its global barrier — force it now, before the
+    // handles and the file go away, so a cleanly closed file always commits its
+    // last slices.
+    if (swmr_flushes_since_barrier > 0) {
+        swmr_flushes_since_barrier = 0;
+        H5Fflush(file_id, H5F_SCOPE_GLOBAL);
+    }
+    // Park the decoded index before the handles go away: the next engine opened on
+    // this file resumes from it instead of re-reading the whole table. Uses the
+    // identity noted in init(), because the AL may have closed our group already.
+    handBackIndexHandoff();
+    if (list_spans_dset >= 0) H5Dclose(list_spans_dset);
+    if (index_dset >= 0) H5Dclose(index_dset);
+    if (data_dset_f64 >= 0) H5Dclose(data_dset_f64);
+    if (data_dset_i32 >= 0) H5Dclose(data_dset_i32);
+    if (data_dset_str >= 0) H5Dclose(data_dset_str);
+    if (data_dset_c128 >= 0) H5Dclose(data_dset_c128);
+    if (data_dset_time >= 0) H5Dclose(data_dset_time);
+    if (data_dset_scalar_f64 >= 0) H5Dclose(data_dset_scalar_f64);
+    if (data_dset_scalar_i32 >= 0) H5Dclose(data_dset_scalar_i32);
+    if (data_dset_scalar_c128 >= 0) H5Dclose(data_dset_scalar_c128);
+    if (paths_dset >= 0) H5Dclose(paths_dset);
+    if (path_table_dset >= 0) H5Dclose(path_table_dset);
+    if (parent_paths_dset >= 0) H5Dclose(parent_paths_dset);
+
+    if (should_close_loc_id) {
+        H5Gclose(file_id); // It is a group (init() descended into the one holding /index)
+    } else if (H5Iget_type(file_id) == H5I_FILE) {
+        H5Fclose(file_id); // It is a file
+    }
+    // The file this engine opened in its constructor: still open whenever init() went
+    // to work in a group inside it. Closing it is not cosmetic — a file left
+    // registered here is cleaned up by HDF5 at library termination, which crashes
+    // doing so (H5_term_library -> H5F_term_package -> H5I_clear_type ->
+    // H5VL_file_close -> H5I_find_id).
+    if (owned_file_id >= 0 && owned_file_id != file_id) H5Fclose(owned_file_id);
+    owned_file_id = -1;
+    file_id = -1;
+}
+
+// ============================================================================
+// INDEX HANDOFF — the parsed /index outlives the engine that read it
+//
+// Reading the tables dominates engine opening (171k rows on core_profiles:
+// ~100 ms, a third of it inflating /index and /paths). A SLICE_OP writer builds
+// one engine per time step, so that cost was paid once per step: quadratic in the
+// number of rows already written. The parsed state is therefore parked when the
+// engine closes and taken back by the next engine on the same file, which then
+// only reads the rows appended since (see getLeaves()).
+//
+// Reuse requires the parked state to still be the head of the on-disk table:
+// same file, same /index object (a recreated dataset has a new address), an
+// extent that did not shrink, and the same (offset, count) in its last row.
+// /index is append-only by construction, so those checks are what a rewrite —
+// the one thing that does break the assumption — has to fail.
+// ============================================================================
+
+PanzerDB::IndexHandoff& PanzerDB::indexHandoff() {
+    // Per thread: two threads each driving a write session must not park their
+    // state into each other's slot. One slot rather than a map on purpose: it
+    // holds the last file touched, so a session walking many IDS files replaces
+    // it instead of keeping one decoded table per file.
+    static thread_local IndexHandoff parked;
+    return parked;
+}
+
+// Returns true when the parked state covers every row the table has now, which is the
+// only case in which the caller may skip restoreTimeContext(): the per-root time
+// counters that function rebuilds are handed over with the rest of the state.
+bool PanzerDB::adoptIndexHandoff() {
+    if (!cached_leaves.empty() || index_rows_loaded > 0) return false;  // already loaded here
+    IndexHandoff& parked = indexHandoff();
+    if (!parked.valid || parked.rows == 0 || parked.generation == 0) return false;
+    if (parked.key != index_file_name) return false;
+    if (!panzer_same_object(index_dset, parked.index_token)) return false;  // /index recreated
+    const long long current_rows = panzer_index_rows(index_dset);
+    if (current_rows < parked.rows) return false;                            // table shrank
+    uint64_t off = 0, cnt = 0;
+    if (!panzer_index_row(index_dset, parked.rows - 1, off, cnt)) return false;
+    if (off != parked.last_offset || cnt != parked.last_count) return false;  // prefix rewritten
+
+    std::swap(cached_leaves, parked.leaves);
+    std::swap(cached_paths_blocks, parked.paths_blocks);
+    std::swap(cached_parent_paths_blocks, parked.parent_paths_blocks);
+    std::swap(leaf_lookup, parked.leaf_lookup);
+    std::swap(parent_lookup, parked.parent_lookup);
+    std::swap(metadata_by_schema, parked.metadata_by_schema);
+    std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
+    std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
+    std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    // READ only: an APPEND engine must rebuild these counters from the rows in the file,
+    // so that the file_time_base snapshot stays "what the file held", never what an
+    // earlier engine of this process wrote.
+    if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
+    std::swap(parked.whole_signals, whole_signals);
+    std::swap(parked.no_slice_paths, no_slice_at_any_index);
+    // Travels with paths_blocks just above: its views are substrings of those texts.
+    std::swap(dynamic_aos_tails, parked.aos_tails);
+    dynamic_tails_built = parked.tails_built;
+    leaf_cache_gen = parked.generation;
+    index_rows_loaded = parked.rows;
+    index_paths_loaded = parked.paths;
+    index_last_offset = parked.last_offset;
+    index_last_count = parked.last_count;
+    // The parked signals and the parked "no slice here" answers were both derived from
+    // exactly this index state, which the checks above just re-validated against the file.
+    whole_signals_gen = leaf_cache_gen;
+    whole_signals_rows = index_rows_loaded;
+    no_slice_gen = leaf_cache_gen;
+    no_slice_rows = index_rows_loaded;
+    dynamic_tails_gen = leaf_cache_gen;
+    dynamic_tails_rows = index_rows_loaded;
+    const bool covers_whole_table = (current_rows == parked.rows);
+    parked = IndexHandoff{};
+    return covers_whole_table;
+}
+
+void PanzerDB::handBackIndexHandoff() {
+    // Not gated on leaves_cache_valid: flush() invalidates the cache precisely because
+    // it appended rows, and what is parked is only the prefix that was decoded — the
+    // rows written after it are read by the next engine, not carried over.
+    if (index_rows_loaded == 0) return;
+    // The state is parked under the identity recorded in init(): by close() time the
+    // AL may already have closed the group this engine hangs on, and an engine can
+    // outlive its handles (the writer drops it when building the next one).
+    if (index_file_name.empty() || H5O_IS_TOKEN_UNDEF(index_token)) return;
+
+    IndexHandoff& parked = indexHandoff();
+    parked = IndexHandoff{};  // whatever another engine parked is replaced by this, newer, decode
+
+    std::swap(cached_leaves, parked.leaves);
+    std::swap(cached_paths_blocks, parked.paths_blocks);
+    std::swap(cached_parent_paths_blocks, parked.parent_paths_blocks);
+    std::swap(leaf_lookup, parked.leaf_lookup);
+    std::swap(parent_lookup, parked.parent_lookup);
+    std::swap(metadata_by_schema, parked.metadata_by_schema);
+    std::swap(max_time_at_dynamic_root, parked.max_time_at_dynamic_root);
+    std::swap(time_lookup_unsafe_paths, parked.time_lookup_unsafe_paths);
+    std::swap(cached_dynamic_aos_roots, parked.dynamic_aos_roots);
+    if (mode == OpenMode::READ) std::swap(aos_time_counters, parked.aos_time_counters);
+    std::swap(whole_signals, parked.whole_signals);
+    std::swap(no_slice_at_any_index, parked.no_slice_paths);
+    // The flag follows the map it describes: what this engine hands over keeps its
+    // "already built" answer, and the engine is left holding an empty map.
+    std::swap(dynamic_aos_tails, parked.aos_tails);
+    parked.tails_built = dynamic_tails_built;
+    dynamic_tails_built = false;
+    parked.key = index_file_name;
+    parked.index_token = index_token;
+    parked.rows = index_rows_loaded;
+    parked.paths = index_paths_loaded;
+    parked.last_offset = index_last_offset;
+    parked.last_count = index_last_count;
+    parked.generation = leaf_cache_gen;
+    parked.valid = true;
+
+    // The containers this engine held now belong to the parked state.
+    leaves_cache_valid = false;
+    index_rows_loaded = 0;
+    index_paths_loaded = 0;
+    index_last_offset = 0;
+    index_last_count = 0;
+    whole_signals_gen = 0;
+    whole_signals_rows = 0;
+    no_slice_gen = 0;
+    no_slice_rows = 0;
+}
+
+bool PanzerDB::reanchor(hid_t new_loc_id) {
+    // A read session and an APPEND write session both hang on a group the AL owns and
+    // closes at the end of every operation, while the engine and the dataset handles it
+    // opened outlive it. An engine that opened the file itself is not hanging on a
+    // borrowed group, and a WRITE engine still holds the tables it just created:
+    // neither is re-anchored.
+    if (mode != OpenMode::READ && mode != OpenMode::APPEND) return false;
+    if (owned_file_id >= 0) return false;
+    if (file_id < 0 || new_loc_id < 0 || index_dset < 0 || index_file_name.empty()) return false;
+    if (panzer_file_name(new_loc_id) != index_file_name) return false;
+
+    // What the table looks like NOW is asked through the caller's handle, never through
+    // ours: our handles belong to the file struct we opened them on, which a write in
+    // this process or in another one cannot update. Asking ourselves would answer with
+    // what we already believe and keep serving a table that has moved on.
+    hid_t fresh = H5Dopen2(new_loc_id, "index", H5P_DEFAULT);
+    if (fresh < 0) return false;
+    const bool same_index_object = panzer_same_object(fresh, index_token);
+    const uint64_t rows_now = panzer_index_rows(fresh);
+    H5Dclose(fresh);
+    if (!same_index_object) return false;                       // /index recreated
+    if (mode == OpenMode::APPEND) {
+        // Here WE are the one that grew the table, so "it did not grow" is the wrong
+        // question: it grew by exactly the rows this engine assigned ids for, and
+        // flush() wrote every one of them. Any other count means somebody else moved
+        // the table, and this engine's decoded state is then stale: rebuild.
+        if (rows_now != next_row_id) return false;
+        // The other thing restoreTimeContext() produces is the file_time_base snapshot
+        // the writer reads through hasFileData() to tell a FRESH signal from a
+        // CONTINUING one, and before this session ran it once per operation. At an
+        // operation boundary this engine's own counters ARE that snapshot — seeded from
+        // the file, then advanced by the rows it committed — so copying the map keeps
+        // those semantics without walking the leaf table a second time.
+        file_time_base = aos_time_counters;
+        // A rebuilt engine also started every operation with an empty AoS stack. A
+        // well-behaved operation unwound it (endArray() per beginArray()), so this is a
+        // no-op on the happy path; what it covers is the AL throwing in the middle of an
+        // AoS, which a rebuilt engine used to hide — a half-open stack would name the
+        // next operation's paths with the previous operation's prefix.
+        array_stack.clear();
+        current_path.clear();
+        path_prefix.clear();
+        dynamic_level.clear();
+        last_level_had_write = false;
+        invalidateDynamicAOSCache();
+    } else if (index_rows_loaded > 0 && rows_now != index_rows_loaded) {
+        if (rows_now < index_rows_loaded) return false;        // table shrank -> full rebuild (correct)
+        // READ + pure append (point 25): instead of refusing and forcing a full
+        // decode + ReadIndex rebuild over every row (the O(rows) x slices cost of a
+        // putSlice loop), read just the newly-appended tail into the existing
+        // leaf cache. The dataset handles this engine opened outlive the group the
+        // AL closes, so getLeaves() reaches them without reopening: it takes its
+        // own handoff branch (index_rows_loaded>0 < n_rows), appends
+        // [index_rows_loaded, n_rows) and bumps leaf_cache_gen. The persistent
+        // ReadIndex then extends with only the new leaves (ensure_current), and
+        // because we did not rebuild the engine, restoreTimeContext() is not
+        // re-run either. Guards: a shrink or a prefix that does not match the
+        // claimed loaded count falls back to a full rebuild (safe, unchanged).
+        if (cached_leaves.size() != index_rows_loaded) return false;
+        invalidateLeafCache();
+        (void)getLeaves();
+    }
+
+    if (should_close_loc_id && new_loc_id != file_id) {
+        // The group here is one this engine opened (init() descended into it), so it is
+        // ours to close. The AL case never reaches this: it owns its group and we only
+        // borrowed the id, which is why should_close_loc_id is false for it.
+        if (H5Iget_type(file_id) == H5I_FILE) H5Fclose(file_id);
+        else H5Gclose(file_id);
+    }
+    file_id = new_loc_id;
+    should_close_loc_id = false;  // the caller owns this id and closes it at end of operation
+    return true;
+}
+
+
+// DIRECT HYPERSLAB READ (no intermediate buffer)
+// ============================================================================
+
+template<typename T>
+int PanzerDB::readSliceDirect(const Leaf& leaf, 
+                               int64_t time_index,
+                               T* out_buffer) const {
+    
+    // Volume of one time slice (recomputed from leaf.shape: already in memory)
+    uint64_t slice_volume = 1;
+    for (size_t s : leaf.shape_span()) {
+        if (s > 0) slice_volume *= s;
+    }
+    if (slice_volume == 0) slice_volume = 1;
+
+    uint64_t local_step = time_index - leaf.time_index;
+    
+    // Determine the appropriate raw dataset and HDF5 type
+    hid_t dset_id = -1;
+    hid_t mem_type = -1;
+
+    DataType type = static_cast<DataType>(leaf.flags >> 4);
+    if (type == DataType::FLOAT64) {
+        dset_id = rawDatasetFor(DataType::FLOAT64, leaf.block);
+        mem_type = H5T_NATIVE_DOUBLE;
+    } else if (type == DataType::INT32) {
+        dset_id = rawDatasetFor(DataType::INT32, leaf.block);
+        mem_type = H5T_NATIVE_INT;
+    } else if (type == DataType::COMPLEX128) {
+        dset_id = rawDatasetFor(DataType::COMPLEX128, leaf.block);
+        hsize_t complex_dims[1] = {2};
+        mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, complex_dims);
+    } else {
+        return -1;
+    }
+    if (dset_id < 0) {
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        return -1;
+    }
+    
+    // KEY OPTIMIZATION: read the slice directly via a hyperslab
+    // Au lieu de lire tout le chunk puis copier
+    
+    hid_t file_space = H5Dget_space(dset_id);
+    
+    // Select exactly the desired slice
+    hsize_t offset[1] = {leaf.offset + local_step * slice_volume};
+    hsize_t count[1] = {slice_volume};
+    
+    H5Sselect_hyperslab(file_space, H5S_SELECT_SET, offset, NULL, count, NULL);
+    
+    // Create the output memory space
+    hid_t mem_space = H5Screate_simple(1, count, NULL);
+    
+    // Lecture DIRECTE dans le buffer de sortie (pas de copie!)
+    herr_t status = H5Dread(dset_id, mem_type, mem_space, file_space, 
+                            H5P_DEFAULT, out_buffer);
+    
+    H5Sclose(mem_space);
+    H5Sclose(file_space);
+    
+    if (type == DataType::COMPLEX128) {
+        H5Tclose(mem_type);
+    }
+    
+    return (status >= 0) ? 0 : -1;
+}
+
+// Instantiation explicite
+template int PanzerDB::readSliceDirect<double>(const Leaf&, int64_t, double*) const;
+template int PanzerDB::readSliceDirect<int32_t>(const Leaf&, int64_t, int32_t*) const;
+template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_t,
+                                                              std::complex<double>*) const;
+
+
+int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const {
+    if (leaves.empty()) return 0;
+
+    hid_t mem_type = -1;
+    size_t element_size = 0;
+    bool need_close_type = false;
+
+    switch (dtype) {
+        case DataType::FLOAT64:
+            mem_type = H5T_NATIVE_DOUBLE;
+            element_size = sizeof(double);
+            break;
+        case DataType::INT32:
+            mem_type = H5T_NATIVE_INT;
+            element_size = sizeof(int32_t);
+            break;
+        case DataType::COMPLEX128:
+            {
+                hsize_t dims[1] = {2};
+                mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, dims);
+                need_close_type = true;
+            }
+            element_size = sizeof(std::complex<double>);
+            break;
+        default:
+            return -1; // Not supported for union read (e.g. strings)
+    }
+
+    // A v4 file splits the raw store by block (payload / time base) and a v5 file
+    // adds the per-step-scalar block, so a leaf list may straddle up to three
+    // datasets. Bucket by block -- in practice one bucket -- and give every leaf
+    // its slot in the caller's order regardless.
+    // Sized by the width of the block field, not by the three blocks in use, so a
+    // row carrying a value this build never writes cannot index outside the array:
+    // rawDatasetFor() sends any unknown block to the payload block, which is also
+    // what the dangling-row guard in getLeaves() measured it against.
+    constexpr size_t bucket_count = (size_t)PANZER_V3_BLOCK_BITS + 1;   // 0..3
+    std::vector<size_t> slot(leaves.size());
+    std::vector<size_t> bucket[bucket_count];
+    size_t dst_elements = 0;
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        slot[i] = dst_elements;
+        dst_elements += leaves[i]->count;
+        bucket[leaves[i]->block].push_back(i);
+    }
+
+    char* const dst_base = static_cast<char*>(buffer);
+    for (size_t b = 0; b < bucket_count; ++b) {
+        const std::vector<size_t>& group = bucket[b];
+        if (group.empty()) continue;
+        hid_t dset_id = rawDatasetFor(dtype, (uint8_t)b);
+        if (dset_id < 0) {
+            if (need_close_type) H5Tclose(mem_type);
+            return -1;
+        }
+        // Single pass over the union range [lo, hi), in bounded windows, then
+        // scatter the result into `buffer` in the original leaf order (time
+        // order, as sorted by the caller).
+        //
+        // Replaces two previous strategies that both degraded on large dynamic
+        // signals ("reading a 10^5-slice file never returns" hang):
+        //   - Hyperslab-OR per disjoint block: O(blocks^2) via repeated
+        //     H5Sselect_hyperslab(OR) — each OR walks the growing selection.
+        //   - Sequential H5Dread per leaf (non-monotone fallback): O(n) separate
+        //     HDF5 round-trips.
+        // One contiguous read per window is O(range) — what a dynamic signal's
+        // data actually occupies — while keeping the scratch buffer bounded: a
+        // time base written before index v4 occupies 1..4 slots per 65536-slot
+        // chunk, so its union range can be 1000x its own byte count (measured:
+        // 8000 doubles over a 1.15 GiB range; to_improve.md point 24/30). The
+        // bytes read and the decompression work are unchanged by windowing;
+        // only the peak RSS is capped.
+        hsize_t lo = (hsize_t)(~0ULL);
+        hsize_t hi = 0;
+        hsize_t wanted = 0;
+        for (size_t i : group) {
+            lo = std::min(lo, (hsize_t)leaves[i]->offset);
+            hi = std::max(hi, (hsize_t)(leaves[i]->offset + leaves[i]->count));
+            wanted += (hsize_t)leaves[i]->count;
+        }
+        const hsize_t range = hi - lo;
+
+
+        if (wanted > 0 && range / wanted > 64 && !scatter_warning_issued) {
+            scatter_warning_issued = true;
+            char dset_name[128];
+            const ssize_t nlen = H5Iget_name(dset_id, dset_name, sizeof(dset_name));
+            std::cerr << "[PanzerDB] warning: reading " << range << " elements of "
+                      << (nlen > 0 ? dset_name : "a raw data block") << " to recover " << wanted
+                      << " (" << (range / wanted) << "x): these index rows are scattered"
+                      " across the block. A time base (index v4) and a per-step scalar"
+                      " (index v5) each get their own block in files written by this"
+                      " build; this file predates that."
+                      " (first occurrence for this file)" << std::endl;
+        }
+
+        const hsize_t window = std::max<hsize_t>(1, (hsize_t)(32u << 20) / (hsize_t)element_size);
+        std::vector<char> tmp((size_t)std::min(range, window) * element_size);
+        // Walk the group in offset order so each window touches only the leaves
+        // that overlap it (a leaf may straddle a window edge: it is copied in two
+        // pieces, once per window).
+        std::vector<size_t> walk = group;
+        std::sort(walk.begin(), walk.end(), [&](size_t x, size_t y) {
+            return leaves[x]->offset < leaves[y]->offset;
+        });
+        size_t walk_pos = 0;
+
+        hid_t file_space = H5Dget_space(dset_id);
+        if (file_space < 0) {
+            if (need_close_type) H5Tclose(mem_type);
+            return -1;
+        }
+        for (hsize_t wlo = lo; wlo < hi; wlo += window) {
+            const hsize_t whi = std::min(wlo + window, hi);
+            const hsize_t wcnt = whi - wlo;
+            hsize_t off = wlo, sel = wcnt;
+            if (H5Sselect_hyperslab(file_space, H5S_SELECT_SET, &off, NULL, &sel, NULL) < 0) {
+                H5Sclose(file_space);
+                if (need_close_type) H5Tclose(mem_type);
+                return -1;
+            }
+            hsize_t mdims[1] = { wcnt };
+            hid_t mem_space = H5Screate_simple(1, mdims, NULL);
+            herr_t status = H5Dread(dset_id, mem_type, mem_space, file_space, H5P_DEFAULT, tmp.data());
+            H5Sclose(mem_space);
+            if (status < 0) {
+                H5Sclose(file_space);
+                if (need_close_type) H5Tclose(mem_type);
+                return -1;
+            }
+            while (walk_pos < walk.size() &&
+                   leaves[walk[walk_pos]]->offset + leaves[walk[walk_pos]]->count <= wlo) ++walk_pos;
+            for (size_t k = walk_pos; k < walk.size(); ++k) {
+                const Leaf* leaf = leaves[walk[k]];
+                const hsize_t l_lo = (hsize_t)leaf->offset;
+                if (l_lo >= whi) break;
+                const hsize_t l_hi = l_lo + (hsize_t)leaf->count;
+                const hsize_t a = std::max(l_lo, wlo), c = std::min(l_hi, whi);
+                if (a >= c) continue;
+                memcpy(dst_base + (slot[walk[k]] + (size_t)(a - l_lo)) * element_size,
+                       tmp.data() + (size_t)(a - wlo) * element_size,
+                       (size_t)(c - a) * element_size);
+            }
+        }
+        H5Sclose(file_space);
+    }
+    if (need_close_type) H5Tclose(mem_type);
+    return 0;
+}
+
+void PanzerDB::beginArray(const std::string& name, size_t size) {
+    ArrayLevel level;
+    level.name = name;
+    level.saved_path_prefix = path_prefix;
+    level.declared_size = size;
+    
+    beginArray(level);
+
+    invalidateDynamicAOSCache();
+}
+
+void PanzerDB::beginArray(const std::string& name, const std::string& timebase) {
+    ArrayLevel level;
+    level.name = name;
+    level.saved_path_prefix = path_prefix;
+    level.timebase = timebase;
+    level.is_dynamic = !timebase.empty();
+    
+    // Calculate path of this AOS
+    std::string new_aos_path = path_prefix;
+    if (!array_stack.empty()) {
+        if (!new_aos_path.empty()) new_aos_path += "/";
+        new_aos_path += std::to_string(array_stack.back().current_index);
+    }
+    if (!new_aos_path.empty()) new_aos_path += "/";
+    new_aos_path += name;
+    
+    if (level.is_dynamic) {
+        // ✅ Only one dynamic AOS allowed
+        if (!dynamic_level.empty()) {
+            throw std::runtime_error("Only one dynamic AOS allowed in hierarchy");
+        }
+        dynamic_level = name;
+        
+        // ✅ Initialize time counter for this AOS
+        if (aos_time_counters.find(new_aos_path) == aos_time_counters.end()) {
+            aos_time_counters[new_aos_path] = 0;
+        }
+        
+        level.aos_full_path = new_aos_path;
+
+        // FIX: In APPEND mode, set index to end of array
+        if (mode == OpenMode::APPEND) {
+            level.current_index = aos_time_counters[new_aos_path];
+        }
+    }
+    
+    beginArray(level);
+    // Cache invalidation: the dynamic-AoS set can change (e.g. opening a dynamic
+    // AoS after a root time write). The static-path beginArray already does this;
+    // the dynamic path must as well, otherwise a stale cache (empty dyn path from
+    // an earlier root write) poisons every subsequent in-AoS signal write and
+    // misroutes it to CASE 2. Mirrors the static-path beginArray (line ~1263).
+    invalidateDynamicAOSCache();
+}
+
+void PanzerDB::beginArray(ArrayLevel& level) {
+    const auto& name = level.name;
+    if (level.is_dynamic) {
+        if (!dynamic_level.empty() && dynamic_level != name) throw std::runtime_error("Only one dynamic level allowed");
+        dynamic_level = name;
+    }
+
+    std::string parent_path = path_prefix;
+    std::string new_node_path = path_prefix;
+    // CORRECTION: If inside an AoS, the new AoS path must include
+    // the parent AoS instance index.
+    if (!array_stack.empty()) {
+        if (!new_node_path.empty()) new_node_path += "/";
+        new_node_path += std::to_string(array_stack.back().current_index);
+    }
+
+    if (!new_node_path.empty()) new_node_path += "/";
+    new_node_path += name;
+
+    // ✅ Check if AoS meta-node already exists to avoid duplicates in Index Table
+    bool already_exists = false;
+    if (mode == OpenMode::APPEND || mode == OpenMode::READ) {
+         // OPTIMIZATION: Use leaf_lookup instead of linear scan
+         getLeaves(); // Ensure cache is built
+         auto it = leaf_lookup.find(new_node_path);
+         if (it != leaf_lookup.end()) already_exists = true;
+    }
+
+    // Anchor this meta-node to the enclosing AoS (if any) so its children can
+    // record a numeric parent_id instead of a duplicated parent text.
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
+    if (!already_exists) {
+        uint64_t aos_flags = level.is_dynamic ? 3 : 2; // 3 for dynamic AoS, 2 for static AoS
+        level.container_row_id = append_index_row(
+            new_node_path, parent_path, {(uint64_t)level.declared_size}, 0, 0, 0, 0, aos_flags,
+            parent_row, inst);
+    } else {
+        // APPEND/READ dedup: reuse the existing meta-node's row id as the anchor for
+        // the children about to be appended.  In parent-first order the leaf index is
+        // the stable row id.
+        if (auto it = leaf_lookup.find(new_node_path); it != leaf_lookup.end() && !it->second.empty()) {
+            level.container_row_id = it->second.front();
+        }
+    }
+
+    path_prefix = new_node_path;
+    current_path.push_back(name);
+    array_stack.push_back(level);
+}
+
+const std::vector<PanzerDB::Leaf>& PanzerDB::getLeaves() const { // NOLINT(readability-const-return-type)
+    if (leaves_cache_valid) return cached_leaves;
+
+    // Cache is invalid, rebuild it directly in class member.
+    // The generation is bumped HERE (not at invalidation): this is the exact point
+    // where the Leaf objects and the path text blocks die, so every consumer holding
+    // Leaf*/string_view into them sees the change and rebuilds its own caches first.
+    auto drop_decoded_index = [&] {
+        ++leaf_cache_gen;
+        cached_leaves.clear();
+        leaf_lookup.clear();
+        time_lookup_unsafe_paths.clear();
+        parent_lookup.clear();
+        metadata_by_schema.clear();
+        max_time_at_dynamic_root.clear();
+        cached_dynamic_aos_roots.clear();
+        cached_paths_blocks.clear();
+        cached_parent_paths_blocks.clear();
+        // Its keys are substrings of the path texts above, so they die with them: the
+        // map has to go too, not merely be treated as stale.
+        dynamic_aos_tails.clear();
+        dynamic_tails_built = false;
+        // index_rows_loaded > 0 means "the containers above hold that many decoded
+        // rows" — the handoff relies on it, so dropping the decode drops the counter.
+        index_rows_loaded = 0;
+        index_paths_loaded = 0;
+        index_last_offset = 0;
+        index_last_count = 0;
+    };
+
+    // 1. Read size of /index
+    hsize_t dims[2];
+    hid_t space = H5Dget_space(index_dset);
+    if (space < 0) {
+        drop_decoded_index();
+        leaves_cache_valid = true; // Le cache est maintenant valide (mais vide).
+        return cached_leaves;
+    }
+    H5Sget_simple_extent_dims(space, dims, nullptr);
+    H5Sclose(space);
+    uint64_t n_rows = dims[0];
+
+    // Column count actually used by the file: 12 for current files, 14 for legacy
+    // ones (which carry the never-read "type" + "index_value" columns).
+    const uint64_t ncols = (dims[1] > 0) ? dims[1] : PANZER_INDEX_COLUMNS;
+    const bool legacy_layout = (ncols != PANZER_INDEX_COLUMNS);
+    const unsigned ndim_c   = legacy_layout ? 1  : 0;
+    const unsigned shape_c  = legacy_layout ? 2  : 1;
+    const unsigned time_c   = legacy_layout ? 8  : 7;
+    const unsigned off_c    = legacy_layout ? 9  : 8;
+    const unsigned cnt_c    = legacy_layout ? 10 : 9;
+    const unsigned flags_c  = legacy_layout ? 11 : 10;
+    const unsigned parent_c = legacy_layout ? 12 : 11;
+
+    // /index and /paths only ever grow, so when this engine took over the decode
+    // parked by the engine that last read this file (adoptIndexHandoff), what is
+    // already decoded is a valid prefix of the table: read only the rows appended
+    // since. That is what turns a writer doing one SLICE_OP per time step from
+    // quadratic back into linear, and it saves a SWMR reader a full re-decode.
+    const bool handoff = (index_rows_loaded > 0 && index_rows_loaded <= n_rows);
+    if (handoff && index_rows_loaded == n_rows) {
+        leaves_cache_valid = true;  // nothing was appended since the handoff
+        return cached_leaves;
+    }
+    const uint64_t start_row = handoff ? index_rows_loaded : 0;
+    if (start_row == 0) drop_decoded_index();
+    else ++leaf_cache_gen;  // cached_leaves grows, so its buffer may move
+
+    if (n_rows == 0) {
+        max_time_at_dynamic_root.clear();
+        leaves_cache_valid = true; // Cache is now valid (but empty).
+        return cached_leaves;
+    }
+
+    const uint64_t read_count = n_rows - start_row;
+
+    // ------------------------------------------------------------------
+    // v3/v4 branch: 7 packed u64 columns + interned path texts in /path_table.
+    // v4 adds the block selector (Leaf::block); the packing is otherwise identical.
+    // ------------------------------------------------------------------
+    if (index_version >= PANZER_INDEX_VERSION_V3 && ncols == PANZER_INDEX_COLUMNS_V3) {
+        uint64_t n_paths = 0;
+        if (path_table_dset >= 0) {
+            hid_t pt_space = H5Dget_space(path_table_dset);
+            hsize_t pt_dims[1] = {0};
+            H5Sget_simple_extent_dims(pt_space, pt_dims, nullptr);
+            H5Sclose(pt_space);
+            n_paths = pt_dims[0];
+        }
+
+        // Path ids are handed out in increasing order, so the text of a path
+        // interned by an earlier engine sits in a block pushed by an earlier
+        // reload; only the ids from path_base on are read now.
+        const uint64_t path_base = start_row > 0 ? index_paths_loaded : 0;
+        const uint64_t new_paths = n_paths > path_base ? n_paths - path_base : 0;
+
+        // Append the block only when there are actually new paths to read.
+        // getLeaves() is called with a fresh engine every slice (putSlice loop),
+        // and the AL pools engines, so a zero-length block emplaced on each call
+        // (new_paths == 0) would accumulate one per slice, growing /path_table's
+        // view to O(n) and making per-leaf path_slot lookup O(n) as well.
+        if (new_paths > 0) {
+            cached_paths_blocks.emplace_back((size_t)new_paths * PATH_MAX_LEN);
+            std::vector<char>& pt_data = cached_paths_blocks.back();
+            hid_t str_type = H5Tcopy(H5T_C_S1);
+            H5Tset_size(str_type, PATH_MAX_LEN);
+            H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+            if (path_base > 0) {
+                const hsize_t pstart[1] = {path_base};
+                const hsize_t pblock[1] = {new_paths};
+                hid_t pt_space = H5Dget_space(path_table_dset);
+                H5Sselect_hyperslab(pt_space, H5S_SELECT_SET, pstart, nullptr, pblock, nullptr);
+                hid_t pt_mem = H5Screate_simple(1, pblock, nullptr);
+                H5Dread(path_table_dset, str_type, pt_mem, pt_space, H5P_DEFAULT, pt_data.data());
+                H5Sclose(pt_mem);
+                H5Sclose(pt_space);
+            } else {
+                H5Dread(path_table_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, pt_data.data());
+            }
+            H5Tclose(str_type);
+        }
+
+        std::vector<uint64_t> idx(read_count * PANZER_INDEX_COLUMNS_V3);
+        if (start_row > 0) {
+            const hsize_t istart[2] = {start_row, 0};
+            const hsize_t iblock[2] = {read_count, PANZER_INDEX_COLUMNS_V3};
+            hid_t idx_space = H5Dget_space(index_dset);
+            H5Sselect_hyperslab(idx_space, H5S_SELECT_SET, istart, nullptr, iblock, nullptr);
+            hid_t idx_mem = H5Screate_simple(2, iblock, nullptr);
+            H5Dread(index_dset, H5T_NATIVE_UINT64, idx_mem, idx_space, H5P_DEFAULT, idx.data());
+            H5Sclose(idx_mem);
+            H5Sclose(idx_space);
+        } else {
+            H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+        }
+
+        // First id covered by each text block, in order; ids are contiguous and
+        // increasing, so the newest blocks are scanned first.
+        std::vector<std::pair<uint64_t, const char*>> path_slots;
+        path_slots.reserve(cached_paths_blocks.size());
+        uint64_t slot_first = 0;
+        for (const std::vector<char>& block: cached_paths_blocks) {
+            path_slots.emplace_back(slot_first, block.data());
+            slot_first += block.size() / PATH_MAX_LEN;
+        }
+        auto path_slot = [&](uint64_t path_id) -> const char* {
+            for (size_t b = path_slots.size(); b-- > 0;) {
+                if (path_id >= path_slots[b].first)
+                    return path_slots[b].second + (size_t)(path_id - path_slots[b].first) * PATH_MAX_LEN;
+            }
+            return nullptr;
+        };
+
+        const uint64_t ext_f64  = rawExtentFor(data_dset_f64);
+        const uint64_t ext_i32  = rawExtentFor(data_dset_i32);
+        const uint64_t ext_c128 = rawExtentFor(data_dset_c128);
+        const uint64_t ext_str  = rawExtentFor(data_dset_str);
+        const uint64_t ext_time = rawExtentFor(data_dset_time);
+        const uint64_t ext_scalar_f64  = rawExtentFor(data_dset_scalar_f64);
+        const uint64_t ext_scalar_i32  = rawExtentFor(data_dset_scalar_i32);
+        const uint64_t ext_scalar_c128 = rawExtentFor(data_dset_scalar_c128);
+
+        // Reserve with headroom (grow geometrically, floor 16): a tail-append loop
+        // (putSlice, point 25) otherwise reserves to exactly n_rows each step, which
+        // reallocates every append and dangles the ReadIndex's const Leaf*, forcing a
+        // full index rebuild per slice. Doubling keeps the buffer base stable across
+        // appends so the index can extend in place (ReadIndex::extend_indexes).
+        if (cached_leaves.capacity() < n_rows) {
+            size_t want = cached_leaves.capacity() ? cached_leaves.capacity() * 2 : size_t(16);
+            if (want < static_cast<size_t>(n_rows)) want = static_cast<size_t>(n_rows);
+            cached_leaves.reserve(want);
+        }
+
+        for (uint64_t i = start_row; i < n_rows; ++i) {
+            const uint64_t* row = &idx[(i - start_row) * PANZER_INDEX_COLUMNS_V3];
+            const uint64_t offset = row[0];
+            const uint64_t count  = row[1];
+            const uint32_t path_id   = (uint32_t)(row[2] & 0xFFFFFFFFULL);
+            const uint32_t parent32  = (uint32_t)(row[2] >> 32);
+            const uint64_t time_idx  = row[3] & 0xFFFFFFFFULL;
+            const uint64_t sflags    = row[3] >> 32;             // kind|dtype|ndim<<8|block<<12
+            const uint64_t flags     = sflags & 0xFFULL;          // public flags (kind + dtype)
+            const unsigned ndim      = (unsigned)((sflags >> PANZER_V3_NDIM_SHIFT) & 0xFULL);
+            const uint8_t  block     = (uint8_t)((sflags >> PANZER_V3_BLOCK_SHIFT) & PANZER_V3_BLOCK_BITS);
+            const uint64_t leaf_kind = flags & 0xFULL;
+
+            // Dangling-row guardrail (same contract as the v2 path), against the
+            // block this row actually addresses.
+            if (leaf_kind == 0) {
+                const DataType dtype = static_cast<DataType>(flags >> 4);
+                const uint64_t extent = block == RAW_BLOCK_TIME ? ext_time
+                                      : block == RAW_BLOCK_SCALAR ? (dtype == DataType::FLOAT64   ? ext_scalar_f64
+                                                                  : dtype == DataType::INT32      ? ext_scalar_i32
+                                                                  : dtype == DataType::COMPLEX128 ? ext_scalar_c128
+                                                                  : ext_str)
+                                      : (dtype == DataType::FLOAT64   ? ext_f64
+                                     : dtype == DataType::INT32      ? ext_i32
+                                     : dtype == DataType::COMPLEX128 ? ext_c128
+                                     : ext_str);
+                if (offset + count > extent) continue;
+            }
+            if (path_id >= n_paths) continue;   // corrupt: no text for that id
+
+            const char* slot = path_slot(path_id);
+            if (!slot) continue;   // corrupt: id outside every text block
+
+            cached_leaves.emplace_back();
+            Leaf& leaf = cached_leaves.back();
+
+            leaf.path = std::string_view(slot);
+
+            // M1 rule on the path text: parent = full path minus 1 segment (data)
+            // or 2 segments (AoS meta). Zero-copy prefix view into the same slot.
+            if (parent32 == PANZER_NO_PARENT_ROW_V3) {
+                leaf.parent_path = std::string_view();
+            } else {
+                const size_t full_len = leaf.path.size();
+                const size_t n_strip = (leaf_kind == 2 || leaf_kind == 3) ? 2 : 1;
+                size_t end = full_len;
+                for (size_t k = 0; k < n_strip && end > 0; ++k) {
+                    const size_t slash = leaf.path.rfind('/', end - 1);
+                    end = (slash == std::string_view::npos) ? 0 : slash;
+                }
+                leaf.parent_path = leaf.path.substr(0, end);
+            }
+
+            leaf.time_index = time_idx;
+            leaf.offset     = offset;
+            leaf.count      = count;
+            leaf.flags      = flags;
+            leaf.block      = block;
+            leaf.is_empty   = (flags == 1);
+            leaf.row_id     = i;
+
+            leaf.ndim = (uint8_t)(ndim > 6 ? 6 : ndim);
+            for (unsigned d = 0; d < ndim && d < 6; ++d) {
+                leaf.shape[d] = (row[4 + d / 2] >> ((d % 2) * 32)) & 0xFFFFFFFFULL;
+            }
+
+            auto& path_rows = leaf_lookup[leaf.path];
+            if (!path_rows.empty())
+                note_row_order(leaf.path, cached_leaves[path_rows.back()], leaf, time_lookup_unsafe_paths);
+            path_rows.push_back(cached_leaves.size() - 1);
+            parent_lookup[leaf.parent_path].push_back(cached_leaves.size() - 1);
+
+            const auto at_pos = leaf.path.find('@');
+            if (at_pos != std::string_view::npos && !leaf.is_empty) {
+                metadata_by_schema[leaf.path.substr(0, at_pos)].push_back(cached_leaves.size() - 1);
+            }
+
+            if (leaf.flags == 3) {
+                cached_dynamic_aos_roots.emplace_back(leaf.path);
+            }
+        }
+
+        // What a later engine may resume from: the prefix now decoded, plus the
+        // last row read from disk (skipped or not) as its signature.
+        const uint64_t* tail = &idx[(read_count - 1) * PANZER_INDEX_COLUMNS_V3];
+        index_rows_loaded = n_rows;
+        index_paths_loaded = n_paths;
+        index_last_offset = tail[0];
+        index_last_count = tail[1];
+
+        rebuildDynamicRootTimeIndex();
+        leaves_cache_valid = true;
+        return cached_leaves;
+    }
+    // ------------------------------------------------------------------
+    // v2 / legacy branch (12 or 14 u64 columns + row-aligned /paths).
+    // ------------------------------------------------------------------
+
+    // 2. Read the index rows and paths added since the prefix already decoded
+    std::vector<uint64_t> idx(read_count * ncols);
+    if (start_row > 0) {
+        const hsize_t istart[2] = {start_row, 0};
+        const hsize_t iblock[2] = {read_count, ncols};
+        hid_t idx_space = H5Dget_space(index_dset);
+        H5Sselect_hyperslab(idx_space, H5S_SELECT_SET, istart, nullptr, iblock, nullptr);
+        hid_t idx_mem = H5Screate_simple(2, iblock, nullptr);
+        H5Dread(index_dset, H5T_NATIVE_UINT64, idx_mem, idx_space, H5P_DEFAULT, idx.data());
+        H5Sclose(idx_mem);
+        H5Sclose(idx_space);
+    } else {
+        H5Dread(index_dset, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, idx.data());
+    }
+
+    // /paths is row-aligned with /index, so its tail block covers exactly these rows.
+    cached_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
+    cached_parent_paths_blocks.emplace_back(read_count * PATH_MAX_LEN);
+    std::vector<char>& paths_data = cached_paths_blocks.back();
+    std::vector<char>& parent_paths_data = cached_parent_paths_blocks.back();
+
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, PATH_MAX_LEN);
+    H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+    if (paths_dset >= 0) {
+        hid_t paths_space = H5Dget_space(paths_dset);
+        hsize_t paths_dims[1];
+        H5Sget_simple_extent_dims(paths_space, paths_dims, nullptr);
+
+        if (paths_dims[0] >= n_rows) { // Ensure data exists
+            if (start_row > 0) {
+                const hsize_t pstart[1] = {start_row};
+                const hsize_t pblock[1] = {read_count};
+                H5Sselect_hyperslab(paths_space, H5S_SELECT_SET, pstart, nullptr, pblock, nullptr);
+                hid_t paths_mem = H5Screate_simple(1, pblock, nullptr);
+                H5Dread(paths_dset, str_type, paths_mem, paths_space, H5P_DEFAULT, paths_data.data());
+                H5Sclose(paths_mem);
+            } else {
+                H5Dread(paths_dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, paths_data.data());
+            }
+        }
+        H5Sclose(paths_space);
+    }
+    H5Tclose(str_type);
+    // M1: /parent_paths is no longer read.  parent_paths_data (already allocated and
+    // zero-initialised above) simply backs the reconstructed parent paths, which the
+    // loop below fills from each row's (parent_id, kind, full path).
+
+    // 3. Iterate over each row and build Leaf objects
+    // Reserve with headroom (grow geometrically, point 25) so a tail-append loop
+    // does not reallocate every step and dangle the ReadIndex's const Leaf*.
+    if (cached_leaves.capacity() < n_rows) {
+        size_t want = cached_leaves.capacity() ? cached_leaves.capacity() * 2 : size_t(16);
+        if (want < static_cast<size_t>(n_rows)) want = static_cast<size_t>(n_rows);
+        cached_leaves.reserve(want);
+    }
+
+    // M1: reconstruct each row's parent_path without a /parent_paths dataset.  The
+    // writer builds a DATA leaf's full path as  parent_path + "/" + name  and an AoS
+    // META row's full path as  parent_path + "/" + instance + "/" + name,  storing
+    // parent_path = path_prefix respectively.  So the stored parent_path is exactly:
+    //   - ""                         for a root row          (parent_id == NO_PARENT)
+    //   - full_path minus  1 segment (last name)             for a data leaf (kind 0/1)
+    //   - full_path minus  2 segments (instance + name)      for an AoS meta (kind 2/3)
+    auto parent_path_of = [&](uint64_t i) -> std::string {
+        const uint64_t* row = &idx[(i - start_row) * ncols];
+        if (row[parent_c] == PANZER_NO_PARENT_ROW) return std::string();
+        const uint64_t leaf_kind = row[flags_c] & 0xFULL;
+        const std::string full(static_cast<const char*>(paths_data.data() + (i - start_row) * PATH_MAX_LEN));
+        const size_t n_strip = (leaf_kind == 2 || leaf_kind == 3) ? 2 : 1;
+        size_t end = full.size();
+        for (size_t k = 0; k < n_strip && end > 0; ++k) {
+            const size_t slash = full.rfind('/', end - 1);
+            end = (slash == std::string::npos) ? 0 : slash;
+        }
+        return full.substr(0, end);
+    };
+
+    // --- Crash-safe guardrail: snapshot data_raw_* extents -----------------
+    // Materialised on-disk extents of the four data_raw_* datasets at the
+    // moment of this read. A DATA row whose (offset + count) exceeds its
+    // dataset's extent is dangling (the old index-first ordering could produce
+    // one if a crash interrupted flush()); we skip it rather than serving a
+    // corrupt read.
+    auto dset_extent = [](hid_t dset_id) -> uint64_t {
+        if (dset_id < 0) return 0;
+        hid_t space = H5Dget_space(dset_id);
+        if (space < 0) return 0;
+        hsize_t ext[1] = {0};
+        H5Sget_simple_extent_dims(space, ext, nullptr);
+        H5Sclose(space);
+        return ext[0];
+    };
+    const uint64_t ext_f64  = dset_extent(data_dset_f64);
+    const uint64_t ext_i32  = dset_extent(data_dset_i32);
+    const uint64_t ext_c128 = dset_extent(data_dset_c128);
+    const uint64_t ext_str  = dset_extent(data_dset_str);
+    // -----------------------------------------------------------------------
+
+    for (uint64_t i = start_row; i < n_rows; ++i) {
+        const uint64_t* row = &idx[(i - start_row) * ncols];
+
+        // --- Crash-safe guardrail (per row, before emplace) -----------------
+        // A DATA row (kind 0) whose payload extends past the materialised
+        // data_raw_* extent is dangling: only a torn pre-change crash could
+        // produce it. Skip it. AoS meta rows (kind 2/3) and empty-data rows
+        // (is_empty) are not backed by data_raw_*, so the check only applies
+        // to kind 0 data.
+        {
+            const uint64_t leaf_kind = row[flags_c] & 0xFULL;
+            if (leaf_kind == 0) {
+                const DataType dtype = static_cast<DataType>(row[flags_c] >> 4);
+                uint64_t extent = 0;
+                if      (dtype == DataType::FLOAT64)      extent = ext_f64;
+                else if (dtype == DataType::INT32)        extent = ext_i32;
+                else if (dtype == DataType::COMPLEX128)   extent = ext_c128;
+                else if (dtype == DataType::STRING)       extent = ext_str;
+                else if (dtype == DataType::STRING_CHUNKED) extent = ext_str; // same column, k slots
+                if (row[off_c] + row[cnt_c] > extent) continue;   // dangling → skip
+            }
+        }
+        // -------------------------------------------------------------------
+
+        // OPTIMIZATION: build in place to avoid copying 'leaf' and its 'shape' vector
+        cached_leaves.emplace_back();
+        Leaf& leaf = cached_leaves.back();
+
+        const size_t slot = (size_t)(i - start_row) * PATH_MAX_LEN;
+        leaf.path         = std::string_view(paths_data.data() + slot);
+
+        // Materialise the reconstructed parent path into the persistent backing
+        // buffer so the std::string_view stays valid for the life of the leaf cache.
+        const std::string recon_parent = parent_path_of(i);
+        char* pp_slot = parent_paths_data.data() + slot;
+        const size_t copy_len = std::min(recon_parent.size(), (size_t)(PATH_MAX_LEN - 1));
+        std::memcpy(pp_slot, recon_parent.data(), copy_len);
+        pp_slot[copy_len] = '\0';
+        leaf.parent_path  = std::string_view(pp_slot);
+
+        leaf.time_index   = row[time_c];
+        leaf.offset       = row[off_c];
+        leaf.count        = row[cnt_c];
+        leaf.flags        = row[flags_c];
+        leaf.block        = RAW_BLOCK_TYPE;   // a pre-v4 index has no time-base block
+        leaf.is_empty     = (row[flags_c] == 1);
+        leaf.row_id       = (uint64_t)i;   // absolute position in /index, used for span-table lookup
+
+        // Shape
+        uint64_t ndim = row[ndim_c];
+        leaf.ndim = (uint8_t)(ndim > 6 ? 6 : ndim);
+        for (uint64_t d = 0; d < ndim && d < 6; ++d) leaf.shape[d] = row[shape_c + d];
+        
+        // Populate lookups
+        auto& path_rows = leaf_lookup[leaf.path];
+        if (!path_rows.empty())
+            note_row_order(leaf.path, cached_leaves[path_rows.back()], leaf, time_lookup_unsafe_paths);
+        path_rows.push_back(cached_leaves.size() - 1);
+        parent_lookup[leaf.parent_path].push_back(cached_leaves.size() - 1);
+
+        // Metadata rows are "@key" leaves: index them by their schema path (the
+        // text before '@') so readMetadata() is a hash lookup, not an O(N) scan.
+        const auto at_pos = leaf.path.find('@');
+        if (at_pos != std::string_view::npos && !leaf.is_empty) {
+            metadata_by_schema[leaf.path.substr(0, at_pos)].push_back(cached_leaves.size() - 1);
+        }
+        
+        if (leaf.flags == 3) {
+            cached_dynamic_aos_roots.emplace_back(leaf.path);
+        }
+    }
+
+    // What a later engine may resume from: the prefix now decoded — /paths being
+    // row-aligned, its extent is the row count — plus the last disk row (skipped
+    // or not) as the signature of that prefix.
+    const uint64_t* tail = &idx[(read_count - 1) * ncols];
+    index_rows_loaded = n_rows;
+    index_paths_loaded = n_rows;
+    index_last_offset = tail[off_c];
+    index_last_count = tail[cnt_c];
+
+    rebuildDynamicRootTimeIndex();
+    leaves_cache_valid = true;
+    return cached_leaves;
+}
+
+namespace {
+// Per-root dynamic-AoS max-end cache for rebuildDynamicRootTimeIndex() (declared
+// here: PanzerDB.cpp is one translation unit). Keyed on the FILE identity
+// (index_file_name) + the row count covered, NOT the leaf-buffer address: engines
+// in a putSlice loop each decode their own fresh buffer (the base pointer is
+// unstable), but they all read the SAME append-only /index, so rows [0, K] are
+// identical content across engines and the per-root max over them is reusable. A
+// different file or a different row count misses; a shrink would violate
+// covered_count <= n, so it falls back to the correct full fold (and refreshes).
+struct DynRootTimeCache {
+    std::string file;                       // index_file_name at cache time
+    size_t covered_count = 0;               // leaf rows the max covers
+    std::unordered_map<std::string, uint64_t> max_end;   // root (owned copy) -> exclusive end
+};
+}  // namespace
+
+void PanzerDB::rebuildDynamicRootTimeIndex() const {
+    max_time_at_dynamic_root.clear();
+    if (cached_dynamic_aos_roots.empty() || cached_leaves.empty()) return;
+
+    // For each dynamic AoS root, track the EXCLUSIVE end of the time range
+    // covered by ALL of its descendant DATA leaves (any depth): a leaf at
+    // time_index t holding n steps covers [t, t+n). Counting time_index only
+    // would report size t+1 for a multi-step row (bulk numeric writes, V4
+    // run-grouped string writes) whose first slice is the row's time_index.
+    // This also makes getAOSShape correct for dynamic AoS that only contain
+    // nested static AoS (e.g. time_slice/ggd/theta/values) where none of the
+    // direct children carry a time index.
+    // max_time_at_dynamic_root[root] is the exclusive end of the time range covered
+    // by the root's descendant DATA leaves, i.e. a running MAX over the leaves — a
+    // non-decreasing function of the leaves appended to the same stable buffer
+    // (a putSlice loop only ever grows it, each slice holding that root's highest
+    // time). So a repeat open of a grown buffer inherits the earlier per-root max
+    // and folds only the appended tail in O(roots x tail), instead of the
+    // O(roots x N) scan over every leaf this function used to do on EVERY decode
+    // (gl_rebuild: the last O(n) term of the putSlice loop). Same (leaf-buffer
+    // address + covered count) key invariant as the two sibling caches, so a moved
+    // buffer / different file / shrink misses and does the correct full fold.
+    static thread_local DynRootTimeCache rc;
+
+    const size_t n = cached_leaves.size();
+    const std::string& fname = index_file_name;   // stable file identity across engines
+
+    // Exclusive end of the time range a single leaf covers [time_index, +steps).
+    auto leaf_end = [](const Leaf& leaf) -> uint64_t {
+        const uint64_t dtype = leaf.flags >> 4;
+        uint64_t steps = 1;
+        if (dtype != (uint64_t)DataType::STRING_CHUNKED) {  // STRING_CHUNKED: slots = chunks of one value, not steps
+            uint64_t slice_volume = 1;
+            for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+            if (slice_volume > 0 && leaf.count > slice_volume) steps = leaf.count / slice_volume;
+        }
+        return leaf.time_index + steps;
+    };
+
+    // Running max of leaf_end over a root's descendant data leaves in [start, end),
+    // seeding from `acc` when the root was already found (the covered earlier leaves).
+    auto foldRange = [&](size_t start, size_t end, std::unordered_map<std::string, uint64_t>& acc) {
+        for (const auto& root : cached_dynamic_aos_roots) {
+            const std::string prefix = root + "/";
+            auto it = acc.find(root);
+            bool found = (it != acc.end());
+            uint64_t cur = found ? it->second : 0;
+            for (size_t i = start; i < end; ++i) {
+                const auto& leaf = cached_leaves[i];
+                if ((leaf.flags & 0xF) != 0) continue;               // data leaves only
+                if (leaf.path.compare(0, prefix.size(), prefix) != 0) continue;
+                const uint64_t e = leaf_end(leaf);
+                if (!found || e > cur) { cur = e; found = true; }
+            }
+            if (found) { if (it != acc.end()) it->second = cur; else acc.emplace(root, cur); }
+        }
+    };
+
+    // Reuse only when we are looking at the SAME FILE (same append-only /index)
+    // and the row count has only grown: rows [0, covered] were already aggregated
+    // into `rc.max_end` by an earlier decode of that file, so we only fold the
+    // newly-appended tail [covered, n) instead of rescanning all n leaves.
+    //
+    // IMPORTANT: publish to the member BEFORE moving acc into the cache, so the
+    // publish loop has a live map to iterate over (std::move leaves acc empty).
+    std::unordered_map<std::string, uint64_t> acc;
+    if (rc.file == fname && rc.covered_count > 0 && rc.covered_count <= n) {
+        acc = rc.max_end;                                                 // O(roots)
+        foldRange(rc.covered_count, n, acc);                               // O(roots x tail)
+    } else {
+        foldRange(0, n, acc);                                              // O(roots x N)
+    }
+
+    // Publish to the member: keys are stable string_views into cached_dynamic_aos_roots
+    // (owned by the leaf decode this cache was built from), never the `acc` copies.
+    // Publish first, THEN update the cache (the cache holds a copy that outlives acc).
+    max_time_at_dynamic_root.clear();
+    for (const auto& root : cached_dynamic_aos_roots) {
+        auto it = acc.find(root);
+        if (it != acc.end())
+            max_time_at_dynamic_root[std::string_view(root)] = it->second;
+    }
+
+    rc.file = fname;
+    rc.covered_count = n;
+    rc.max_end = std::move(acc);
+}
+
+template<typename T>
+void PanzerDB::readTensor(const Leaf& leaf, T* out_buffer) const {
+    if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
+
+    DataType type = static_cast<DataType>(leaf.flags >> 4); // Type is encoded in upper bits of flag
+    hid_t dset_id = -1;
+    hid_t mem_type = -1;
+
+    if (type == DataType::FLOAT64) {
+        dset_id = rawDatasetFor(DataType::FLOAT64, leaf.block);
+        mem_type = H5T_NATIVE_DOUBLE;
+    } else if (type == DataType::INT32) {
+        dset_id = rawDatasetFor(DataType::INT32, leaf.block);
+        mem_type = H5T_NATIVE_INT;
+    } else if (type == DataType::COMPLEX128) {
+        dset_id = rawDatasetFor(DataType::COMPLEX128, leaf.block);
+        hsize_t complex_dims[1] = {2};
+        mem_type = H5Tarray_create2(H5T_NATIVE_DOUBLE, 1, complex_dims);
+    } else {
+        throw std::runtime_error("Unsupported data type for readTensor");
+    }
+
+    if (dset_id < 0) throw std::runtime_error("Dataset for this type is not open");
+
+    // mem_type above is chosen by the LEAF, never by T, so H5Dread writes
+    // `stored_size` bytes per element no matter what T is: a narrower T gets
+    // overrun. The opposite direction is deliberate and live -- readInterpolatedData
+    // routes integer signals through readDataByIndex(double**), which over-allocates
+    // and whose consumer reads the buffer back as int32. So only the narrow
+    // direction is fatal.
+    const size_t stored_size = (type == DataType::COMPLEX128) ? 2 * sizeof(double)
+                               : (type == DataType::FLOAT64)   ? sizeof(double)
+                                                               : sizeof(int32_t);
+    if (sizeof(T) < stored_size) {
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("readTensor: " + std::to_string(sizeof(T)) +
+                                 "-byte buffer element cannot hold a " +
+                                 std::to_string(stored_size) + "-byte stored element", LOG);
+    }
+
+    hsize_t hoffset = leaf.offset;
+    hsize_t hcount = leaf.count;
+    hid_t space = H5Dget_space(dset_id);
+    if (space < 0) {
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Dget_space failed", LOG);
+    }
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL) < 0) {
+        H5Sclose(space);
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Sselect_hyperslab failed", LOG);
+    }
+    hid_t memspace = H5Screate_simple(1, &hcount, NULL);
+    herr_t status = H5Dread(dset_id, mem_type, memspace, space, H5P_DEFAULT, out_buffer);
+    if (status < 0) {
+        H5Sclose(memspace); H5Sclose(space);
+        if (type == DataType::COMPLEX128) H5Tclose(mem_type);
+        throw ALBackendException("H5Dread failed for numeric tensor", LOG);
+    }
+    H5Sclose(memspace); H5Sclose(space);
+    if (type == DataType::COMPLEX128) {
+        H5Tclose(mem_type);
+    }
+}
+
+// Explicit template instantiation
+template void PanzerDB::readTensor<double>(const Leaf& leaf, double* out_buffer) const;
+template void PanzerDB::readTensor<int32_t>(const Leaf& leaf, int32_t* out_buffer) const;
+template void PanzerDB::readTensor<std::complex<double>>(const Leaf& leaf, std::complex<double>* out_buffer) const;
+
+template<>
+void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const {
+    if (leaf.is_empty) throw std::runtime_error("Leaf is empty");
+    {
+        const uint64_t dt = static_cast<uint64_t>(leaf.flags >> 4);
+        if (dt != static_cast<uint64_t>(DataType::STRING) &&
+            dt != static_cast<uint64_t>(DataType::STRING_CHUNKED)) {
+            throw ALBackendException("Mismatched data type for readTensor<std::string>", LOG);
+        }
+    }
+
+    // Check validity and attempt recovery if needed
+    H5I_type_t id_type = H5Iget_type(data_dset_str);
+    if (id_type != H5I_DATASET) {
+        throw ALBackendException("Dataset for string type is not open", LOG);
+    }
+    
+    hid_t dset_id = data_dset_str;
+
+    hsize_t hoffset = leaf.offset;
+    hsize_t hcount = leaf.count;
+    hid_t space = H5Dget_space(dset_id);
+    if (space < 0) throw ALBackendException("H5Dget_space failed", LOG);
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &hoffset, NULL, &hcount, NULL) < 0) {
+        H5Sclose(space);
+        throw ALBackendException("H5Sselect_hyperslab failed", LOG);
+    }
+    hid_t memspace = H5Screate_simple(1, &hcount, NULL);
+
+    // data_raw_str is now a FIXED-WIDTH, NUL-padded C1 column (SWMR-safe).
+    // Read hcount elements of STRING_MAX_LEN bytes, then copy each to a
+    // std::string trimmed at its NUL terminator.
+    hid_t str_type_fixed = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type_fixed, STRING_MAX_LEN);
+    H5Tset_strpad(str_type_fixed, H5T_STR_NULLPAD);
+    H5Tset_cset(str_type_fixed, H5T_CSET_UTF8);
+
+    std::vector<char> buf((size_t)hcount * STRING_MAX_LEN, 0);
+
+    herr_t status = H5Dread(dset_id, str_type_fixed, memspace, space, H5P_DEFAULT, buf.data());
+    if (status < 0) {
+        H5Tclose(str_type_fixed);
+        H5Sclose(memspace);
+        H5Sclose(space);
+        throw ALBackendException("H5Dread failed for string tensor", LOG);
+    }
+
+    for (size_t i = 0; i < (size_t)hcount; ++i) {
+        const char* slot = buf.data() + (size_t)i * STRING_MAX_LEN;
+        out_buffer[i] = std::string(slot, strnlen(slot, STRING_MAX_LEN));
+    }
+
+    H5Tclose(str_type_fixed);
+    H5Sclose(memspace);
+    H5Sclose(space);
+}
+
+template void PanzerDB::readTensor<std::string>(const Leaf& leaf, std::string* out_buffer) const;
+
+//==========================================================================
+// Bulk string read: one H5Dread covering [lo, hi) of data_raw_str slots
+//==========================================================================
+
+std::vector<std::string> PanzerDB::readStringBulk(uint64_t lo, uint64_t hi) const {
+    if (data_dset_str < 0) throw ALBackendException("data_raw_str not open", LOG);
+    const uint64_t n = (hi > lo) ? (hi - lo) : 0;
+    std::vector<std::string> out(n);
+    if (n == 0) return out;
+    // data_raw_str elements are fixed STRING_MAX_LEN-char slots. Read `n` whole
+    // slots with the exact element type (NOT a flat char stream — that would
+    // drop all but the first byte of each slot), then trim each at its NUL.
+    const hsize_t count = (hsize_t)n, offset = (hsize_t)lo;
+    hid_t space = H5Dget_space(data_dset_str);
+    if (space < 0)  throw ALBackendException("H5Dget_space failed (string bulk)", LOG);
+    if (H5Sselect_hyperslab(space, H5S_SELECT_SET, &offset, NULL, &count, NULL) < 0) {
+        H5Sclose(space); throw ALBackendException("H5Sselect_hyperslab failed (string bulk)", LOG);
+    }
+    hid_t memspace = H5Screate_simple(1, &count, NULL);
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, STRING_MAX_LEN);
+    H5Tset_strpad(str_type, H5T_STR_NULLPAD);
+    H5Tset_cset(str_type, H5T_CSET_UTF8);
+    std::vector<char> raw(n * STRING_MAX_LEN, 0);
+    if (H5Dread(data_dset_str, str_type, memspace, space, H5P_DEFAULT, raw.data()) < 0) {
+        H5Tclose(str_type); H5Sclose(memspace); H5Sclose(space);
+        throw ALBackendException("H5Dread failed (string bulk)", LOG);
+    }
+    H5Tclose(str_type); H5Sclose(memspace); H5Sclose(space);
+    for (uint64_t i = 0; i < n; ++i) {
+        const char* slot = raw.data() + (size_t)i * STRING_MAX_LEN;
+        out[i] = std::string(slot, strnlen(slot, STRING_MAX_LEN));
+    }
+    return out;
+}
+
+// Private helper function to avoid duplication
+template<typename T>
+void PanzerDB::writeDataImpl(const std::string& name,
+                              const std::vector<size_t>& shape,
+                              const T* data,
+                              size_t count,
+                              const std::string& timebase,
+                              DataType dtype,
+                              hid_t dataset_id,
+                              std::vector<T>& buffer) {
+    // ✅ ASSERT: timebase must be empty (static data only)
+    if (!timebase.empty()) {
+        throw ALBackendException("writeData with timebase not allowed, use writeDataSlices", LOG);
+    }
+    
+    last_level_had_write = true;
+    
+    if (!array_stack.empty()) { 
+        array_stack.back().had_write = true;
+        array_stack.back().actual_count++;
+    }
+
+    // OPTIMIZATION 1: build parent_path efficiently
+    std::string parent_path;
+    if (!array_stack.empty()) {
+        // precompute the required size
+        size_t estimated_size = path_prefix.length() + 25; // +25 pour "/12345"
+        parent_path.reserve(estimated_size);
+        
+        parent_path = path_prefix;
+        parent_path += '/';
+        parent_path += std::to_string(array_stack.back().current_index);
+    } else {
+        parent_path = path_prefix;
+    }
+
+    // OPTIMIZATION 2: build full_path with reserved capacity
+    std::string full_path;
+    full_path.reserve(parent_path.length() + name.length() + 1);
+    
+    full_path = parent_path;
+    if (!full_path.empty()) full_path += '/';
+    full_path += name;
+
+
+    // ✅ Static data: time_idx = 0 always
+    uint64_t time_idx = 0;
+    
+    // OPTIMISATION: Use cached disk size
+    uint64_t current_disk_size = 0;
+    if (dtype == DataType::FLOAT64) current_disk_size = disk_size_f64;
+    else if (dtype == DataType::INT32) current_disk_size = disk_size_i32;
+    else if (dtype == DataType::COMPLEX128) current_disk_size = disk_size_c128;
+    
+    uint64_t offset = current_disk_size + buffer.size();
+
+    if (buffer.capacity() < buffer.size() + count) {
+        size_t new_capacity = std::max(buffer.size() + count, 
+                                       buffer.capacity() * BUFFER_GROWTH_FACTOR);
+        buffer.reserve(new_capacity);
+    }
+
+    buffer.insert(buffer.end(), data, data + count);
+
+    uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, count, flags, parent_row, inst);
+}
+
+// OPTIMIZED PATH PARSING (for substitution in readDataByIndex)
+// ============================================================================
+
+
+
+PathComponents PanzerDB::parsePath(const std::string& path, 
+                                   const std::string& aos_path) const {
+    PathComponents result;
+    
+    if (path.length() <= aos_path.length()) {
+        return result;
+    }
+    
+    // check that path starts with aos_path + '/'
+    std::string expected_prefix = aos_path + "/";
+    if (path.rfind(expected_prefix, 0) != 0) {
+        return result;
+    }
+    
+    result.prefix = aos_path;
+    
+    // Extraire ce qui suit
+    std::string remainder = path.substr(expected_prefix.length());
+    
+    // OPTIMISATION: Trouver le premier '/' sans copie de string
+    size_t first_slash = remainder.find('/');
+    
+    if (first_slash != std::string::npos) {
+        result.index_str = remainder.substr(0, first_slash);
+        result.suffix = remainder.substr(first_slash);
+        result.has_index = true;
+    } else {
+        result.index_str = remainder;
+        result.suffix = "";
+        result.has_index = true;
+    }
+    
+    return result;
+}
+
+// double
+template<>
+void PanzerDB::writeData<double>(const std::string& name,
+                         const std::vector<size_t>& shape,
+                         const double* data, size_t count,
+                         const std::string& timebase) {
+    writeDataImpl(name, shape, data, count, timebase,
+                  DataType::FLOAT64, data_dset_f64, data_buffer_f64);
+}
+
+// int32_t
+template<>
+void PanzerDB::writeData<int32_t>(const std::string& name,
+                         const std::vector<size_t>& shape,
+                         const int32_t* data, size_t count,
+                         const std::string& timebase) {
+    writeDataImpl(name, shape, data, count, timebase,
+                  DataType::INT32, data_dset_i32, data_buffer_i32);
+}
+
+// complex
+template<>
+void PanzerDB::writeData<std::complex<double>>(const std::string& name,
+                         const std::vector<size_t>& shape,
+                         const std::complex<double>* data, size_t count,
+                         const std::string& timebase) {
+    writeDataImpl(name, shape, data, count, timebase,
+                  DataType::COMPLEX128, data_dset_c128, data_buffer_c128);
+}
+
+// New specific signature for raw strings
+template<>
+void PanzerDB::writeData<char>(const std::string& name,
+                         const std::vector<size_t>& shape,
+                         const char* data,  // ✅ Simple pointer to buffer
+                         size_t count,      // count should be == shape[0]
+                         const std::string& timebase) {
+    if (!timebase.empty()) {
+        throw std::runtime_error("writeData with timebase not allowed, use writeDataSlices");
+    }
+    
+    last_level_had_write = true;
+    
+    if (!array_stack.empty()) { 
+        array_stack.back().had_write = true;
+        array_stack.back().actual_count++;
+    }
+
+    std::string parent_path = path_prefix;
+    if (!array_stack.empty()) {
+        parent_path += "/" + std::to_string(array_stack.back().current_index);
+    }
+
+    std::string full_path = parent_path;
+    if (!full_path.empty()) full_path += "/";
+    full_path += name;
+
+    uint64_t time_idx = 0;
+    
+    uint64_t offset = disk_size_str + data_buffer_str.size();
+
+    // ✅ Construct std::string from raw buffer (scalar string).
+    // A scalar longer than one fixed 512B slot (STRING_MAX_LEN-1) is split across
+    // `k` slots tagged STRING_CHUNKED instead of throwing — SWMR-safe, no vlen.
+    size_t str_length = shape.empty() ? count : shape[0];
+    const size_t max_slot = STRING_MAX_LEN - 1;
+    size_t n_chunks = str_length ? (str_length - 1) / max_slot + 1 : 1;
+    for (size_t c = 0; c < n_chunks; ++c) {
+        size_t off = c * max_slot;
+        data_buffer_str.emplace_back(data + off,
+                                     std::min(max_slot, str_length - off));
+    }
+
+    DataType dtype = (n_chunks > 1) ? DataType::STRING_CHUNKED : DataType::STRING;
+    uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+    append_index_row(full_path, parent_path, shape, 0, time_idx, offset, n_chunks, flags, parent_row, inst);
+    //                                                                    ↑ count = n_chunks (1 short / k chunked)
+}
+
+template<>
+void PanzerDB::writeData<const char*>(const std::string& name,
+                         const std::vector<size_t>& shape,
+                         const char* const* data,
+                         size_t count,
+                         const std::string& timebase) {
+    // This is for writing a single string scalar or a list of strings as a static entry.
+    // We can reuse writeDataSlices with n_slices = 1 for a single entry.
+    writeDataSlices(name, shape, data, 1, timebase);
+}
+// Private helper function to avoid duplication
+template<typename T>
+void PanzerDB::writeDataSlicesImpl(const std::string& name,
+                                    const std::vector<size_t>& base_shape,
+                                    const T* data,
+                                    size_t n_slices,
+                                    const std::string& timebase,
+                                    DataType dtype,
+                                    hid_t dataset_id,
+                                    std::vector<T>& buffer) {
+    std::string dynamic_aos_path = getDynamicAOSPath();
+
+    // ✅ Construct data path to serve as time key
+    std::string parent_path = path_prefix;
+    if (!array_stack.empty() && !array_stack.back().is_dynamic) {
+        parent_path += "/" + std::to_string(array_stack.back().current_index);
+    }
+    std::string full_path = parent_path;
+    if (!full_path.empty()) full_path += "/";
+    full_path += name;
+    
+    uint64_t base_time = 0;
+    // Time-base block selector, taken up here because CASE 1 needs the enclosing
+    // dynamic AoS's timebase name to answer it. See rawDatasetFor() for why the row
+    // has to say which block its offset belongs to.
+    std::string dynamic_aos_timebase;
+    bool block_row = false;
+
+    // ✅ CASE 1: Data in dynamic AOS
+    if (!dynamic_aos_path.empty()) {
+        // Auto-sync avec l'index de l'AOS dynamique
+        size_t dynamic_aos_current_iteration = 0;
+        // Parcours inverse pour trouver le plus proche parent dynamique
+        for (auto it = array_stack.rbegin(); it != array_stack.rend(); ++it) {
+            if (it->is_dynamic) {
+                dynamic_aos_current_iteration = it->current_index;
+                dynamic_aos_timebase = it->timebase;
+                break;
+            }
+        }
+        // The per-element base of this AoS: "profiles_1d/time" for a dynamic
+        // AoS "profiles_1d" opened with timebase "time". It is one value per
+        // slice, so it is the row layout that suffers most from being scattered
+        // through the payload block.
+        const std::string aos_base = normalisedTimebase(dynamic_aos_timebase);
+        block_row = (!aos_base.empty() &&
+                     full_path == dynamic_aos_path + "/" + aos_base);
+
+        // FIX: Use max between current iteration and known signal end
+        // This allows:
+        // 1. Alignment of different signals (test_magnetics) via dynamic_aos_current_iteration
+        // 2. Chunked writing of the SAME signal via aos_time_counters[full_path]
+        
+        uint64_t signal_next_time = aos_time_counters[full_path];
+        base_time = std::max((uint64_t)dynamic_aos_current_iteration, signal_next_time);
+        
+        // FIX: If signal is lagging (gap) relative to AoS timebase, align it.
+        // Assume timebase has already been written for this slice (standard case).
+        //
+        // Only a CONTINUING signal (already has data in the file, see hasFileData) can
+        // "lag" its timebase. A FRESH signal written after a bulk (whole-array)
+        // timebase write has no gap to catch up to; forcing it to (time_next -
+        // n_slices) would shift its slices out of the timebase's valid 0..N-1 range.
+        // So the catch-up anchor is skipped for fresh signals, keeping their own
+        // contiguous position (base_time above).
+        if (hasFileData(full_path) && !dynamic_aos_timebase.empty()) {
+             std::string time_path = dynamic_aos_path + "/" + dynamic_aos_timebase;
+             if (aos_time_counters.find(time_path) != aos_time_counters.end()) {
+                 uint64_t time_next = aos_time_counters[time_path];
+                 if (time_next >= n_slices) {
+                     base_time = std::max(base_time, time_next - n_slices);
+                 }
+             }
+        }
+    }
+    // ✅ CASE 2: Standalone dynamic data (no dynamic AOS parent)
+    else {
+        // Use full data path as time key
+        std::string time_key = full_path;
+
+        // Initialize counter if necessary
+        if (aos_time_counters.find(time_key) == aos_time_counters.end()) {
+            aos_time_counters[time_key] = 0;
+        }
+
+        base_time = aos_time_counters[time_key];
+
+        // The IDS's root time base: it is its own timebase, which is how the AL
+        // names it on the way in ("time" written with timebase "time"). Whether it
+        // arrives as one bulk row (put) or one row per slice (putSlice), it is read
+        // back whole on nearly every access.
+        block_row = (!timebase.empty() && full_path == normalisedTimebase(timebase));
+        // FIX (gaps, homogeneous_time=1): for a standalone dynamic signal on the
+        // master timebase, anchor the slice number to the timebase's written
+        // position (like CASE 1 does with the dynamic AoS timebase). Without this,
+        // skipping the signal for a time step would compress the signal's timeline
+        // (its next write landing on the next slice) instead of leaving a resolvable
+        // gap aligned to the master timebase. max() preserves chunked writes.
+        // Guarded by timebase so it never fires for the timebase write itself, and
+        // by hasFileData so it only applies to a CONTINUING signal (see CASE 1): a
+        // fresh signal is kept at its own contiguous position instead of being
+        // shifted onto the timebase's last written index.
+        if (hasFileData(full_path) && !timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+            uint64_t time_next = aos_time_counters[timebase];
+            if (time_next >= n_slices) {
+                base_time = std::max(base_time, time_next - n_slices);
+            }
+        }
+    }
+
+    // --- Common writing ---
+    size_t slice_size = 1;
+    for (auto s : base_shape) if (s > 0) slice_size *= s;
+
+    // Raw data writing
+    // OPTIMISATION: Use cached disk size
+    uint64_t current_disk_size = 0;
+    if (dtype == DataType::FLOAT64) current_disk_size = disk_size_f64;
+    else if (dtype == DataType::INT32) current_disk_size = disk_size_i32;
+    else if (dtype == DataType::COMPLEX128) current_disk_size = disk_size_c128;
+
+    // A time base has its own block and its own cursor (v4). Only a file opened
+    // with that block can route into it: APPEND keeps the layout of the file it
+    // opens, so on a v3 file data_dset_time is invalid and these rows stay in the
+    // payload block with their block bit at 0.
+    const bool time_block = block_row && index_version >= PANZER_INDEX_VERSION_V4 &&
+                            data_dset_time >= 0;
+
+    // A per-step scalar -- one value per time step for a node that is 0-D in the
+    // IDS (global_quantities&ip is the case that costs the most, see to_improve.md
+    // point 31) -- has its own block in v5, so it grows like the time base instead
+    // of being scattered one value per 18 001 slots through the payload. Same
+    // layout rule as the time base: APPEND on a v3/v4 file has no such handle, so
+    // those files keep the old rows. Strings are excluded: their offset indexes
+    // data_raw_str, which the read path resolves by type.
+    hid_t scalar_dset;
+    if constexpr (std::is_same<T, double>::value)      scalar_dset = data_dset_scalar_f64;
+    else if constexpr (std::is_same<T, int32_t>::value) scalar_dset = data_dset_scalar_i32;
+    else                                                scalar_dset = data_dset_scalar_c128;
+    const bool scalar_block = !time_block && slice_size == 1 &&
+                              index_version >= PANZER_INDEX_VERSION_V5 && scalar_dset >= 0;
+
+    const size_t n_values = slice_size * n_slices;
+    // The block this row appends to and its cursor: the time base (v4) has one, a
+    // per-step scalar (v5) has one, everything else goes to the block of its type.
+    // Only a double can be a time base, hence the compile-time guard -- dtype
+    // FLOAT64 <=> T is double.
+    std::vector<T>* payload = &buffer;
+    uint64_t payload_disk_size = current_disk_size;
+    if constexpr (std::is_same<T, double>::value) {
+        if (time_block) {
+            payload = &data_buffer_time;
+            payload_disk_size = disk_size_time;
+        }
+    }
+    if (scalar_block) {
+        if constexpr (std::is_same<T, double>::value) {
+            payload = &data_buffer_scalar_f64;
+            payload_disk_size = disk_size_scalar_f64;
+        } else if constexpr (std::is_same<T, int32_t>::value) {
+            payload = &data_buffer_scalar_i32;
+            payload_disk_size = disk_size_scalar_i32;
+        } else {
+            payload = &data_buffer_scalar_c128;
+            payload_disk_size = disk_size_scalar_c128;
+        }
+    }
+    const uint64_t start_offset = payload_disk_size + payload->size();
+    payload->insert(payload->end(), data, data + n_values);
+
+    uint64_t flags = (static_cast<uint64_t>(dtype) << 4);
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
+    append_index_row(full_path, parent_path, base_shape, 0,
+                    base_time,                  // Start time
+                    start_offset,               // Start offset
+                    slice_size * n_slices,      // TOTAL Count
+                    flags, parent_row, inst,
+                    time_block ? RAW_BLOCK_TIME : (scalar_block ? RAW_BLOCK_SCALAR : RAW_BLOCK_TYPE));
+
+    last_level_had_write = true;
+    
+    // Update counters
+    uint64_t next_time = base_time + n_slices;
+    aos_time_counters[full_path] = next_time;
+
+    if (!dynamic_aos_path.empty()) {
+        if (next_time > aos_time_counters[dynamic_aos_path]) {
+            aos_time_counters[dynamic_aos_path] = next_time;
+        }
+    }
+
+}
+
+// double - uses data_dset_f64 and data_buffer_f64
+void PanzerDB::writeDataSlices(const std::string& name,
+                               const std::vector<size_t>& base_shape,
+                               const double* data, size_t n_slices,
+                               const std::string& timebase) {
+    writeDataSlicesImpl(name, base_shape, data, n_slices, timebase,
+                        DataType::FLOAT64, data_dset_f64, data_buffer_f64);
+}
+
+// int32_t - uses data_dset_i32 and data_buffer_i32
+void PanzerDB::writeDataSlices(const std::string& name,
+                               const std::vector<size_t>& base_shape,
+                               const int32_t* data, size_t n_slices,
+                               const std::string& timebase) {
+    writeDataSlicesImpl(name, base_shape, data, n_slices, timebase,
+                        DataType::INT32, data_dset_i32, data_buffer_i32);
+}
+
+// complex - uses data_dset_c128 and data_buffer_c128
+void PanzerDB::writeDataSlices(const std::string& name,
+                               const std::vector<size_t>& base_shape,
+                               const std::complex<double>* data, size_t n_slices,
+                               const std::string& timebase) {
+    writeDataSlicesImpl(name, base_shape, data, n_slices, timebase,
+                        DataType::COMPLEX128, data_dset_c128, data_buffer_c128);
+}
+
+void PanzerDB::writeDataSlices(const std::string& name,
+                               const std::vector<size_t>& base_shape,
+                               const char* const* data, size_t n_slices,
+                               const std::string& timebase) {
+    std::string dynamic_aos_path = getDynamicAOSPath();
+
+    // Auto-sync (same code as others)
+    size_t dynamic_aos_current_iteration = 0;
+    std::string dynamic_aos_timebase;
+    for (auto it = array_stack.rbegin(); it != array_stack.rend(); ++it) {
+        if (it->is_dynamic) {
+            dynamic_aos_current_iteration = it->current_index;
+            dynamic_aos_timebase = it->timebase;
+            break;
+        }
+    }
+    
+    uint64_t base_time = 0;
+    std::string time_key;
+    
+    std::string parent_path = path_prefix;
+    if (!array_stack.empty() && !array_stack.back().is_dynamic) {
+        parent_path += "/" + std::to_string(array_stack.back().current_index);
+    }
+    std::string full_path = parent_path;
+    if (!full_path.empty()) full_path += "/";
+    full_path += name;
+
+    if (!dynamic_aos_path.empty()) {
+        // FIX: Use max between current iteration and known signal end (like numerics)
+        uint64_t signal_next_time = aos_time_counters[full_path];
+        base_time = std::max((uint64_t)dynamic_aos_current_iteration, signal_next_time);
+        
+        // FIX: Alignment with timebase in case of gap (like numerics). Only a
+        // CONTINUING string signal (see hasFileData) can lag its timebase; a fresh
+        // one written after a bulk timebase write is kept at its own position.
+        if (hasFileData(full_path) && !dynamic_aos_timebase.empty()) {
+             std::string time_path = dynamic_aos_path + "/" + dynamic_aos_timebase;
+             if (aos_time_counters.find(time_path) != aos_time_counters.end()) {
+                 uint64_t time_next = aos_time_counters[time_path];
+                 if (time_next >= n_slices) {
+                     base_time = std::max(base_time, time_next - n_slices);
+                 }
+             }
+        }
+    } else {
+        time_key = full_path;
+        if (aos_time_counters.find(time_key) == aos_time_counters.end()) {
+            aos_time_counters[time_key] = 0;
+        }
+        base_time = aos_time_counters[time_key];
+
+        // FIX (gaps, homogeneous_time=1): same timebase anchoring as the numeric
+        // writeDataSlicesImpl CASE 2, so a skipped string slice leaves a
+        // resolvable gap aligned to the master timebase instead of compressing.
+        // Gated by hasFileData (continuing signal only) as in numeric CASE 2.
+        if (hasFileData(full_path) && !timebase.empty() && aos_time_counters.find(timebase) != aos_time_counters.end()) {
+            uint64_t time_next = aos_time_counters[timebase];
+            if (time_next >= n_slices) {
+                base_time = std::max(base_time, time_next - n_slices);
+            }
+        }
+    }
+
+    uint64_t start_offset = disk_size_str + data_buffer_str.size();
+
+    // ✅ DIFFERENCE: count_per_slice for strings
+    size_t count_per_slice = base_shape.empty() ? 1 : base_shape[0];
+    const bool scalar = (count_per_slice == 1);
+    const size_t max_slot = STRING_MAX_LEN - 1;
+
+    // Enclosing AoS is constant across the loop: one parent anchor for all slices.
+    const uint64_t parent_row = array_stack.empty() ? PANZER_NO_PARENT_ROW
+                                                    : array_stack.back().container_row_id;
+    const uint64_t inst = array_stack.empty() ? 0 : array_stack.back().current_index;
+
+    // V4 run-grouping state (see the loop below).
+    bool string_run_open = false;
+    size_t string_run_start = 0;
+    uint64_t string_run_first_slot = 0;
+    bool list_run_open = false;
+    size_t list_run_start = 0;
+    uint64_t list_run_first_slot = 0;
+
+    // ── V4: one index row per RUN of consecutive slices sharing a uniform
+    // per-step slot count, mirroring what writeDataSlicesImpl does for numeric
+    // signals (count = slots_per_step * run_length, time = first step). The
+    // readers already handle multi-step string leaves (readStringDataByIndex
+    // derives element_size = count / n_steps; isTimeInLeaf derives n_steps
+    // from the shape). Two cases stay one-row-per-slice:
+    //   - STRING_CHUNKED scalars (k > 1 slots): the readers join the WHOLE
+    //     leaf into one value, so each chunked value keeps its own row;
+    //   - spanned lists: the span table keys (row_id, element_idx) assumes one
+    //     list per row.
+    for (size_t i = 0; i < n_slices; ++i) {
+        const char* const* slice_data = data + (i * count_per_slice);
+        if (scalar) {
+            // One scalar string may exceed the 512B slot width. Split it across
+            // `k` fixed-width slots (STRING_CHUNKED) rather than throwing; the reader
+            // concatenates them back. SWMR-safe, no variable-length type.
+            const size_t slen = std::strlen(slice_data[0]);
+            const size_t n_chunks = slen ? (slen - 1) / max_slot + 1 : 1;
+            const uint64_t first_slot = data_buffer_str.size();
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t off = c * max_slot;
+                data_buffer_str.emplace_back(slice_data[0] + off,
+                                             std::min(max_slot, slen - off));
+            }
+            if (n_chunks > 1) {
+                // Close the compact run first: its slot range must stay contiguous
+                // in data_raw_str and end right before this chunked value.
+                if (string_run_open) {
+                    append_index_row(full_path, parent_path, base_shape, 0,
+                                     base_time + string_run_start, string_run_first_slot,
+                                     i - string_run_start,
+                                     (static_cast<uint64_t>(DataType::STRING) << 4),
+                                     parent_row, inst);
+                    string_run_open = false;
+                }
+                append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
+                                 disk_size_str + first_slot, n_chunks,
+                                 (static_cast<uint64_t>(DataType::STRING_CHUNKED) << 4),
+                                 parent_row, inst);
+            } else {
+                // Compact scalar: extends the current run (one slot per step).
+                if (!string_run_open) {
+                    string_run_open = true;
+                    string_run_start = i;
+                    string_run_first_slot = disk_size_str + first_slot;
+                }
+                if (i + 1 == n_slices) {
+                    append_index_row(full_path, parent_path, base_shape, 0,
+                                     base_time + string_run_start, string_run_first_slot,
+                                     i + 1 - string_run_start,
+                                     (static_cast<uint64_t>(DataType::STRING) << 4),
+                                     parent_row, inst);
+                    string_run_open = false;
+                }
+            }
+        } else {
+            // A list: elements may exceed one 512B slot (IMAS: any-length strings).
+            // If an element > max_slot, chunk it across consecutive slots and record
+            // per-element positions in the span table. If all fit, compact behavior
+            // (one slot per element, no span entries) — identical to the old layout.
+            bool any_spanned = false;
+            std::vector<size_t> chunk_counts(count_per_slice);
+            for (size_t j = 0; j < count_per_slice; ++j) {
+                size_t slen = std::strlen(slice_data[j]);
+                chunk_counts[j] = slen ? (slen - 1) / max_slot + 1 : 1;
+                if (chunk_counts[j] > 1) any_spanned = true;
+            }
+
+            // Absolute position in data_raw_str for the first slot of this slice.
+            uint64_t first_slot_abs = disk_size_str + (uint64_t)data_buffer_str.size();
+            uint64_t cum_slot = 0;
+
+            if (any_spanned) {
+                // Close any open compact run BEFORE this row: the span entries
+                // below must key the row id this slice is about to get.
+                if (list_run_open) {
+                    append_index_row(full_path, parent_path, base_shape, 0,
+                                     base_time + list_run_start, list_run_first_slot,
+                                     (i - list_run_start) * count_per_slice,
+                                     (static_cast<uint64_t>(DataType::STRING) << 4),
+                                     parent_row, inst);
+                    list_run_open = false;
+                }
+                // Row id assigned by the next append_index_row call.
+                uint64_t my_row_id = next_row_id;
+                for (size_t j = 0; j < count_per_slice; ++j) {
+                    const char* el = slice_data[j];
+                    size_t slen = std::strlen(el);
+                    size_t n = chunk_counts[j];
+                    for (size_t c = 0; c < n; ++c) {
+                        size_t offc = c * max_slot;
+                        data_buffer_str.emplace_back(el + offc, std::min((size_t)max_slot, slen - offc));
+                    }
+                    appendListSpan(my_row_id, j, cum_slot, (uint64_t)n);
+                    cum_slot += n;
+                }
+                append_index_row(full_path, parent_path, base_shape, 0, base_time + i,
+                                 first_slot_abs, cum_slot,
+                                 (static_cast<uint64_t>(DataType::STRING) << 4),
+                                 parent_row, inst);
+            } else {
+                for (size_t j = 0; j < count_per_slice; ++j) {
+                    const char* el = slice_data[j];
+                    size_t slen = std::strlen(el);
+                    for (size_t c = 0; c < chunk_counts[j]; ++c) {
+                        size_t offc = c * max_slot;
+                        data_buffer_str.emplace_back(el + offc, std::min((size_t)max_slot, slen - offc));
+                    }
+                }
+                if (!list_run_open) {
+                    list_run_open = true;
+                    list_run_start = i;
+                    list_run_first_slot = first_slot_abs;
+                }
+                if (i + 1 == n_slices) {
+                    append_index_row(full_path, parent_path, base_shape, 0,
+                                     base_time + list_run_start, list_run_first_slot,
+                                     (i + 1 - list_run_start) * count_per_slice,
+                                     (static_cast<uint64_t>(DataType::STRING) << 4),
+                                     parent_row, inst);
+                    list_run_open = false;
+                }
+            }
+        }
+    }
+    
+    last_level_had_write = true;
+    
+    if (!dynamic_aos_path.empty()) {
+        uint64_t next_time = base_time + n_slices;
+        
+        aos_time_counters[full_path] = next_time; // Update signal counter
+        
+        if (next_time > aos_time_counters[dynamic_aos_path]) {
+            aos_time_counters[dynamic_aos_path] = next_time;
+        }
+    } else {
+        aos_time_counters[time_key] += n_slices;
+    }
+}
+
+void PanzerDB::incrementArrayIndex() {
+    if (!array_stack.empty()) {
+        array_stack.back().current_index++;
+    }
+}
+
+void PanzerDB::setCurrentArrayIndex(size_t new_index) {
+    if (!array_stack.empty()) {
+        array_stack.back().current_index = new_index;
+    }
+}
+
+// APPEND_INDEX_ROW: AVOID STRING COPIES
+// ============================================================================
+
+uint64_t PanzerDB::append_index_row(const std::string& full_path,
+                                    const std::string& parent_path,
+                                    const std::vector<size_t>& shape,
+                                    uint64_t type,
+                                    uint64_t time_idx,
+                                    uint64_t offset,
+                                    uint64_t count,
+                                    uint64_t flags,
+                                    uint64_t parent_id, uint64_t index_value,
+                                    uint8_t block) {
+
+    const uint64_t assigned_row_id = next_row_id++;
+    // M1: parent_path is no longer stored on disk; it is reconstructed in
+    // getLeaves() from (parent_id, kind, full path).
+    (void)parent_path;
+
+    // OPTIMIZATION 1: preallocate exactly what is needed for the /paths entry
+    size_t required_paths = paths_buffer.size() + PATH_MAX_LEN;
+    if (paths_buffer.capacity() < required_paths) {
+        size_t new_cap = std::max(required_paths, paths_buffer.capacity() * BUFFER_GROWTH_FACTOR);
+        paths_buffer.reserve(new_cap);
+    }
+
+    if (index_version >= PANZER_INDEX_VERSION_V3) {
+        // v3/v4: 7 packed u64 columns + interned path id. The path TEXT is emitted
+        // only for a first-occurring path (deduplicated in /path_table).
+        const uint32_t path_id = intern_path(full_path);
+
+        if (time_idx > 0xFFFFFFFFULL) {
+            throw ALBackendException("v3 index: time_index exceeds u32 range.", LOG);
+        }
+        uint32_t parent32 = PANZER_NO_PARENT_ROW_V3;
+        if (parent_id != PANZER_NO_PARENT_ROW) {
+            if (parent_id > 0xFFFFFFFEULL) {
+                throw ALBackendException("v3 index: parent row id exceeds u32 range.", LOG);
+            }
+            parent32 = static_cast<uint32_t>(parent_id);
+        }
+        uint64_t row[PANZER_INDEX_COLUMNS_V3] = {0};
+        row[0] = offset;
+        row[1] = count;
+        row[2] = (uint64_t)path_id | ((uint64_t)parent32 << 32);
+        row[3] = time_idx | ((flags | ((uint64_t)shape.size() << PANZER_V3_NDIM_SHIFT) |
+                              ((uint64_t)block << PANZER_V3_BLOCK_SHIFT)) << 32);
+        for (size_t i = 0; i < shape.size() && i < 6; ++i) {
+            if (shape[i] > 0xFFFFFFFFULL) {
+                throw ALBackendException("v3 index: shape dimension exceeds u32 range.", LOG);
+            }
+            row[4 + i / 2] |= (uint64_t)(uint32_t)shape[i] << ((i % 2) * 32);
+        }
+        index_buffer.insert(index_buffer.end(), row, row + PANZER_INDEX_COLUMNS_V3);
+        return assigned_row_id;
+    }
+
+    // v2 path (pre-v3 files): row-aligned /paths text, one 256B slot per row.
+    // There is no column left for a block selector here, and a v2 file has no
+    // time-base block to select -- say so instead of dropping the bit.
+    if (block) {
+        throw ALBackendException("append_index_row: a v2/legacy index row cannot address the time-base block; that needs the v4 packing", LOG);
+    }
+    size_t current_path_size = paths_buffer.size();
+    paths_buffer.resize(current_path_size + PATH_MAX_LEN, 0);
+
+    // optimized copy (strncpy is fast for fixed-size buffers)
+    strncpy(paths_buffer.data() + current_path_size, full_path.c_str(), PATH_MAX_LEN - 1);
+
+    // build the row. Layout depends on the file's column count (index_cols):
+    //   12 (v2):  ndim | shape[6] | time_index | offset | count | flags | parent_id
+    //   14 (legacy): leading "type" + trailing "index_value" column, never read back.
+    uint64_t row[PANZER_INDEX_COLUMNS + 2] = {0};
+    const bool legacy = (index_cols == 14);
+    const unsigned ndim_c   = legacy ? 1  : 0;
+    const unsigned shape_c  = legacy ? 2  : 1;
+    const unsigned time_c   = legacy ? 8  : 7;
+    const unsigned off_c    = legacy ? 9  : 8;
+    const unsigned cnt_c    = legacy ? 10 : 9;
+    const unsigned flags_c  = legacy ? 11 : 10;
+    const unsigned parent_c = legacy ? 12 : 11;
+    row[ndim_c] = shape.size();
+    for (size_t i = 0; i < shape.size() && i < 6; ++i) {
+        row[shape_c + i] = shape[i];
+    }
+    row[time_c] = time_idx;
+    row[off_c] = offset;
+    row[cnt_c] = count;
+    row[flags_c] = flags;
+    row[parent_c] = parent_id;   // enclosing AoS meta-node row id (PANZER_NO_PARENT_ROW for root)
+    // M1: the legacy "type" and "index_value" columns are no longer stored
+    // (the data type lives in flags >> 4, the instance index is in the path).
+    (void)type;
+    (void)index_value;
+
+    index_buffer.insert(index_buffer.end(), row, row + index_cols);
+    return assigned_row_id;
+}
+
+bool PanzerDB::isInsideDynamicAOS(std::string* timebase) const {
+    if (array_stack.empty()) {
+        return false;
+    }
+    // Data is dynamic if it has at least one dynamic AoS parent.
+    // So we must traverse the entire stack.
+    for (auto it = array_stack.rbegin(); it != array_stack.rend(); ++it) {
+        const ArrayLevel& level = *it;
+        if (level.is_dynamic) {
+            if (timebase) {
+                *timebase = level.timebase;
+            }
+            return true; // Found dynamic parent
+        }
+    }
+    if (timebase) timebase->clear();
+    return false; // No dynamic parent found
+}
+
+
+void PanzerDB::dumpLeafIndex() const {
+    const auto& leaves = getLeaves();
+    std::cerr << "=== PanzerDB Index Table (" << leaves.size() << " entries) ===" << std::endl;
+    std::cerr << std::left << std::setw(60) << "Path" 
+              << std::setw(10) << "TimeIdx" 
+              << std::setw(10) << "Count" 
+              << std::setw(15) << "Offset" 
+              << "Shape" << std::endl;
+    
+    for (const auto& leaf : leaves) {
+        std::cerr << std::left << std::setw(60) << leaf.path 
+                  << std::setw(10) << leaf.time_index 
+                  << std::setw(10) << leaf.count 
+                  << std::setw(15) << leaf.offset << " [";
+        for (size_t i = 0; i < leaf.shape_span().size(); ++i) {
+            std::cerr << leaf.shape[i] << (i < leaf.shape_span().size() - 1 ? "," : "");
+        }
+        std::cerr << "]" << std::endl;
+    }
+    std::cerr << "============================================" << std::endl;
+}
+
+void PanzerDB::endArray() {
+   if (current_path.empty() || array_stack.empty()) {
+        return;
+    }
+
+    ArrayLevel level = array_stack.back();
+    array_stack.pop_back();
+    current_path.pop_back();
+
+    path_prefix = level.saved_path_prefix;
+
+    // ✅ If exiting dynamic AOS, signal it by clearing dynamic_level
+    if (level.is_dynamic && level.name == dynamic_level) {
+        dynamic_level = "";
+    }
+
+    if (preserve_empty_nodes && !level.had_write) {
+        // Logic for empty nodes to be reviewed
+    }
+
+    if (!array_stack.empty()) {
+        array_stack.back().actual_count += level.actual_count ? level.actual_count : 1;
+    }
+
+    invalidateDynamicAOSCache();
+}
+
+std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
+  const auto &leaves = getLeaves();
+  std::vector<size_t> shapes;
+
+  // 1. Find root AoS meta-node
+  const Leaf *aos_root_leaf = nullptr;
+
+
+  
+  // OPTIMISATION: Utiliser leaf_lookup
+  auto it_root = leaf_lookup.find(std::string_view(level_name));
+  if (it_root != leaf_lookup.end() && !it_root->second.empty()) {
+      aos_root_leaf = &leaves[it_root->second[0]];
+  }
+  // No linear fallback is needed if the index is consistent
+
+  if (!aos_root_leaf) {
+    return shapes; // Return empty vector if AoS not found
+  }
+
+  // NEW LOGIC FOR DYNAMIC AoS
+  if (aos_root_leaf->flags == 3) { // flags == 3 indicates dynamic AoS
+    // Use the exclusive end of the time range computed over ALL descendant
+    // data leaves (any depth) at cache build time. Looking at direct children
+    // only would miss leaves behind nested static AoS (e.g. time_slice/ggd/
+    // theta/values) where no direct child carries a time index.
+    auto it = max_time_at_dynamic_root.find(std::string_view(level_name));
+    if (it != max_time_at_dynamic_root.end()) {
+      shapes.push_back(static_cast<size_t>(it->second));
+    } else {
+      // No data leaves found under this dynamic AoS. Size is 0.
+      shapes.push_back(0);
+    }
+
+    return shapes;
+  }
+
+  // OLD LOGIC (kept for static AoS)
+  // 2. Scan children to find maximum index of real instances
+  long long max_index = -1;
+  
+  // OPTIMISATION: Utiliser parent_lookup pour ne parcourir que les enfants directs
+  auto it_children = parent_lookup.find(std::string_view(level_name));
+  if (it_children != parent_lookup.end()) {
+    for (size_t idx : it_children->second) {
+      const auto& leaf = leaves[idx];
+      // leaf.path est de la forme "level_name/suffix"
+      std::string_view suffix = leaf.path.substr(level_name.length() + 1); // +1 pour '/'
+      // Suffix must start with a digit.
+      if (!suffix.empty() && isdigit(suffix[0])) {
+        size_t slash_pos = suffix.find('/');
+        std::string index_str(suffix.substr(0, slash_pos));
+        try {
+          long long idx = std::stoll(index_str);
+          if (idx > max_index) {
+            max_index = idx;
+          }
+        } catch (...) {
+          // Ignore if not a number
+        }
+      }
+    }
+  }
+
+  // If instances found (max_index >= 0), size is max_index + 1.
+  // Otherwise, use size declared in AoS meta-node.
+  if (max_index >= 0) {
+    shapes.push_back(static_cast<size_t>(max_index + 1));
+  } else {
+    // If no indexed child found, rely on declared size
+    // in the AoS meta-node itself.
+    if (!aos_root_leaf->shape_span().empty()) {
+      shapes.push_back(aos_root_leaf->shape[0]);
+    } else {
+      shapes.push_back(0); // Case where even meta-node has no shape (should not happen for an AoS)
+    }
+  }
+  return shapes;
+}
+
+size_t PanzerDB::getDynamicAOSSize(const std::string& aos_path) const {
+    auto it = aos_time_counters.find(aos_path);
+    if (it != aos_time_counters.end()) {
+        return static_cast<size_t>(it->second);
+    }
+    return 0;
+}
+
+int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requested_time, int interp_mode) const {
+    // Read the whole time base through the batched, memoised path. The path can be
+    // complex (e.g. "A/0/B/time"). Assembling it leaf by leaf — which is what it looks
+    // like when a slice-wise write left one row per time step — decompresses a whole
+    // chunk per step: the cost of one getSlice then grows with the number of slices in
+    // the file, which is the defect measured in to_improve.md point 24.
+    std::vector<double> time_values = getWholeDynamicSignal(timebase_path);
+
+    if (time_values.empty()) {
+        return -1; // Timebase not found, or found but empty.
+    }
+
+    // 5. Use DataInterpolation to get the correct index based on interpolation mode.
+    DataInterpolation interpolator;
+    std::map<std::string, int> times_indices;
+    try {
+        return interpolator.getSlicesTimesIndices(requested_time, time_values, times_indices, interp_mode);
+    } catch (const ALBackendException& e) {
+        // Handle cases where time vector is empty or other issues.
+        std::cerr << "[PanzerDB::getTimeIndex] Warning: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+// In panzerdb.cpp, replace lambda is_time_in_leaf with a method:
+bool PanzerDB::isTimeInLeaf(const Leaf& leaf, int64_t time_index) const {
+    if ((leaf.flags & 0xF) != 0) return false; // Not data
+
+    // Spatial volume calculation
+    size_t slice_volume = 1;
+    for (auto s : leaf.shape_span()) if(s > 0) slice_volume *= s;
+
+    // Time steps count calculation
+    size_t n_steps = (slice_volume > 0) ? (leaf.count / slice_volume) : 1;
+    if (n_steps == 0) n_steps = 1;
+
+    return (static_cast<uint64_t>(time_index) >= leaf.time_index &&
+            static_cast<uint64_t>(time_index) < (leaf.time_index + n_steps));
+}
+
+PanzerDB::RowSlice PanzerDB::rowsForTime(std::string_view path, int64_t time_index) const
+{
+    getLeaves(); // Makes sure leaf_lookup and its safety record are built.
+    const auto it = leaf_lookup.find(path);
+    if (it == leaf_lookup.end()) return {nullptr, 0};
+    const std::vector<size_t>& rows = it->second;
+    if (rows.empty()) return {nullptr, 0};
+
+    if (time_lookup_unsafe_paths.find(path) != time_lookup_unsafe_paths.end()) {
+        return {rows.data(), rows.size()};
+    }
+
+    // Rows of this path are ordered and their time spans disjoint, so only the
+    // last row starting at or before the requested step can hold it.
+    size_t lo = 0, hi = rows.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if ((int64_t)cached_leaves[rows[mid]].time_index <= time_index) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return {nullptr, 0};
+    return {&rows[lo - 1], 1};
+}
+void PanzerDB::buildDynamicAosTails() const {
+    getLeaves();  // leaf_lookup and the path blocks it views have to exist first
+    dynamic_aos_tails.clear();
+    for (const auto& kv : leaf_lookup) {
+        const std::string_view path = kv.first;
+        // Filed under EVERY root the path sits under, not just the first one the root
+        // search would pick: the search resolves the ROOT from the requested path, and a
+        // path may be reachable through a nested dynamic AoS whose root is not the one it
+        // resolves to. Filing it once could then answer "no family" where a row exists,
+        // i.e. drop data -- so the index stays deliberately over-inclusive.
+        for (const auto& root : cached_dynamic_aos_roots) {
+            if (path.size() <= root.size() || path[root.size()] != '/' ||
+                path.compare(0, root.size(), root) != 0) continue;
+            const std::string_view rest = path.substr(root.size() + 1);
+            const std::string_view::size_type slash = rest.find('/');
+            const std::string_view element =
+                (slash == std::string_view::npos) ? rest : rest.substr(0, slash);
+            // Only a numeric element can be reached: the substitution asks for
+            // root + "/" + to_string(idx) + suffix, and idx is never negative here.
+            bool numeric = !element.empty();
+            for (char c : element) if (c < '0' || c > '9') { numeric = false; break; }
+            if (!numeric) continue;
+            const std::string_view tail =
+                (slash == std::string_view::npos) ? std::string_view() : rest.substr(slash);
+            dynamic_aos_tails[root].insert(tail);
+        }
+    }
+    dynamic_tails_gen = leaf_cache_gen;
+    dynamic_tails_rows = index_rows_loaded;
+    dynamic_tails_built = true;
+}
+bool PanzerDB::dynamicAosFamilyHasRows(const std::string& root, const std::string& suffix) const {
+    if (!dynamic_tails_built || dynamic_tails_gen != leaf_cache_gen ||
+        dynamic_tails_rows != index_rows_loaded)
+        buildDynamicAosTails();
+    const auto it = dynamic_aos_tails.find(root);
+    if (it == dynamic_aos_tails.end()) return false;
+    return it->second.find(std::string_view(suffix)) != it->second.end();
+}
+int64_t PanzerDB::nearestAvailableSliceIndex(const char* full_path, int64_t requested_idx,
+                                             int64_t prefer_direction,
+                                             const std::vector<double>& time_basis,
+                                             double requested_time) const {
+    std::string target_path(full_path);
+
+    // The dynamic AoS prefix of the target (if any), mirroring the path
+    // resolution strategies of the pz_read*Data_by_index family:
+    //   direct path, generic path (index dropped), substituted path
+    //   (index replaced by the requested one).
+    std::string dynamic_aos;
+    std::string remainder_suffix; // e.g. "/ion/0/signal_1d" (leading '/')
+    for (const auto& aos_path : cached_dynamic_aos_roots) {
+        if (target_path.size() > aos_path.size() &&
+            target_path[aos_path.size()] == '/' &&
+            target_path.compare(0, aos_path.size(), aos_path) == 0) {
+            dynamic_aos = aos_path;
+            const std::string::size_type dyn_len = dynamic_aos.size();
+            // remainder = target_path[dyn_len+1 .. end]  (skips trailing '/')
+            const std::string::size_type rem_start = dyn_len + 1;
+            std::string remainder = (rem_start < target_path.size())
+                                            ? target_path.substr(rem_start)
+                                            : std::string();
+            std::string::size_type first_slash = remainder.find('/');
+            if (first_slash != std::string::npos) {
+                remainder_suffix = remainder.substr(first_slash);
+            }
+            break;
+        }
+    }
+
+    // A path holding no /index row cannot cover any index. Deciding that once, here,
+    // is what keeps a request for a signal this file does not carry from walking the
+    // whole time base to conclude nothing exists: the two scans below then cost
+    // 2 x slices probes, three path lookups each (to_improve.md point 24).
+    const long long nb = static_cast<long long>(time_basis.size());
+    const int64_t lo = 0;
+    const int64_t hi = (nb > 0) ? nb - 1 : 0;
+
+    if (no_slice_gen != leaf_cache_gen || no_slice_rows != index_rows_loaded) {
+        no_slice_at_any_index.clear();
+        no_slice_gen = leaf_cache_gen;
+        no_slice_rows = index_rows_loaded;
+    }
+    {
+        const auto dead = no_slice_at_any_index.find(target_path);
+        if (dead != no_slice_at_any_index.end() && dead->second == nb) return -1;
+    }
+
+    auto path_has_rows = [this](const std::string& path) -> bool {
+        const auto it = leaf_lookup.find(std::string_view(path));
+        return it != leaf_lookup.end() && !it->second.empty();
+    };
+    const std::string generic_path = dynamic_aos.empty() ? std::string()
+                                                         : dynamic_aos + remainder_suffix;
+    const bool target_live = path_has_rows(target_path);
+    const bool generic_live = !generic_path.empty() && path_has_rows(generic_path);
+    if (!target_live && !generic_live && dynamic_aos.empty()) return -1;
+
+    // Only the substituted form can answer now, and whether it exists AT ALL is a
+    // property of the decoded table, not of the requested index: if no row sits under
+    // this root with this tail, no index can be reached and the scans below would walk
+    // the whole time base to say so. Measured on 54924 occurrence 3 (V2): 501 of the
+    // 535 paths one getSlice asks for are absent, 8.1M probes, 402 of the 424 CPU-ms
+    // of the first slice read of a process (to_improve.md point 24).
+    const bool family_live = (!target_live && !generic_live)
+                                 ? dynamicAosFamilyHasRows(dynamic_aos, remainder_suffix)
+                                 : true;
+
+    if (!family_live) {
+        // Same conclusion the two scans would have reached, recorded the same way so
+        // the next read of this path stops before even resolving the root.
+        if (nb > 0 && requested_idx >= 0 && requested_idx <= hi)
+            no_slice_at_any_index[target_path] = nb;
+        return -1;
+    }
+
+    auto path_covers = [&](const std::string& path, int64_t idx) -> bool {
+        for (size_t lidx : rowsForTime(path, idx)) {
+            if (isTimeInLeaf(getLeaves()[lidx], idx)) return true;
+        }
+        return false;
+    };
+
+    auto available = [&](int64_t idx) -> bool {
+        if (target_live && path_covers(target_path, idx)) return true;
+        if (dynamic_aos.empty()) return false;
+        if (generic_live && path_covers(generic_path, idx)) return true; // generic
+        std::string substituted;
+        substituted.reserve(dynamic_aos.size() + remainder_suffix.size() + 12);
+        substituted.append(dynamic_aos);
+        substituted.push_back('/');
+        substituted.append(std::to_string(idx));
+        substituted.append(remainder_suffix);
+        return path_covers(substituted, idx);
+    };
+
+    if (available(requested_idx)) return requested_idx;
+
+    // Highest available index <= requested (linear search, few slices expected)
+    int64_t highest_below = -1;
+    for (int64_t i = requested_idx; i >= lo; --i) {
+        if (available(i)) { highest_below = i; break; }
+    }
+    // Lowest available index >= requested
+    int64_t lowest_above = -1;
+    if (requested_idx <= hi) {
+        for (int64_t i = requested_idx; i <= hi; ++i) {
+            if (available(i)) { lowest_above = i; break; }
+        }
+    }
+
+    // Both scans together covered every index of this time base and found nothing, so
+    // the answer does not depend on which index was asked for. Keyed on the time-base
+    // length too: that is the bound the scans covered, so a later read whose time base
+    // reaches further has to re-probe rather than inherit this -1. Recorded because the
+    // AL re-asks the same absent signals on each read (to_improve.md point 24).
+    if (highest_below == -1 && lowest_above == -1) {
+        if (nb > 0 && requested_idx >= 0 && requested_idx <= hi)
+            no_slice_at_any_index[target_path] = nb;
+        return -1;
+    }
+
+    if (prefer_direction < 0) {
+        return highest_below != -1 ? highest_below : lowest_above;
+    }
+    if (prefer_direction > 0) {
+        return lowest_above != -1 ? lowest_above : highest_below;
+    }
+
+    // Nearest in time; ties resolved to the smaller index
+    auto distance = [&](int64_t idx) -> double {
+        if (requested_time >= 0 && idx >= 0 && idx < static_cast<int64_t>(time_basis.size())) {
+            return std::abs(time_basis[idx] - requested_time);
+        }
+        return std::abs(static_cast<double>(idx - requested_idx));
+    };
+
+    if (highest_below == -1) return lowest_above;
+    if (lowest_above == -1) return highest_below;
+    double d_below = distance(highest_below);
+    double d_above = distance(lowest_above);
+    if (d_below < d_above) return highest_below;
+    if (d_above < d_below) return lowest_above;
+    return highest_below; // tie -> smaller index
+}
+
+int PanzerDB::readDataByIndex(
+                         const char* full_data_path,
+                         int64_t time_index,
+                         uint64_t* ndim_out,
+                         uint64_t shape_out[6],
+                         double** data_out) {
+
+
+    const auto& leaves = getLeaves();
+    if (leaves.empty()) return -1;
+
+    std::string_view target_path(full_data_path);
+    
+
+    if (time_index == -1) {
+        // --- Static or Global Search (Aggregation) ---
+        std::vector<const Leaf*> matches;
+        uint64_t total_count = 0;
+
+        // Note: In C++17/20, find with string_view works if heterogeneous lookup is enabled or via temp string
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            matches.reserve(it->second.size());
+            for (size_t idx : it->second) {
+                matches.push_back(&leaves[idx]);
+                total_count += leaves[idx].count;
+            }
+        }
+
+        if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            // shape_out can be left uninitialized
+            return 0; // Success, empty dataset
+        }
+
+        // Simple case: single leaf
+        if (matches.size() == 1) {
+            const Leaf& leaf = *matches[0];
+            
+            size_t slice_vol = 1;
+            for(auto s : leaf.shape_span()) if(s > 0) slice_vol *= s;
+            
+            if (leaf.count > slice_vol) {
+                *ndim_out = leaf.shape_span().size() + 1;
+                for (size_t i = 0; i < leaf.shape_span().size(); ++i) shape_out[i] = leaf.shape[i];
+                shape_out[*ndim_out - 1] = leaf.count / slice_vol;
+            } else {
+                *ndim_out = leaf.shape_span().size();
+                for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+            }
+            
+            *data_out = (double*)malloc(leaf.count * sizeof(double));
+            this->readTensor(leaf, *data_out);
+            return 0;
+        }
+
+        // Complex case: aggregation of time slices
+        std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
+            return a->time_index < b->time_index;
+        });
+
+        const Leaf& first = *matches[0];
+        *data_out = (double*)malloc(total_count * sizeof(double));
+        // OPTIMISATION: Use readLeavesUnion for batched read
+        if (readLeavesUnion(matches, *data_out, DataType::FLOAT64) < 0) {
+            size_t offset = 0;
+            for(const auto* leaf : matches) {
+                this->readTensor(*leaf, (*data_out) + offset);
+                offset += leaf->count;
+            }
+        }
+
+        *ndim_out = first.shape_span().size() + 1;
+        for(size_t i=0; i<first.shape_span().size(); ++i) shape_out[i] = first.shape[i];
+        
+        size_t slice_vol = 1;
+        for(auto s : first.shape_span()) if(s > 0) slice_vol *= s;
+        shape_out[*ndim_out - 1] = total_count / slice_vol;
+
+
+        return 0;
+    } else {
+        // --- Dynamic Search with specific time_index ---
+        
+        // 1. Direct search
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
+                const auto& leaf = leaves[idx];
+                if (isTimeInLeaf(leaf, time_index)) {
+                    size_t slice_volume = 1;
+                    for (auto s : leaf.shape_span()) if(s > 0) slice_volume *= s;
+                    if (slice_volume == 0) slice_volume = 1;
+                    
+                    *data_out = (double*)malloc(slice_volume * sizeof(double));
+                    if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
+                        free(*data_out);
+                        return -1;
+                    }
+                    
+                    *ndim_out = leaf.shape_span().size();
+                    for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                    
+                    return 0;
+                }
+            }
+        }
+
+        // 2. Search via index substitution in path
+        // Ex: "profiles_2d/0/ion/0/state/0/z_min" -> "profiles_2d/1/ion/0/state/0/z_min"
+        // for time_index=1
+        
+        // Note: We don't need to split the whole path to find the dynamic AoS.
+        // We iterate over known leaves to find the matching dynamic AoS prefix.
+        
+        // Find first dynamic AoS in hierarchy
+        std::string dynamic_aos_path = "";
+        // OPTIMISATION: Use cached roots instead of iterating all leaves
+        for (const auto& aos_path : cached_dynamic_aos_roots) {
+            // Check if target path starts with this AoS
+            if (target_path.size() > aos_path.size() && 
+                target_path[aos_path.size()] == '/' &&
+                target_path.compare(0, aos_path.size(), aos_path) == 0) {
+                dynamic_aos_path = aos_path;
+                break;
+            }
+        }
+        
+        if (!dynamic_aos_path.empty()) {
+            // OPTIMISATION: Parse une seule fois
+            // Inline logic using string_view to avoid allocations in parsePath
+            std::string_view aos_view(dynamic_aos_path);
+            
+            // We know target_path starts with aos_view + "/"
+            std::string_view remainder = target_path.substr(aos_view.size() + 1);
+            size_t first_slash = remainder.find('/');
+            
+            // If there is a remainder, we have an index
+            if (!remainder.empty()) {
+                std::string_view suffix = (first_slash != std::string_view::npos) 
+                                        ? remainder.substr(first_slash) 
+                                        : std::string_view();
+
+                // STRATEGY 1: Generic Path
+                std::string generic_path;
+                generic_path.reserve(aos_view.size() + suffix.size());
+                generic_path.append(aos_view);
+                generic_path.append(suffix);
+
+
+                auto it_gen = leaf_lookup.find(generic_path);
+                if (it_gen != leaf_lookup.end()) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
+                        const auto& leaf = leaves[idx];
+                        if (isTimeInLeaf(leaf, time_index)) {
+                            size_t slice_volume = 1;
+                            for (auto s : leaf.shape_span()) if(s > 0) slice_volume *= s;
+                            if (slice_volume == 0) slice_volume = 1;
+                            
+                            *data_out = (double*)malloc(slice_volume * sizeof(double));
+                            if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
+                                free(*data_out);
+                                return -1;
+                            }
+                            
+                            *ndim_out = leaf.shape_span().size();
+                            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                            
+                            return 0;
+                        }
+                    }
+                }
+
+                // STRATEGY 2: Substituted Path
+                std::string substituted_path;
+                substituted_path.reserve(aos_view.size() + 25 + suffix.size());
+                substituted_path.append(aos_view);
+                substituted_path.push_back('/');
+                substituted_path.append(std::to_string(time_index));
+                substituted_path.append(suffix);
+
+                auto it_sub = leaf_lookup.find(substituted_path);
+                if (it_sub != leaf_lookup.end()) {
+                    for (size_t idx : rowsForTime(substituted_path, time_index)) {
+                        const auto& leaf = leaves[idx];
+                        if (isTimeInLeaf(leaf, time_index)) {
+                            size_t slice_volume = 1;
+                            for (auto s : leaf.shape_span()) if(s > 0) slice_volume *= s;
+                            if (slice_volume == 0) slice_volume = 1;
+                            
+                            *data_out = (double*)malloc(slice_volume * sizeof(double));
+                            if (this->readSliceDirect(leaf, time_index, *data_out) < 0) {
+                                free(*data_out);
+                                return -1;
+                            }
+                            
+                            *ndim_out = leaf.shape_span().size();
+                            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                            
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+int PanzerDB::readStringDataByIndex(
+                          const char* full_data_path,
+                          int64_t time_index,
+                          uint64_t* ndim_out,
+                          uint64_t shape_out[6],
+                          char** data_out) {
+
+
+    const auto& leaves = getLeaves();
+    if (leaves.empty()) return -1;
+
+    std::string_view target_path(full_data_path);
+
+
+    if (time_index == -1) {
+        // --- Static/Global Search ---
+        std::vector<const Leaf*> matches;
+        uint64_t total_count = 0;
+
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            matches.reserve(it->second.size());
+            for (size_t idx : it->second) {
+                matches.push_back(&leaves[idx]);
+                total_count += leaves[idx].count;
+            }
+        }
+
+        if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0; // Success, empty dataset
+        }
+
+        std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
+            return a->time_index < b->time_index;
+        });
+
+        std::vector<std::string> buffer;
+        buffer.reserve(total_count);
+
+        for(const auto* leaf : matches) {
+            size_t current_size = buffer.size();
+            buffer.resize(current_size + leaf->count);
+            readTensor(*leaf, buffer.data() + current_size);
+        }
+
+        size_t max_len = 0;
+        for(const auto& s : buffer) {
+            if (s.length() > max_len) max_len = s.length();
+        }
+        max_len += 1;
+
+        size_t total_bytes = total_count * max_len;
+        *data_out = (char*)malloc(total_bytes);
+        memset(*data_out, 0, total_bytes);
+
+        for(size_t i=0; i<total_count; ++i) {
+            strncpy(*data_out + (i * max_len), buffer[i].c_str(), max_len - 1);
+        }
+
+        *ndim_out = 2;
+        shape_out[0] = total_count;
+        shape_out[1] = max_len;
+
+        return 0;
+    }
+
+    // --- Dynamic Search ---
+    const PanzerDB::Leaf* target_leaf = nullptr;
+    
+    // 1. Direct search
+    auto it = leaf_lookup.find(target_path);
+    if (it != leaf_lookup.end()) {
+        for (size_t idx : rowsForTime(target_path, time_index)) {
+            if (isTimeInLeaf(leaves[idx], time_index)) {
+                target_leaf = &leaves[idx];
+                break;
+            }
+        }
+    }
+
+    // 2. Search via substitution
+    if (!target_leaf) {
+        std::string dynamic_aos_path = "";
+        for (const auto& aos_path : cached_dynamic_aos_roots) {
+            if (target_path.size() > aos_path.size() && 
+                target_path[aos_path.size()] == '/' &&
+                target_path.compare(0, aos_path.size(), aos_path) == 0) {
+                dynamic_aos_path = aos_path;
+                break;
+            }
+        }
+
+        if (!dynamic_aos_path.empty()) {
+            std::string prefix = dynamic_aos_path + "/";
+            if (target_path.size() >= prefix.size() && target_path.compare(0, prefix.size(), prefix) == 0) {
+                std::string_view suffix = target_path.substr(prefix.length());
+                size_t first_slash = suffix.find('/');
+                
+                // STRATEGY 1: Generic Path
+                std::string generic_path = dynamic_aos_path;
+                if (first_slash != std::string::npos) {
+                    generic_path.append(suffix.substr(first_slash));
+                } else {
+                    generic_path.append("/").append(suffix);
+                }
+
+                auto it_gen = leaf_lookup.find(generic_path);
+                if (it_gen != leaf_lookup.end()) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
+                        if (isTimeInLeaf(leaves[idx], time_index)) {
+                            target_leaf = &leaves[idx];
+                            break;
+                        }
+                    }
+                }
+
+                // STRATEGY 2: Substituted Path
+                if (!target_leaf) {
+                    std::string substituted_path = dynamic_aos_path + "/" + std::to_string(time_index);
+                    if (first_slash != std::string::npos) {
+                        substituted_path.append(suffix.substr(first_slash));
+                    }
+                    auto it_sub = leaf_lookup.find(substituted_path);
+                    if (it_sub != leaf_lookup.end()) {
+                        for (size_t idx : rowsForTime(substituted_path, time_index)) {
+                            if (isTimeInLeaf(leaves[idx], time_index)) {
+                                target_leaf = &leaves[idx];
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!target_leaf) {
+        // Fallback to direct search if substitution fails (for root dynamic signals)
+        auto it_fb = leaf_lookup.find(target_path);
+        if (it_fb != leaf_lookup.end()) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
+                if (isTimeInLeaf(leaves[idx], time_index)) {
+                    target_leaf = &leaves[idx];
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (target_leaf) {
+        // OPTIMISATION: Utilisation du scratch buffer string
+        scratch_str.resize(target_leaf->count);
+        readTensor(*target_leaf, scratch_str.data());
+        
+        size_t shape_prod = 1;
+        for(auto s : target_leaf->shape_span()) shape_prod *= s;
+        if (shape_prod == 0) shape_prod = 1;
+
+        uint64_t n_steps = target_leaf->count / shape_prod;
+        if (n_steps == 0) n_steps = 1;
+        
+        uint64_t element_size = target_leaf->count / n_steps;
+        uint64_t local_step = time_index - target_leaf->time_index;
+        
+        size_t start_idx = local_step * element_size;
+        
+        bool is_scalar = isStringScalarLeaf(*target_leaf);
+        const bool chunked =
+            (leafDataType(*target_leaf) == DataType::STRING_CHUNKED);
+
+        if (is_scalar) {
+            // A STRING_CHUNKED scalar spans `count` fixed slots; concatenate them
+            // into one logical string. A short scalar has count==1 -> unchanged.
+            const size_t span = chunked ? (size_t)target_leaf->count : 1u;
+            const size_t base = chunked ? 0u : (size_t)start_idx;
+            std::string joined;
+            for (size_t i = 0; i < span; ++i) joined += scratch_str[base + i];
+            *data_out = (char*)malloc(joined.size() + 1);
+            strcpy(*data_out, joined.c_str());
+
+            *ndim_out = 1;
+            shape_out[0] = joined.size();
+        } else {
+            // ── Spanned list path (IMAS: elements > 512B chunked across multiple slots) ──
+            std::vector<SpanEntry> spans;
+            if (isListSpanned(target_leaf->row_id)) {
+                const auto& ref = getListSpans(target_leaf->row_id);
+                spans = ref;
+            }
+
+            if (!spans.empty()) {
+                // `scratch_str` holds leaf.count physical slots (one per 512B slot).
+                // Each span entry gives: slot_offset (relative) + slot_span (how many slots).
+                size_t max_len = 0;
+                for (const auto& se : spans) {
+                    size_t len = 0;
+                    for (size_t k = 0; k < se.slot_span; ++k)
+                        len += scratch_str[se.slot_offset + k].length();
+                    if (len > max_len) max_len = len;
+                }
+                max_len += 1;
+
+                size_t n_logical = (size_t)spans.size();
+                size_t total_bytes = n_logical * max_len;
+                *data_out  = (char*)malloc(total_bytes);
+                memset(*data_out, 0, total_bytes);
+
+                size_t slot_cursor = 0;   // redundant with se.slot_offset but kept for clarity
+                for (size_t i = 0; i < n_logical; ++i) {
+                    const auto& se = spans[i];
+                    std::string joined;
+                    for (size_t k = 0; k < se.slot_span; ++k)
+                        joined += scratch_str[se.slot_offset + k];
+                    strncpy(*data_out + (i * max_len), joined.c_str(), max_len - 1);
+                }
+
+                *ndim_out = 2;
+                shape_out[0] = n_logical;
+                shape_out[1] = max_len;
+                return 0;
+            }
+
+            // ── Compact list path (all elements <= 512B, one slot each) — existing code ──
+            size_t max_len = 0;
+            for(size_t i=0; i<element_size; ++i) {
+                size_t len = scratch_str[start_idx + i].length();
+                if (len > max_len) max_len = len;
+            }
+            max_len += 1;
+
+            size_t total_bytes = element_size * max_len;
+            *data_out = (char*)malloc(total_bytes);
+            memset(*data_out, 0, total_bytes);
+
+            for(size_t i=0; i<element_size; ++i) {
+                const std::string& s = scratch_str[start_idx + i];
+                strncpy(*data_out + (i * max_len), s.c_str(), max_len - 1);
+            }
+
+            *ndim_out = 2;
+            shape_out[0] = element_size;
+            shape_out[1] = max_len;
+        }
+        
+        return 0;
+    }
+
+    return -1;
+}
+
+int PanzerDB::readComplexDataByIndex(
+                          const char* full_data_path,
+                          int64_t time_index,
+                          uint64_t* ndim_out,
+                          uint64_t shape_out[6],
+                          std::complex<double>** data_out) {
+
+
+    const auto& leaves = getLeaves();
+    if (leaves.empty()) return -1;
+
+    std::string_view target_path(full_data_path);
+
+    
+    if (time_index == -1) {
+        // --- Static/Global Search ---
+        std::vector<const Leaf*> matches;
+        uint64_t total_count = 0;
+
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            matches.reserve(it->second.size());
+            for (size_t idx : it->second) {
+                matches.push_back(&leaves[idx]);
+                total_count += leaves[idx].count;
+            }
+        }
+
+        if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0; // Success, empty dataset
+        }
+
+        if (matches.size() == 1) {
+            const Leaf& leaf = *matches[0];
+            
+            size_t slice_vol = 1;
+            for(auto s : leaf.shape_span()) if(s > 0) slice_vol *= s;
+            
+            if (leaf.count > slice_vol) {
+                *ndim_out = leaf.shape_span().size() + 1;
+                for (size_t i = 0; i < leaf.shape_span().size(); ++i) shape_out[i] = leaf.shape[i];
+                shape_out[*ndim_out - 1] = leaf.count / slice_vol;
+            } else {
+                *ndim_out = leaf.shape_span().size();
+                for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+            }
+            
+            *data_out = (std::complex<double>*)malloc(leaf.count * sizeof(std::complex<double>));
+            this->readTensor(leaf, *data_out);
+            return 0;
+        }
+
+        std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
+            return a->time_index < b->time_index;
+        });
+
+        const Leaf& first = *matches[0];
+        *data_out = (std::complex<double>*)malloc(total_count * sizeof(std::complex<double>));
+        // OPTIMISATION: Use readLeavesUnion for batched read
+        if (readLeavesUnion(matches, *data_out, DataType::COMPLEX128) < 0) {
+            size_t offset = 0;
+            for(const auto* leaf : matches) {
+                this->readTensor(*leaf, (*data_out) + offset);
+                offset += leaf->count;
+            }
+        }
+
+        *ndim_out = first.shape_span().size() + 1;
+        for(size_t i=0; i<first.shape_span().size(); ++i) shape_out[i] = first.shape[i];
+        
+        size_t slice_vol = 1;
+        for(auto s : first.shape_span()) if(s > 0) slice_vol *= s;
+        shape_out[*ndim_out - 1] = total_count / slice_vol;
+
+        return 0;
+    }
+
+    // --- Dynamic Search ---
+    
+    const PanzerDB::Leaf* target_leaf = nullptr;
+
+    // 1. Direct search
+    auto it = leaf_lookup.find(target_path);
+    if (it != leaf_lookup.end()) {
+        for (size_t idx : rowsForTime(target_path, time_index)) {
+            if (isTimeInLeaf(leaves[idx], time_index)) {
+                target_leaf = &leaves[idx];
+                break;
+            }
+        }
+    }
+
+    // 2. Search via substitution
+    if (!target_leaf) {
+        std::string dynamic_aos_path = "";
+        for (const auto& aos_path : cached_dynamic_aos_roots) {
+            if (target_path.size() > aos_path.size() && 
+                target_path[aos_path.size()] == '/' &&
+                target_path.compare(0, aos_path.size(), aos_path) == 0) {
+                dynamic_aos_path = aos_path;
+                break;
+            }
+        }
+
+        if (!dynamic_aos_path.empty()) {
+            std::string prefix = dynamic_aos_path + "/";
+            if (target_path.size() >= prefix.size() && target_path.compare(0, prefix.size(), prefix) == 0) {
+                std::string_view suffix = target_path.substr(prefix.length());
+                size_t first_slash = suffix.find('/');
+
+                // STRATEGY 1: Generic Path
+                std::string generic_path = dynamic_aos_path;
+                if (first_slash != std::string::npos) {
+                    generic_path.append(suffix.substr(first_slash));
+                } else {
+                    generic_path.append("/").append(suffix);
+                }
+                auto it_gen = leaf_lookup.find(generic_path);
+                if (it_gen != leaf_lookup.end()) {
+                    for (size_t idx : rowsForTime(generic_path, time_index)) {
+                        if (isTimeInLeaf(leaves[idx], time_index)) {
+                            target_leaf = &leaves[idx];
+                            break;
+                        }
+                    }
+                }
+
+                // STRATEGY 2: Substituted Path
+                if (!target_leaf) {
+                    std::string substituted_path = dynamic_aos_path + "/" + std::to_string(time_index);
+                    if (first_slash != std::string::npos) {
+                        substituted_path.append(suffix.substr(first_slash));
+                    }
+                    auto it_sub = leaf_lookup.find(substituted_path);
+                    if (it_sub != leaf_lookup.end()) {
+                        for (size_t idx : rowsForTime(substituted_path, time_index)) {
+                            if (isTimeInLeaf(leaves[idx], time_index)) {
+                                target_leaf = &leaves[idx];
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (target_leaf) {
+        size_t slice_volume = 1;
+        for(auto s : target_leaf->shape_span()) if (s > 0) slice_volume *= s;
+        if (slice_volume == 0) slice_volume = 1;
+        
+        *data_out = (std::complex<double>*)malloc(slice_volume * sizeof(std::complex<double>));
+        if (this->readSliceDirect(*target_leaf, time_index, *data_out) < 0) {
+            free(*data_out);
+            return -1;
+        }
+        
+        *ndim_out = target_leaf->shape_span().size();
+        for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = target_leaf->shape[i];
+        
+        return 0;
+    }
+
+    return -1;
+}
+
+int PanzerDB::readIntDataByIndex(
+                         const char* full_data_path,
+                         int64_t time_index,
+                         uint64_t* ndim_out,
+                         uint64_t shape_out[6],
+                         int32_t** data_out) {
+
+    const auto& leaves = getLeaves();
+    if (leaves.empty()) return -1;
+
+    std::string_view target_path(full_data_path);
+    
+    if (time_index == -1) {
+        // --- Static or Global Search (Aggregation) ---
+        std::vector<const Leaf*> matches;
+        uint64_t total_count = 0;
+
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            matches.reserve(it->second.size());
+            for (size_t idx : it->second) {
+                const auto& leaf = leaves[idx];
+                if (static_cast<DataType>(leaf.flags >> 4) == DataType::INT32) {
+                    matches.push_back(&leaf);
+                    total_count += leaf.count;
+                }
+            }
+        }
+
+        if (matches.empty()) return -1;
+
+        if (total_count == 0) {
+            *data_out = nullptr;
+            *ndim_out = 0;
+            return 0;
+        }
+
+        *data_out = (int32_t*)malloc(total_count * sizeof(int32_t));
+
+        if (matches.size() == 1) {
+            const Leaf& leaf = *matches[0];
+            this->readTensor(leaf, *data_out);
+            // Bulk-written time series in ONE leaf (count = n_slices * prod(shape))
+            // re-append the time dimension: same rule as the FLOAT64
+            // readDataByIndex single-leaf branch (before, the int variant lost
+            // it, so a scalar int series read as 0D).
+            size_t slice_vol = 1;
+            for (auto s : leaf.shape_span()) if (s > 0) slice_vol *= s;
+            if (leaf.count > slice_vol) {
+                *ndim_out = leaf.shape_span().size() + 1;
+                for (size_t i = 0; i + 1 < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+                shape_out[*ndim_out - 1] = leaf.count / slice_vol;
+            } else {
+                *ndim_out = leaf.shape_span().size();
+             for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = leaf.shape[i];
+            }
+            return 0;
+        }
+
+        // Aggregation of time slices
+        std::sort(matches.begin(), matches.end(), [](const Leaf* a, const Leaf* b){
+            return a->time_index < b->time_index;
+        });
+
+        if (readLeavesUnion(matches, *data_out, DataType::INT32) < 0) {
+            // Fallback to sequential reads if union fails
+            size_t offset = 0;
+            for(const auto* leaf : matches) {
+                this->readTensor(*leaf, (*data_out) + offset);
+                offset += leaf->count;
+            }
+        }
+
+        const Leaf& first = *matches[0];
+        *ndim_out = first.shape_span().size() + 1;
+        for(size_t i=0; i<first.shape_span().size(); ++i) shape_out[i] = first.shape[i];
+        
+        size_t slice_vol = 1;
+        for(auto s : first.shape_span()) if(s > 0) slice_vol *= s;
+        if (slice_vol > 0) {
+            shape_out[*ndim_out - 1] = total_count / slice_vol;
+        } else {
+            shape_out[*ndim_out - 1] = total_count;
+        }
+
+        return 0;
+
+    } else {
+        // --- Dynamic Search with specific time_index ---
+        const Leaf* target_leaf = nullptr;
+
+        // 1. Direct search
+        auto it = leaf_lookup.find(target_path);
+        if (it != leaf_lookup.end()) {
+            for (size_t idx : rowsForTime(target_path, time_index)) {
+                const auto& leaf = leaves[idx];
+                if (static_cast<DataType>(leaf.flags >> 4) == DataType::INT32 && isTimeInLeaf(leaf, time_index)) {
+                    target_leaf = &leaf;
+                    break;
+                }
+            }
+        }
+
+        // 2. Search via index substitution in path (if not found yet)
+        if (!target_leaf) {
+             // This logic would be a copy of readDataByIndex, adapted for int32.
+             // For now, we keep it simple.
+        }
+
+        if (target_leaf) {
+            size_t slice_volume = 1;
+            for (auto s : target_leaf->shape_span()) if(s > 0) slice_volume *= s;
+            if (slice_volume == 0) slice_volume = 1;
+            
+            *data_out = (int32_t*)malloc(slice_volume * sizeof(int32_t));
+            if (this->readSliceDirect(*target_leaf, time_index, *data_out) < 0) {
+                free(*data_out);
+                return -1;
+            }
+            
+            *ndim_out = target_leaf->shape_span().size();
+            for (size_t i = 0; i < *ndim_out && i < 6; ++i) shape_out[i] = target_leaf->shape[i];
+            
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+int PanzerDB::readInterpolatedData(
+                         const char* full_data_path,  // ✅ Changed
+                         double time,
+                         const std::vector<double>& time_basis,
+                         int interp_mode,
+                         int datatype,
+                         uint64_t* ndim_out,
+                         uint64_t shape_out[6],
+                         void** data_out,
+                         bool expect_time_dim) {
+
+    // A node this file does not hold has no row in the decoded table, at any time
+    // index. Settling that BEFORE the time base is consulted is what keeps a signal
+    // the dictionary declares but nobody wrote from dying inside DataInterpolation:
+    // such a signal has no base of its own either, and an empty time vector is
+    // precisely what getSlicesTimesIndices throws on two lines below -- so the
+    // absence of the data was never reported, only the absence of its base. The 1.0
+    // reader tests the dataset first (HDF5Reader::read_ND_Data) and leaves the node
+    // undefined. The resolution mirrors nearestAvailableSliceIndex, which keeps its
+    // own early-outs for signals that do exist.
+    auto filed_under_any_index = [this](const char* path) -> bool {
+        getLeaves(); // builds leaf_lookup and cached_dynamic_aos_roots
+        auto rows_for = [this](const std::string& p) -> bool {
+            const auto it = leaf_lookup.find(std::string_view(p));
+            return it != leaf_lookup.end() && !it->second.empty();
+        };
+        std::string target(path);
+        if (rows_for(target)) return true;
+        for (const auto& root : cached_dynamic_aos_roots) {
+            if (target.size() <= root.size() || target[root.size()] != '/' ||
+                target.compare(0, root.size(), root) != 0) continue;
+            // The reader addresses a node through the AoS index it carries, but the
+            // file may hold it under the generic path (index dropped) or under a
+            // different index of the same family -- either form can answer.
+            const std::string remainder = target.substr(root.size() + 1);
+            const auto slash = remainder.find('/');
+            const std::string suffix =
+                (slash == std::string::npos) ? std::string() : remainder.substr(slash);
+            if (rows_for(root + suffix)) return true;
+            return dynamicAosFamilyHasRows(root, suffix);
+        }
+        return false;
+    };
+    if (!filed_under_any_index(full_data_path)) return -1;
+
+    DataInterpolation data_interpolation_component;
+    std::map<std::string, int> times_indices;
+
+    int slice_index = data_interpolation_component.getSlicesTimesIndices(time, time_basis, times_indices, interp_mode);
+    int request_sup = times_indices[SLICE_SUP];
+
+    // Resolve the requested time indices to available slices.
+    // A "gap" (missing slice for this signal) is resolved to the closest
+    // available slice:
+    //   - closest / undefined : nearest available slice in time (ties -> lower index)
+    //   - previous            : last available <= t (else first available >= t)
+    //   - linear              : last available <= t (inf) and first available
+    //                           >= t (sup), interpolation factor computed with
+    //                           the actual times of those slices.
+    // A signal with no data at all -> -1 (data not available).
+    // Closest (and undefined) ask for the nearest slice in time; previous and
+    // linear ask for "last available <= t" on the inf side.
+    const bool want_nearest = (interp_mode != PREVIOUS_INTERP && interp_mode != LINEAR_INTERP);
+    const int64_t inf_direction = want_nearest ? 0 : -1;
+    int64_t inf_i = nearestAvailableSliceIndex(full_data_path, slice_index, inf_direction, time_basis, time);
+    if (inf_i == -1) return -1;
+
+    int64_t sup_i = inf_i;
+    if (interp_mode == LINEAR_INTERP && request_sup != slice_index) {
+        sup_i = nearestAvailableSliceIndex(full_data_path, request_sup, +1, time_basis, time);
+        if (sup_i == -1) sup_i = inf_i;
+        if (sup_i < inf_i) {
+            std::swap(inf_i, sup_i);
+        }
+    }
+
+    auto read_slice_at = [this, full_data_path, datatype, ndim_out, shape_out](int64_t idx, void** out_ptr) -> int {
+        *out_ptr = nullptr;
+        if (datatype == alconst::char_data) {
+            return readStringDataByIndex(full_data_path, idx, ndim_out, shape_out, (char**)out_ptr);
+        } else if (datatype == alconst::complex_data) {
+            return readComplexDataByIndex(full_data_path, idx, ndim_out, shape_out, (std::complex<double>**)out_ptr);
+        } else {
+            return readDataByIndex(full_data_path, idx, ndim_out, shape_out, (double**)out_ptr);
+        }
+    };
+
+    void* data_inf = nullptr;
+    if (read_slice_at(inf_i, &data_inf) != 0) {
+        return -1;
+    }
+
+    if (sup_i == inf_i || interp_mode != LINEAR_INTERP) {
+        *data_out = data_inf;
+        return 0;
+    }
+
+    void* data_sup = nullptr;
+    if (read_slice_at(sup_i, &data_sup) != 0) {
+        free(data_inf);
+        return -1;
+    }
+
+    std::map<std::string, double> slices_times;
+    slices_times[SLICE_INF] = time_basis[inf_i];
+    slices_times[SLICE_SUP] = time_basis[sup_i];
+
+    std::map<std::string, void*> y_slices;
+    y_slices[SLICE_INF] = data_inf;
+    y_slices[SLICE_SUP] = data_sup;
+
+    size_t shape_prod = 1;
+    for (size_t i = 0; i < *ndim_out; ++i) shape_prod *= shape_out[i];
+
+    data_interpolation_component.interpolate(datatype, shape_prod, y_slices, slices_times, time, data_out, interp_mode);
+
+    if (data_inf && *data_out != data_inf) free(data_inf);
+    if (data_sup && *data_out != data_sup) free(data_sup);
+
+    return 0;
+}
+
+std::string PanzerDB::getDynamicAOSPath() const {
+    // OPTIMISATION: Retourner le cache si valide
+    if (dynamic_aos_path_valid) {
+        return cached_dynamic_aos_path;
+    }
+    
+    if (array_stack.empty()) {
+        cached_dynamic_aos_path = "";
+        dynamic_aos_path_valid = true;
+        return cached_dynamic_aos_path;
+    }
+    
+    // Recherche du premier AoS dynamique dans le stack
+    for (auto it = array_stack.rbegin(); it != array_stack.rend(); ++it) {
+        if (it->is_dynamic) {
+            cached_dynamic_aos_path = it->aos_full_path;
+            dynamic_aos_path_valid = true;
+            return cached_dynamic_aos_path;
+        }
+    }
+    
+    cached_dynamic_aos_path = "";
+    dynamic_aos_path_valid = true;
+    return cached_dynamic_aos_path;
+}
+
+void PanzerDB::invalidateDynamicAOSCache() {
+    dynamic_aos_path_valid = false;
+}
+
+uint64_t PanzerDB::getCurrentTimeForAOS(const std::string& aos_path) {
+    if (aos_path.empty()) return 0;
+    auto it = aos_time_counters.find(aos_path);
+    return (it != aos_time_counters.end()) ? it->second : 0;
+}
+
+void PanzerDB::advanceTimeForAOS(const std::string& aos_path, uint64_t delta) {
+    if (!aos_path.empty()) {
+        aos_time_counters[aos_path] += delta;
+    }
+}
+
+// Dans panzerdb.cpp
+void PanzerDB::advanceTimebase(const std::string& timebase_name, uint64_t n_steps) {
+    std::string dynamic_aos_path = getDynamicAOSPath();
+    if (dynamic_aos_path.empty()) {
+        throw std::runtime_error("advanceTimebase called outside a dynamic AoS");
+    }
+    advanceTimeForAOS(dynamic_aos_path, n_steps);
+}
+
+
+// Retrieve a whole dynamic signal that is not inside an AoS
+std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) const {
+
+    // 1. Access the in-memory index
+    const auto& leaves = getLeaves();
+
+    // When this signal was written slice by slice it occupies one row per time step,
+    // interleaved with the payloads separating those steps, so the read below touches
+    // every chunk of the raw dataset: doing it once per slice read costs O(total
+    // payload) per call (to_improve.md point 24). Keep the payload while the index
+    // state it was derived from is still what this engine sees.
+    if (whole_signals_gen == leaf_cache_gen && whole_signals_rows == index_rows_loaded) {
+        const auto cached = whole_signals.find(dataset_name);
+        if (cached != whole_signals.end()) return cached->second;
+    } else {
+        whole_signals.clear();
+        whole_signals_gen = leaf_cache_gen;
+        whole_signals_rows = index_rows_loaded;
+    }
+
+    // 2. Filtrer les feuilles correspondant au dataset
+    std::vector<const PanzerDB::Leaf*> target_leaves;
+    size_t total_elements = 0;
+
+    auto it = leaf_lookup.find(dataset_name);
+    if (it != leaf_lookup.end()) {
+        for (size_t idx : it->second) {
+            // Comparaison stricte car le dataset n'est pas dans un AOS
+            // (already guaranteed by the lookup)
+            target_leaves.push_back(&leaves[idx]);
+            total_elements += leaves[idx].count;
+        }
+    }
+
+    if (target_leaves.empty()) {
+        return {};
+    }
+
+    // 3. Sort by Time Index
+    // Crucial if data was written in multiple times (APPEND)
+    std::sort(target_leaves.begin(), target_leaves.end(), 
+        [](const PanzerDB::Leaf* a, const PanzerDB::Leaf* b) {
+            return a->time_index < b->time_index;
+        });
+
+    // 4. Result vector pre-allocation
+    std::vector<double> full_signal;
+    full_signal.resize(total_elements);
+
+    // 5. Reading and assembly (Concatenation).
+    // Batched like the other multi-leaf reads: one hyperslab union over the
+    // time-sorted leaves instead of one H5Dread per APPEND chunk.
+    if (readLeavesUnion(target_leaves, full_signal.data(), DataType::FLOAT64) < 0) {
+        // Fallback: sequential per-leaf read (non-monotonic offsets).
+        size_t current_offset = 0;
+        for (const auto* leaf : target_leaves) {
+            readTensor(*leaf, full_signal.data() + current_offset);
+            current_offset += leaf->count;
+        }
+    }
+
+    whole_signals[dataset_name] = full_signal;
+    return full_signal;
+}
+
+std::string PanzerDB::stripIndices(const std::string& path) {
+    std::string result;
+    result.reserve(path.size());
+
+    // One pass over the segments. Equivalent to splitting on '/' and dropping the
+    // empty ones and the purely-numeric ones (AoS indices), but without a
+    // stringstream: this runs twice per node on the read path, and constructing a
+    // stream (locale + ios bookkeeping) was measurable there.
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t end = path.find('/', i);
+        if (end == std::string::npos) end = path.size();
+        const size_t len = end - i;
+        bool is_index = (len > 0);
+        for (size_t k = i; k < end && is_index; ++k)
+            is_index = (path[k] >= '0' && path[k] <= '9');
+        if (len > 0 && !is_index) {
+            if (!result.empty()) result += '/';
+            result.append(path, i, len);
+        }
+        i = end + 1;
+    }
+    return result;
+}
+
+void PanzerDB::writeMetadata(const std::string& path, const std::string& value) {
+    // path is the full metadata key, e.g., "flux_loop/field@units"
+    // value is the metadata value, e.g., "T"
+
+    // Use the set to avoid writing the same metadata attribute more than once.
+    // This is critical for efficiency and for APPEND mode.
+    if (written_metadata_schema_paths.count(path)) {
+        return; // Already written for this schema, do nothing.
+    }
+
+    // Treat the metadata entry as a single, static string.
+    const char* value_cstr = value.c_str();
+
+    // Write the string using the specialized writeData template.
+    // The 'path' itself serves as the unique dataset name for the metadata.
+    // Shape is empty for a scalar, count is 1, and timebase is empty for static data.
+    this->writeData<const char*>(path, {}, &value_cstr, 1, "");
+
+    // Mark this metadata path as written to prevent duplicates.
+    written_metadata_schema_paths.insert(path);
+}
+
+
+std::map<std::string, std::string> PanzerDB::readMetadata(const std::string& instance_path) {
+    std::map<std::string, std::string> metadata;
+
+    // 1. Convert to schema path (remove indices)
+    std::string schema_path = stripIndices(instance_path);
+
+    // 2. Check cache to avoid redundant reads
+    if (written_metadata_schema_paths.count(schema_path)) {
+        return metadata; // Already processed, return empty (or cached if we stored it)
+    }
+
+    // 3. Resolve this schema's @key leaves from the index built in getLeaves()
+    //    (was an O(N) scan of the whole index with a prefix test per read_ND_Data call).
+    const auto it_meta = metadata_by_schema.find(schema_path);
+    if (it_meta != metadata_by_schema.end()) {
+        for (size_t leaf_idx : it_meta->second) {
+            const Leaf& leaf = cached_leaves[leaf_idx];
+            std::string key(leaf.path.substr(schema_path.size() + 1));
+            std::string value;
+            if (static_cast<uint64_t>(leaf.flags >> 4) ==
+                static_cast<uint64_t>(DataType::STRING_CHUNKED)) {
+                // Scalar string split across `count` slots -> read all, concatenate.
+                std::vector<std::string> parts(leaf.count);
+                readTensor<std::string>(leaf, parts.data());
+                for (const auto& p : parts) value += p;
+            } else {
+                readTensor<std::string>(leaf, &value);
+            }
+            metadata[key] = value;
+        }
+    }
+
+    // 4. Mark as processed
+    written_metadata_schema_paths.insert(schema_path);
+    return metadata;
+}
+
+void PanzerDB::synchronizeArrayStack(const std::vector<std::string>& aos_names,
+                                     const std::vector<int>& indices) {
+    if (aos_names.size() != indices.size()) {
+        throw std::runtime_error("synchronizeArrayStack: aos_names and indices must have the same size");
+    }
+    
+    if (aos_names.empty()) return;
+    
+    size_t sync_depth = std::min(array_stack.size(), aos_names.size());
+    
+    if (sync_depth == 0) {
+        return;
+    }
+    
+   // OPTIMIZATION 2: in-place modification with change detection
+    bool modified = false;
+    for (size_t level = 0; level < sync_depth; ++level) {
+        const std::string& target_name = aos_names[level];
+        int target_index = indices[level];
+        
+        ArrayLevel& current_level = array_stack[level];
+        
+        // name check
+        if (current_level.name != target_name) {
+            continue;
+        }
+        
+        // FIX: Ne pas synchroniser dynamic AoS en mode APPEND
+        if (mode == OpenMode::APPEND && current_level.is_dynamic) {
+            continue;
+        }
+
+        // update if necessary
+        if (current_level.current_index != static_cast<size_t>(target_index)) {
+            current_level.current_index = target_index;
+            modified = true;
+        }
+    }
+    
+    // OPTIMIZATION 3: rebuild only if modified
+    if (modified) {
+        // Reconstruire le stack
+        
+        // optimized rebuild of path_prefix (single allocation)
+        path_prefix = buildPathFromStack(array_stack);
+    }
+}
+
+/**
+ * @brief Determines the data type of a leaf from its path using the
+ * in-memory PanzerDB index. This is the correct and performant way.
+ * @param path Full logical path to the data node.
+ * @return The data type as a DataType enum value.
+ */
+ imas::direct_access::DataType PanzerDB::getLeafType(const std::string& path)
+ {
+     // 1. Fetch the in-memory index (fast, uses the cache).
+     const auto& leaves = getLeaves();
+ 
+     // 2. Look up the leaf using PanzerDB's optimized lookup table.
+     auto it = leaf_lookup.find(std::string_view(path));
+     if (it != leaf_lookup.end() && !it->second.empty()) {
+         // A path may have several entries (e.g. time series).
+         // The type is identical for all of them, so take the first one.
+         const Leaf& leaf = leaves[it->second[0]];
+ 
+         // 3. Decode the data type from the 'flags' member.
+         // The type is encoded in the most significant bits.
+         uint64_t type_bits = (leaf.flags >> 4);
+         PanzerDB::DataType pz_type = static_cast<PanzerDB::DataType>(type_bits);
+ 
+         // 4. Fait la correspondance entre le type interne de PanzerDB et celui de l'API.
+         switch (pz_type) {
+             case PanzerDB::DataType::FLOAT64:
+                 return imas::direct_access::DataType::DOUBLE;
+             case PanzerDB::DataType::INT32:
+                 return imas::direct_access::DataType::INT32;
+             case PanzerDB::DataType::COMPLEX128:
+                 return imas::direct_access::DataType::COMPLEX_DOUBLE;
+             case PanzerDB::DataType::STRING:
+                 return imas::direct_access::DataType::STRING;
+             case PanzerDB::DataType::STRING_CHUNKED:
+                 return imas::direct_access::DataType::STRING; // scalar, read-joined
+             case PanzerDB::DataType::LIST_OF_STRINGS:
+                 return imas::direct_access::DataType::LIST_OF_STRINGS;
+             default:
+                 throw std::runtime_error("Unknown data type in leaf flags for path: " + path);
+         }
+     }
+ 
+     // If the leaf is not found in the index, this is an error.
+     throw std::runtime_error("Path not found in the PanzerDB index: " + path);
+ }
+
+ bool PanzerDB::isDynamicAOS(const std::string& aos_path) const
+{
+    // Ensure the index is loaded in memory.
+    const auto& leaves = getLeaves();
+
+    // Use the optimized lookup table to find the leaf matching the path.
+    auto it = leaf_lookup.find(std::string_view(aos_path));
+    if (it != leaf_lookup.end() && !it->second.empty()) {
+        // A path should uniquely identify an AoS meta-node,
+        // so take the first match.
+        const Leaf& leaf = leaves[it->second[0]];
+
+        // Flag '3' marks a dynamic AoS meta-node in the PanzerDB index.
+        if (leaf.flags == 3) {
+            return true;
+        }
+    }
+
+    // If the path is not found or is not a dynamic AoS.
+    return false;
+}
+
+// Reports whether a data signal (leaf) varies over time (see header for the
+// criterion).  The two sub-cases (dynamic-AoS ancestor / own time axis) mirror
+// exactly the reader's own "add one time dimension" decision, cf. readDataByIndex
+// (panzerdb.cpp:2384) and isTimeInLeaf (panzerdb.cpp:2227-2238).
+bool PanzerDB::isDynamicSignal(const std::string& signal_path) const
+{
+    // Ensure the index (and its lookup caches) is loaded in memory.
+    const auto& leaves = getLeaves();
+
+    // Case 1: signal lives under a dynamic Array of Structures — the time axis
+    // is supplied by the AoS iteration.  A dynamic-AoS root is any prefix of the
+    // leaf path (top-level, or nested under a static-AoS instance index).
+    for (const auto& root : cached_dynamic_aos_roots) {
+        if (signal_path.size() >= root.size() &&
+            signal_path.compare(0, root.size(), root) == 0 &&
+            (signal_path.size() == root.size() || signal_path[root.size()] == '/')) {
+            return true;
+        }
+    }
+
+    // Case 2: no dynamic AoS — but the leaf owns its own time axis.
+    auto it = leaf_lookup.find(std::string_view(signal_path));
+    if (it == leaf_lookup.end() || it->second.empty()) return false;
+
+    // Iterative form: several leaf rows at the same path (one per time step).
+    if (it->second.size() > 1) return true;
+
+    // Bulk form: a single data row whose stored count exceeds one spatial slice.
+    const Leaf& leaf = leaves[it->second.front()];
+    if ((leaf.flags & 0xF) != 0) return false;   // not a data leaf (e.g. an AoS meta-node)
+    uint64_t slice_volume = 1;
+    for (auto s : leaf.shape_span()) if (s > 0) slice_volume *= s;
+    if (slice_volume == 0) slice_volume = 1;     // scalar: empty shape
+    return leaf.count > slice_volume;
+}

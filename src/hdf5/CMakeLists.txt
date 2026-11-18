@@ -19,7 +19,26 @@ target_sources( al PRIVATE
     hdf5_dataset_handler.cpp
     hdf5_events_handler.cpp
     hdf5_backend_factory.cpp
+	panzerdb.h
+    panzerdb.cpp
+    hdf5_writer_v2.h
+    hdf5_writer_v2.cpp
+    hdf5_reader_v2.h
+    hdf5_reader_v2.cpp
+    global_read_strategy.h
+    global_read_strategy.cpp
+    slice_read_strategy.h
+    slice_read_strategy.cpp
+    timerange_read_strategy.h
+    timerange_read_strategy.cpp
+    direct_access_api.cpp
+    path_parser.cpp
+    direct_reader.cpp
+    view_publisher.h
+    view_publisher.cpp
+    imas_h5read/imas_h5read.cpp
 )
+# target_compile_definitions( al PRIVATE -DHDF5 -DDEBUG_HDF5_WRITER_V2 )
 target_compile_definitions( al PRIVATE -DHDF5 )
 if(WIN32)
 	# Use modern CMake targets if available (vcpkg), otherwise legacy variables
@@ -47,3 +66,270 @@ else()
   target_compile_definitions( al PRIVATE ${HDF5_C_DEFINITIONS} )
 endif()
 
+macro(al_add_hdf5_test test_name)
+    add_executable(${test_name} ${EXE_FLAG} ${PROJECT_SOURCE_DIR}/tests/hdf5_backend/${test_name}.cpp)
+    target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${test_name} PRIVATE al z dl ${HDF5_LIBRARIES} )
+    if(NOT WIN32 AND NOT APPLE)
+        target_link_libraries(${test_name} PRIVATE stdc++fs)
+    endif()
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endmacro()
+
+# Measurement tool for the read-parameter study (NOT registered as a test)
+add_executable(bench_read ${EXE_FLAG} ${PROJECT_SOURCE_DIR}/tests/hdf5_backend/bench_read.cpp)
+target_include_directories(bench_read PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_read PRIVATE al z dl ${HDF5_LIBRARIES})
+if(NOT WIN32 AND NOT APPLE)
+    target_link_libraries(bench_read PRIVATE stdc++fs)
+endif()
+
+# --------------------------------------------------------------------------
+# Engine tests (PanzerDB API directly)
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_engine_readdata_by_index)
+al_add_hdf5_test(test_engine_readdata_by_index_deep)
+al_add_hdf5_test(test_engine_readdata_by_index_2signals)
+al_add_hdf5_test(test_engine_readdata_by_index_complex_aos)
+al_add_hdf5_test(test_engine_readdata_by_index_verydeep)
+al_add_hdf5_test(test_engine_readdata_by_index_ultradeep)
+al_add_hdf5_test(test_engine_readdata_by_index_2d)
+al_add_hdf5_test(test_engine_write_read_char)
+al_add_hdf5_test(test_engine_write_read_string_complex)
+al_add_hdf5_test(test_engine_write_read_listofstrings)
+al_add_hdf5_test(test_engine_write_read_root_scalar)
+al_add_hdf5_test(test_engine_empty_aos_getshape)
+al_add_hdf5_test(test_engine_group_constructor)
+al_add_hdf5_test(test_engine_write_read_dynamic_aos)
+al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
+al_add_hdf5_test(test_engine_write_read_nested_dynamic_aos)
+# Bulk timebase + per-slice signal: fresh signal must land at 0..N-1, not shift
+# onto the timebase's last written index (see hasFileData gating in panzerdb.cpp).
+al_add_hdf5_test(test_engine_write_bulk_time_slice_signal)
+al_add_hdf5_test(test_engine_append_complex)
+# readIntDataByIndex single-leaf branch: report the time dimension for a bulk
+# leaf (count = n_slices * shape), same rule as readDataByIndex (FLOAT64).
+al_add_hdf5_test(test_engine_readint_by_index_bulk)
+
+# --- SWMR: fixed-width data_raw_str boundary + writer/reader smoke --------
+# `test_swmr_string_fixed_width` forks a separate reader process (a real shared-FS
+# writer/reader pair) and still uses std::this_thread::sleep_for for pacing.
+find_package(Threads REQUIRED)
+al_add_hdf5_test(test_engine_write_read_string_512)
+# Span-table (Option B): list elements > 511B chunked across 512B slots,
+# recorded in the /list_spans dataset; backward-compatible with compact lists.
+al_add_hdf5_test(test_engine_write_read_list_spanned)
+# A WRITE engine on a file it did not create must drop /list_spans with the other tables,
+# and an APPEND into a file that never had one must create it: either way the alternative
+# is a long list element coming back wrong, silently.
+al_add_hdf5_test(test_engine_list_spans_over_write)
+al_add_hdf5_test(test_swmr_string_fixed_width)
+# Crash-safe commit ordering: reader guardrail against a dangling index row
+# (offset past the materialised data_raw_* extent — see PanzerDB::getLeaves).
+al_add_hdf5_test(test_engine_commit_order_guardrail)
+# v3 index format: packed 7-column /index + interned /path_table, version
+# attribute, and upward compatibility with legacy 12-column files.
+al_add_hdf5_test(test_engine_index_v3)
+# v4 time-base block (data_time_f64): both time bases get their own raw block and
+# stay contiguous, and a stamped-ahead index_version is refused by name.
+al_add_hdf5_test(test_engine_time_base_layout)
+# v5 per-step-scalar block (data_scalar_*): a node with one value per time step
+# (global_quantities&ip) gets a block of its own instead of one slot per AoS
+# element in the payload, which is what made a whole-IDS get() sweep the payload twice.
+al_add_hdf5_test(test_engine_scalar_block)
+# Counters table that restoreTimeContext() rebuilds at open (aos_time_counters):
+# what getDynamicAOSSize / getAOSShape answer in READ, and where APPEND resumes.
+al_add_hdf5_test(test_engine_time_context)
+# Index handoff: the decoded /index outlives its engine and the next engine on the
+# same file only reads the rows appended since (PanzerDB::adoptIndexHandoff).
+al_add_hdf5_test(test_engine_index_handoff)
+# Handle ownership: an engine that opened the file itself must close it, or HDF5
+# segfaults at library termination (PanzerDB::close).
+al_add_hdf5_test(test_engine_handle_lifecycle)
+# Handle ownership, other direction: a commit must not leave dataspaces registered
+# (PanzerDB::flush).
+al_add_hdf5_test(test_engine_flush_dataspace_handles)
+target_link_libraries(test_swmr_string_fixed_width PRIVATE Threads::Threads)
+
+# Golden/oracle: pins the PanzerDB index surface (Leaf + list_nodes +
+# getAOSShape + stripIndices). Default CTest mode is `verify`; `capture`
+# regenerates the committed oracle. See tests/hdf5_backend/test_index_golden.cpp.
+al_add_hdf5_test(test_index_golden)
+al_add_hdf5_test(test_index_lifetime_guard)
+target_compile_definitions(test_index_golden PRIVATE
+    PZGOLD_GOLDEN_DIR="${PROJECT_SOURCE_DIR}/tests/hdf5_backend/fixtures/goldens")
+target_include_directories(test_index_golden PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# --------------------------------------------------------------------------
+# AL-level tests (via HDF5Backend / ALContext, dispatching to v2)
+# --------------------------------------------------------------------------
+# regression reproductions
+al_add_hdf5_test(test_al_bfield_na_slice)
+# Round-trip 2x inflation: a top-level node (e.g. reflectometer_profile/n_e)
+# must not leak the channel(0) member data via the name_index last-segment
+# fallback (see tests/hdf5_backend/test_al_reflectometer_toplevel_no_leak.cpp).
+al_add_hdf5_test(test_al_reflectometer_toplevel_no_leak)
+# Filter pipeline order: shuffle MUST be added before deflate (compressor last),
+# else the shuffle is a no-op and the numeric buffer costs ~+20% file size.
+al_add_hdf5_test(test_engine_filter_pipeline_order)
+al_add_hdf5_test(test_al_cic_string_slice)
+al_add_hdf5_test(test_al_dynamic_aos_nested_static_slice)
+al_add_hdf5_test(test_al_static_aos_signal_slice)
+al_add_hdf5_test(test_al_string_list_1d_slice)
+# A second ids_put() reuses the IDS file instead of truncating it, so the tables it drops have
+# to include the span table: otherwise the new list is read back with the element boundaries
+# of the previous put.
+al_add_hdf5_test(test_al_string_list_reput)
+
+# core IDS structures
+al_add_hdf5_test(test_al_core_profiles_put_get_slice)
+al_add_hdf5_test(test_al_core_sources_put_slice)
+
+# magnetics flux_loop
+al_add_hdf5_test(test_al_flux_loop_aos)
+al_add_hdf5_test(test_al_flux_loop_deep_data_slice)
+al_add_hdf5_test(test_al_flux_loop_deep_data_getslice)
+# inhomogeneous magnetics signal at flux_loop(j)/flux/data whose base is a
+# sibling of the payload inside `flux` (flux_loop(j)/flux/time): the reader used
+# to anchor the base on the AoS element and miss it -- see the fix in the
+# inhomogeneous static-AoS branch of IReadStrategy::getTimeValues
+# (src/hdf5/iread_strategy.h).
+al_add_hdf5_test(test_al_repro_flux_loop_flux_getslice)
+# inhomogeneous 1-D signal under static AoS A > dynamic AoS B (base per element
+# A/i/B/j/time): second context in the "Unexpected time vector with size 0" family.
+al_add_hdf5_test(test_al_repro_nested_aos_signal_getslice)
+# ece IDS: static channel > DYNAMIC beam_tracing > static beam > 0-D power_initial,
+# inhomogeneous; reported failing from MATLAB ids_get_slice
+# ("Unexpected time vector with size 0").
+al_add_hdf5_test(test_al_repro_ece_beam_tracing_getslice)
+# ece slice-INDEX resolution: nested dynamic beam_tracing with a TIME-VARYING
+# per-slice beam count — ids_get_slice(t) must return slice t's AoS size, not
+# slice 0's (getSliceIndex falls back to element index 0 when the HLI declares
+# the base dictionary-absolute); same basename-extraction class as getTimeValues.
+al_add_hdf5_test(test_al_repro_ece_beamtracing_sliceindex_getslice)
+
+# dynamic-AoS behaviour
+al_add_hdf5_test(test_al_dynamic_aos_gap)
+al_add_hdf5_test(test_al_dynamic_aos_nested_only_getshape)
+# signal dynamism detection (under dynamic AoS OR own time axis, cf.
+# PanzerDB::isDynamicSignal; tests/hdf5_backend/test_al_is_dynamic_signal.cpp)
+al_add_hdf5_test(test_al_is_dynamic_signal)
+al_add_hdf5_test(test_al_dynamic_aos_string_slice)
+al_add_hdf5_test(test_al_dynamic_aos_string_inhom_slice)
+al_add_hdf5_test(test_al_nested_dynamic_timebase)
+al_add_hdf5_test(test_al_nested_static_aos)
+# nested static AoS whose size varies across a dynamic time-slice (a "gap"):
+# the x-point node disappears between two slices (mirrors hdf5bug.py).
+al_add_hdf5_test(test_al_equilibrium_xpoint_gap)
+al_add_hdf5_test(test_al_nested_aos_listofstrings)
+al_add_hdf5_test(test_al_static_aos_dynamic_signal_slice)
+al_add_hdf5_test(test_al_timeslice_nested_x_point)
+
+# homogeneous / inhomogeneous timebases
+al_add_hdf5_test(test_al_homog_timebase_2d_signal)
+al_add_hdf5_test(test_al_inhom_timebase)
+# an inhomogeneous IDS may give a root-level signal its own time base as a sibling
+# leaf ("<sig>/time"); a slice read must follow that declared path instead of
+# falling back to a root "time" that such an IDS never writes.
+al_add_hdf5_test(test_al_inhom_root_signal_slice)
+# ... and a dynamic signal the dictionary declares but the file never wrote (neither
+# data nor base): the slice read answers "not available" instead of throwing on the
+# empty time base, the way the 1.0 reader leaves the node undefined.
+al_add_hdf5_test(test_al_missing_dynamic_signal_slice)
+# a homogeneous IDS resolves the AoS slice index on its root time base (one index row on
+# a bulk write) rather than the base the dynamic AoS keeps for itself (one row per step);
+# the gapped-AoS fixture pins why that cannot be done unconditionally -- its elements are
+# numbered in write order, behind the time axis.
+al_add_hdf5_test(test_al_homog_aos_element_index)
+
+# gap handling
+al_add_hdf5_test(test_al_gap_closest_prev)
+al_add_hdf5_test(test_al_gap_homog_slice)
+al_add_hdf5_test(test_al_gap_homog_timerange)
+al_add_hdf5_test(test_al_gap_linear)
+al_add_hdf5_test(test_al_gap_timerange)
+
+# profiles_1d / root 1D signals
+al_add_hdf5_test(test_al_profiles_1d_dynamic)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_0d_append)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_append_slice)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_append_slice_large)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_signal_1d)
+al_add_hdf5_test(test_al_profiles_1d_dynamic_signal_2d)
+al_add_hdf5_test(test_al_root_1d_dynamic_append)
+
+# slice operators
+al_add_hdf5_test(test_al_slice_op_code_output)
+# A read session that already read a pulse has to notice rows appended after that read:
+# the session keeps its engine across operations, so this is its invalidation gate.
+al_add_hdf5_test(test_al_slice_read_after_append_between_reads)
+# Mirror gate on the write side: a slice session keeps one APPEND engine across
+# putSlice(), so it must notice rows another writer added between its own slices.
+al_add_hdf5_test(test_al_slice_write_after_foreign_append)
+# The v2 -> v1 conversion switch (BACKEND_HDF5_FORCE_CONVERSION_TO_V1): the lock must stay
+# when it is off, and the converted pulse must read back as a plain v1 pulse when it is on.
+al_add_hdf5_test(test_al_convert_v2_to_v1)
+# The other direction (BACKEND_ALLOW_AUTO_UPGRADE): rewriting a v1 pulse with a 2.0 target has to
+# drop the v1 datasets and re-annotate master.h5, or the next open reads a "1.0" label and hands
+# the pulse to the v1 reader -- which never sees what the upgrade wrote.
+al_add_hdf5_test(test_al_upgrade_v1_to_v2)
+# Global read of a 1-slice scalar time series must stay 1D(1) (AL convention,
+# to_improve.md point 3); static scalars must remain 0D.
+al_add_hdf5_test(test_al_global_code_output_1slice)
+
+# time-range operator
+al_add_hdf5_test(test_al_timerange_basic)
+al_add_hdf5_test(test_al_timerange_aos)
+# TIMERANGE window on a dynamic signal inside a STATIC AoS whose time base sits on
+# the AoS element (homogeneous_time = 0): the window must filter that signal.
+al_add_hdf5_test(test_al_timerange_inhom_static_aos)
+al_add_hdf5_test(test_al_timerange_aos_string_list)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling)
+al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling_vector)
+al_add_hdf5_test(test_al_timerange_root_string)
+al_add_hdf5_test(test_al_timerange_simple)
+
+# resampling
+al_add_hdf5_test(test_al_resampling_user_vector)
+
+# metadata
+al_add_hdf5_test(test_al_metadata_strategies)
+# XML-driven (@IMAS_PREFIX) metadata extraction: INT_* leaves + multi-level path lookup
+al_add_hdf5_test(test_al_metadata_extract_inttype)
+
+# --------------------------------------------------------------------------
+# Direct-access API
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_direct_api_validation)
+
+# User-friendly VDS view (snapshot): standard h5ls/h5dump/h5py can inspect the
+# IMAS instance tree without any IMAS-API dependency. See view_publisher.{h,cpp}.
+al_add_hdf5_test(test_publish_view)
+
+# --------------------------------------------------------------------------
+# h5read (imas_h5read library)
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_h5read_overloads)
+
+# --------------------------------------------------------------------------
+# Path parser
+# --------------------------------------------------------------------------
+al_add_hdf5_test(test_path_parser_syntax)
+al_add_hdf5_test(test_path_sanitization)
+# Slice-resolution contract of DataInterpolation (oracle = original linear scans),
+# the safety net for replacing those scans by binary searches.
+al_add_hdf5_test(test_time_resolution)
+# readTensor must raise on a failing HDF5 read instead of returning the caller's
+# uninitialized buffer, and on a buffer element smaller than the stored element
+# (REVIEW_PERF_hdf5_v2.md items E1 and E2).
+al_add_hdf5_test(test_read_tensor_contract)
+# Explicit read-side node-role rules (to_improve.md point 3, conservative pass).
+al_add_hdf5_test(test_read_node_roles)
+# stripIndices equivalence table, pinning its stringstream-free rewrite (the
+# function runs twice per node on the read path).
+al_add_hdf5_test(test_strip_indices)
+
+# Ajouter les outils HDF5
+add_subdirectory(tools)
+add_subdirectory(metadata )

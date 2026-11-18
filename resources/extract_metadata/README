@@ -1,0 +1,2 @@
+python generate_structures.py plasma_profiles plasma_profiles.xml
+python generate_structures.py distributions distributions.xml

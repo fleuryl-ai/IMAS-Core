@@ -1,0 +1,174 @@
+Read-attribution probe (PANZER_READ_PROBE) -- kept out of every commit.
+
+Re-add it with:
+    git apply probe_read_attribution.patch
+Remove it again with:
+    git apply -R probe_read_attribution.patch
+
+It prints [PROBE] / [PROBE-SCATTER] / [PROBE-HIST] / [PROBE-PATH] /
+[PROBE-DSET] at process exit when PANZER_READ_PROBE=1, and the first n union
+calls when PANZER_READ_PROBE_LOG=<n>. It is what priced to_improve.md point 31
+(143990000 elements swept for 8000 wanted, 3.17 s of an 11.39 s get()).
+
+--- a/src/hdf5/panzerdb.cpp
++++ b/src/hdf5/panzerdb.cpp
+@@ -15,6 +15,8 @@
+ #include <string>
+ #include <type_traits>
+ #include <map>
++#include <cstdlib>  // PROBE (remove with the read-batching work)
++#include <chrono>   // PROBE (remove with the read-batching work)
+ 
+ /*
+  * ###############################################################################
+@@ -1858,6 +1860,69 @@
+ template int PanzerDB::readSliceDirect<std::complex<double>>(const Leaf&, int64_t,
+                                                               std::complex<double>*) const;
+ 
++// ##############################################################################
++// # PROBE -- read-attribution instrumentation kept from the get() study         #
++// # (to_improve.md points 30/31: a whole-IDS get() on an append-built file asks  #
++// # for ~2 passes over the raw block, the extra one covering the per-step        #
++// # scalars). Enabled only with PANZER_READ_PROBE=1; PANZER_READ_PROBE_LOG=<n>   #
++// # additionally dumps the first n union calls so the walk order is visible.     #
++// # Stays out of any commit: delete this block when the v5 scalar-block work     #
++// # lands.                                                                       #
++// ##############################################################################
++namespace {
++struct ReadProbe {
++    struct Dset {
++        hsize_t chunk = 0;                     // chunk length in elements (from the file)
++        unsigned long long calls = 0;          // union calls touching this block
++        unsigned long long span_elems = 0;     // elements actually asked of HDF5 ([lo,hi) per call)
++        unsigned long long wanted_elems = 0;   // elements the caller actually wants
++        std::map<unsigned long long, unsigned> chunk_hits;  // chunk id -> times touched
++    };
++    struct PathStat {
++        unsigned long long calls = 0, leaves = 0, elems = 0;
++        unsigned long long lo = ~0ULL, hi = 0;
++    };
++    std::map<std::string, Dset> dsets;
++    std::map<std::string, PathStat> paths;
++    std::map<unsigned long long, unsigned long long> hist;  // leaves in the bucket -> visits
++    // Visits whose span is huge (a scattered leaf list read as one contiguous
++    // sweep): what they cost in wall clock, separately from the walk.
++    double scattered_seconds = 0.0;
++    unsigned long long scattered_visits = 0, scattered_span = 0, scattered_wanted = 0;
++    unsigned long long calls = 0, visits = 0, logged = 0, log_limit = 0;
++    ReadProbe() {
++        if (const char* s = std::getenv("PANZER_READ_PROBE_LOG")) log_limit = std::strtoull(s, nullptr, 10);
++    }
++    ~ReadProbe() {
++        if (!std::getenv("PANZER_READ_PROBE")) return;
++        std::cerr << "[PROBE] union calls=" << calls << " block visits=" << visits << std::endl;
++        std::cerr << std::setprecision(3)
++                  << "[PROBE-SCATTER] visits=" << scattered_visits
++                  << " span_elems=" << scattered_span << " wanted_elems=" << scattered_wanted
++                  << " seconds=" << scattered_seconds << std::endl;
++        for (auto& kv : hist)
++            std::cerr << "[PROBE-HIST] leaves_per_visit=" << kv.first << " visits=" << kv.second << std::endl;
++        for (auto& kv : paths)
++            std::cerr << "[PROBE-PATH] " << kv.first << " calls=" << kv.second.calls
++                      << " leaves=" << kv.second.leaves << " elems=" << kv.second.elems
++                      << " lo=" << kv.second.lo << " hi=" << kv.second.hi << std::endl;
++        for (auto& kv : dsets) {
++            const Dset& d = kv.second;
++            unsigned long long touches = 0;
++            for (auto& c : d.chunk_hits) touches += c.second;
++            const unsigned long long distinct = d.chunk_hits.size();
++            std::cerr << "[PROBE-DSET] " << kv.first << " chunk_elems=" << d.chunk
++                      << " calls=" << d.calls << " span_elems=" << d.span_elems
++                      << " wanted_elems=" << d.wanted_elems
++                      << " chunks_distinct=" << distinct << " chunks_touched=" << touches
++                      << " reread_x=" << (distinct ? double(touches) / double(distinct) : 0.0)
++                      << std::endl;
++        }
++    }
++};
++ReadProbe& readProbe() { static ReadProbe p; return p; }
++bool readProbeOn() { static const bool on = std::getenv("PANZER_READ_PROBE") != nullptr; return on; }
++}  // namespace
+ 
+ int PanzerDB::readLeavesUnion(const std::vector<const Leaf*>& leaves, void* buffer, DataType dtype) const {
+     if (leaves.empty()) return 0;
+@@ -1906,6 +1971,7 @@
+     }
+ 
+     char* const dst_base = static_cast<char*>(buffer);
++    if (readProbeOn()) ++readProbe().calls;
+     for (size_t b = 0; b < bucket_count; ++b) {
+         const std::vector<size_t>& group = bucket[b];
+         if (group.empty()) continue;
+@@ -1941,6 +2007,47 @@
+         }
+         const hsize_t range = hi - lo;
+ 
++        if (readProbeOn()) {
++            ReadProbe& pr = readProbe();
++            ++pr.visits;
++            ++pr.hist[group.size()];
++            char pnm[128];
++            const ssize_t pnm_len = H5Iget_name(dset_id, pnm, sizeof(pnm));
++            ReadProbe::Dset& d = pr.dsets[pnm_len > 0 ? pnm : "raw block"];
++            if (d.chunk == 0) {
++                hid_t dcpl = H5Dget_create_plist(dset_id);
++                hsize_t cdims[8] = {0};
++                if (dcpl >= 0 && H5Pget_chunk(dcpl, 8, cdims) > 0) d.chunk = cdims[0];
++                if (dcpl >= 0) H5Pclose(dcpl);
++            }
++            ++d.calls;
++            d.span_elems += range;
++            d.wanted_elems += wanted;
++            if (d.chunk > 0 && range > 0)
++                for (hsize_t c = lo / d.chunk; c <= (hi - 1) / d.chunk; ++c)
++                    ++d.chunk_hits[(unsigned long long)c];
++            for (const Leaf* l : leaves) {
++                ReadProbe::PathStat& ps = pr.paths[std::string(l->path)];
++                ++ps.calls;
++                ++ps.leaves;
++                ps.elems += l->count;
++                ps.lo = std::min(ps.lo, (unsigned long long)l->offset);
++                ps.hi = std::max(ps.hi, (unsigned long long)(l->offset + l->count));
++            }
++            if (pr.visits <= pr.log_limit || (range > 1000000 && pr.logged < pr.log_limit + 20)) {
++                ++pr.logged;
++                std::cerr << "[PROBE-CALL] #" << pr.visits << " leaves=" << group.size()
++                          << " dset=" << (pnm_len > 0 ? pnm : "?")
++                          << " span=[" << lo << "," << hi << ") wanted=" << wanted;
++                for (size_t i = 0; i < group.size() && i < 4; ++i) {
++                    const Leaf* l = leaves[group[i]];
++                    std::cerr << " {off=" << l->offset << " cnt=" << l->count
++                              << " blk=" << unsigned(l->block)
++                              << " t=" << l->time_index << "}";
++                }
++                std::cerr << " path=" << leaves[group[0]]->path << std::endl;
++            }
++        }
+ 
+         if (wanted > 0 && range / wanted > 64 && !scatter_warning_issued) {
+             scatter_warning_issued = true;
+@@ -1957,6 +2064,9 @@
+ 
+         const hsize_t window = std::max<hsize_t>(1, (hsize_t)(32u << 20) / (hsize_t)element_size);
+         std::vector<char> tmp((size_t)std::min(range, window) * element_size);
++        std::chrono::steady_clock::time_point sweep_t0;
++        const bool sweep_timed = readProbeOn() && range > 1000000;
++        if (sweep_timed) sweep_t0 = std::chrono::steady_clock::now();
+         // Walk the group in offset order so each window touches only the leaves
+         // that overlap it (a leaf may straddle a window edge: it is copied in two
+         // pieces, once per window).
+@@ -2003,6 +2113,14 @@
+                        (size_t)(c - a) * element_size);
+             }
+         }
++        if (sweep_timed) {
++            ReadProbe& pr = readProbe();
++            ++pr.scattered_visits;
++            pr.scattered_span += range;
++            pr.scattered_wanted += wanted;
++            pr.scattered_seconds += std::chrono::duration<double>(
++                std::chrono::steady_clock::now() - sweep_t0).count();
++        }
+         H5Sclose(file_space);
+     }
+     if (need_close_type) H5Tclose(mem_type);

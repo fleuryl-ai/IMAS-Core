@@ -20,6 +20,48 @@ using namespace boost::filesystem;
 
 #define MASTER_FILE_NAME "master.h5" 
 
+/**
+ * @brief Optional File Access Property List taken from the environment.
+ *
+ * Read-parameter research hook: IMAS_HDF5_FAPL holds ';'-separated directives
+ *   cache=<nbytes>,<nslots>,<w0> ; align=<threshold>,<alignment> ;
+ *   meta=<bytes> ; sieve=<bytes>
+ * e.g. IMAS_HDF5_FAPL="cache=268435456,10091,0.75;align=4096,4194304".
+ * Unset (production default) => H5P_DEFAULT, i.e. nothing changes.
+ * @return A new FAPL, or H5P_DEFAULT when the variable is not set.
+ */
+static hid_t fapl_from_env() {
+    const char* spec = std::getenv("IMAS_HDF5_FAPL");
+    if (!spec || !*spec) return H5P_DEFAULT;
+
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    if (fapl < 0) return H5P_DEFAULT;
+
+    std::string s(spec);
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(';', pos);
+        std::string tok = s.substr(pos, (end == std::string::npos) ? std::string::npos : end - pos);
+        pos = (end == std::string::npos) ? s.size() : end + 1;
+        if (tok.compare(0, 6, "cache=") == 0) {
+            unsigned long long nbytes = 0, nslots = 0; double w0 = 0.75;
+            if (sscanf(tok.c_str() + 6, "%llu,%llu,%lf", &nbytes, &nslots, &w0) >= 2)
+                H5Pset_cache(fapl, 0, (int)nslots, (size_t)nbytes, (double)w0);
+        } else if (tok.compare(0, 6, "align=") == 0) {
+            hsize_t thr = 0, al = 0;
+            if (sscanf(tok.c_str() + 6, "%llu,%llu", (unsigned long long*)&thr, (unsigned long long*)&al) == 2)
+                H5Pset_alignment(fapl, thr, al);
+        } else if (tok.compare(0, 5, "meta=") == 0) {
+            hsize_t mb = 0;
+            if (sscanf(tok.c_str() + 5, "%llu", (unsigned long long*)&mb) == 1) H5Pset_meta_block_size(fapl, mb);
+        } else if (tok.compare(0, 6, "sieve=") == 0) {
+            size_t sb = 0;
+            if (sscanf(tok.c_str() + 6, "%zu", &sb) == 1) H5Pset_sieve_buf_size(fapl, (int)sb);
+        }
+    }
+    return fapl;
+}
+
 
 HDF5Utils::HDF5Utils()
 {
@@ -51,6 +93,8 @@ int
     /* Turn off error handling */
     if (!debug)
         H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+    //H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
 
     if (! (mode == OPEN_PULSE || mode == FORCE_OPEN_PULSE))
         throw ALBackendException("HDF5Backend: unexepcted mode in HDF5Utils::openPulse()", LOG);
@@ -138,6 +182,8 @@ void
     /* Turn off error handling */
     if (!debug)
         H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+    //H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
     
     if (*file_id != -1)
         hdf5_utils.closeMasterFile(file_id);
@@ -261,10 +307,11 @@ void HDF5Utils::createIDSFile(OperationContext * ctx, std::string &IDSpulseFile,
 void HDF5Utils::openIDSFile(OperationContext * ctx, std::string &IDSpulseFile, hid_t *IDS_file_id, bool try_read_only, std::string backend_version) {
     if (!exists(IDSpulseFile.c_str()))
 	    return;
-    *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    const hid_t fapl = fapl_from_env();
+    *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDWR, fapl);
     if (*IDS_file_id < 0) {
         if(try_read_only) {
-            *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+            *IDS_file_id = H5Fopen(IDSpulseFile.c_str(), H5F_ACC_RDONLY, fapl);
             if (*IDS_file_id < 0) { 
                 char error_message[200];
                 sprintf(error_message, "Unable to open external file in Read-Only mode for IDS: %s. It might indicate that the file is being currently handled by a writing concurrent process.\n", ctx->getDataobjectName().c_str());
@@ -298,6 +345,7 @@ void HDF5Utils::openIDSFile(OperationContext * ctx, std::string &IDSpulseFile, h
             }
         }
     }
+    if (fapl != H5P_DEFAULT) H5Pclose(fapl);
 }
 
 void HDF5Utils::openMasterFile(hid_t *file_id, const std::string &filePath, bool for_deletion) { //open master file
@@ -393,6 +441,44 @@ void HDF5Utils::writeHeader(DataEntryContext * ctx, hid_t file_id, std::string &
     H5Sclose(dataspace_id);
     H5Tclose(dtype_id);
     H5Aclose(att_id);
+}
+
+void HDF5Utils::rewriteHeaderVersion(hid_t file_id, std::string backend_version)
+{
+    const char *backend_version_attribute_name = "HDF5_BACKEND_VERSION";
+
+    // Same type writeHeader() builds, so the attribute keeps the width and encoding every
+    // reader expects; only its text changes.
+    hid_t dtype_id = H5Tcopy(H5T_C_S1);
+    H5Tset_size(dtype_id, strlen(backend_version_attribute_name));
+    if (H5Tset_cset(dtype_id, H5T_CSET_UTF8) < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to set characters to UTF8 for: %s\n", backend_version_attribute_name);
+        throw ALBackendException(error_message);
+    }
+
+    hid_t att_id = H5Aopen(file_id, backend_version_attribute_name, H5P_DEFAULT);
+    if (att_id < 0) {   // never annotated: create it instead
+        hid_t dataspace_id = H5Screate(H5S_SCALAR);
+        att_id = H5Acreate2(file_id, backend_version_attribute_name, dtype_id,
+                            dataspace_id, H5P_DEFAULT, H5P_DEFAULT);
+        H5Sclose(dataspace_id);
+    }
+    if (att_id < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to open or create attribute: %s\n", backend_version_attribute_name);
+        H5Tclose(dtype_id);
+        throw ALBackendException(error_message, LOG);
+    }
+
+    herr_t status = H5Awrite(att_id, dtype_id, backend_version.c_str());
+    H5Aclose(att_id);
+    H5Tclose(dtype_id);
+    if (status < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to write attribute: %s\n", backend_version_attribute_name);
+        throw ALBackendException(error_message, LOG);
+    }
 }
 
 // WHAT SHALL WE STORE IN USERBLOCK W.R.T URI WHERE SHOT AND RUN ARE NOT MANDATORY ?
@@ -681,6 +767,13 @@ hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative
         *IDS_group_id = openHDF5Group(ctx->getDataobjectName().c_str(), IDS_file_id);
     else
         *IDS_group_id = openHDF5Group(ctx->getDataobjectName().c_str(), file_id);
+
+    if (*IDS_group_id < 0) {
+        char error_message[200];
+        sprintf(error_message, "Unable to open group for IDS: %s\n", ctx->getDataobjectName().c_str());
+        H5Eprint2(H5E_DEFAULT, stderr);
+        throw ALBackendException(error_message, LOG);
+    }
 }
 
 void HDF5Utils::showStatus(hid_t file_id) {

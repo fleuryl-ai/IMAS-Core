@@ -90,6 +90,8 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
   set(AL_BACKEND_MDSPLUS OFF CACHE BOOL "MDSPlus backend" FORCE)    
 endif()
 
+# Enable testing with CTest
+enable_testing()
 
 # Dependencies
 # ##############################################################################
@@ -201,6 +203,7 @@ else()
 endif()
 
 add_subdirectory(src)
+add_subdirectory(tests)
 
 # Dummy Executable
 # ##############################################################################
@@ -214,6 +217,7 @@ if(NOT WIN32 AND NOT APPLE)
   # On Windows, filesystem is part of the standard library
   target_link_libraries( imas_print_version PRIVATE stdc++fs )
 endif()
+target_link_libraries( imas_print_version PRIVATE al stdc++fs )
 add_dependencies( imas_print_version al )
 
 # Install
@@ -291,6 +295,8 @@ install(
   FILES ${CMAKE_CURRENT_BINARY_DIR}/al-core.pc
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
+
+include(CTest)
 
 # Install mdsplusIMASDB4to5
 install(

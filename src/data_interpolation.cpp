@@ -3,8 +3,30 @@
 #include "al_const.h"
 #include "al_exception.h"
 
+#include <algorithm>
 #include <math.h>
 #include <limits>
+#include <complex>
+
+namespace {
+
+// IMAS invalid value left in a time vector by a partially written slice.
+constexpr double kInvalidTime = -9.e40;
+
+// A timebase is strictly increasing. The only unsorted shape the reader has to
+// tolerate is a trailing run of invalid values, which binary searches must
+// ignore: this returns where the increasing prefix ends. A vector made of
+// invalid values only is constant, hence still sorted, so it is searched whole
+// (matching what the former linear scan returned).
+size_t increasing_prefix_size(const std::vector<double> &time_vector)
+{
+    size_t n = time_vector.size();
+    while (n > 0 && time_vector[n - 1] == kInvalidTime)
+        n--;
+    return n == 0 ? time_vector.size() : n;
+}
+
+} // namespace
 
 DataInterpolation::DataInterpolation()
 {
@@ -19,13 +41,13 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
         *time_min_index = -1;
         *time_max_index = -1;
 
-        for (size_t i = 0; i < time_vector.size(); i++)
+        const size_t nb_valid = increasing_prefix_size(time_vector);
+        const std::vector<double>::const_iterator begin = time_vector.begin();
+
+        const std::vector<double>::const_iterator min_it = std::lower_bound(begin, begin + nb_valid, tmin);
+        if (min_it != begin + nb_valid)
         {
-            if (time_vector[i] >= tmin)
-            {
-                *time_min_index = i;
-                break;
-            }
+            *time_min_index = (int)(min_it - begin);
         }
         //printf("time_vector.size()=%d\n", time_vector.size());
 
@@ -34,17 +56,11 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
             return;
         }
 
-        const double default_value = -9.e40;
-
-        for (size_t i = time_vector.size() - 1; i >= 0; i--)
+        // Last sample that is neither an invalid value nor beyond tmax.
+        const std::vector<double>::const_iterator max_it = std::upper_bound(begin, begin + nb_valid, tmax);
+        if (max_it != begin)
         {
-
-            if (time_vector[i] != default_value && time_vector[i] <= tmax)
-            {
-                //printf("found i = %d\n", i);
-                *time_max_index = i;
-                break;
-            }
+            *time_max_index = (int)(max_it - begin) - 1;
         }
 
         if (*time_max_index == -1)
@@ -72,10 +88,15 @@ void DataInterpolation::getTimeRangeIndices(double tmin, double tmax, std::vecto
         }
 
         if (dtime.size() == 1) {
-            *range = round((tmax - tmin) / dtime[0]);
-            double t = ((*range) * dtime[0] + tmin);
-            if (t <= tmax)
-                *range = *range + 1;
+            if (dtime[0] <= 0) {
+                *range = 0;
+            } else {
+                // Add a small epsilon to handle floating point inaccuracies at the boundary
+                // e.g. (0.95-0.55)/0.2 could be 1.99999... which floor would truncate to 1.
+                // The new logic correctly computes the number of points in the interval.
+                double epsilon = 1e-9; 
+                *range = static_cast<int>(floor((tmax - tmin) / dtime[0] + epsilon)) + 1;
+            }
         }
         else {
             size_t max_index = dtime.size() - 1;
@@ -98,6 +119,13 @@ int DataInterpolation::getSlicesTimesIndices(double requested_time, const std::v
         throw ALBackendException("Unexpected time vector with size 0", LOG); 
     }
 
+    /*printf("DataInterpolation::getSlicesTimesIndices::requested_time=%f\n", requested_time);
+    printf("time_vector.size()=%d\n", time_vector.size());
+
+    for (int i = 0; i < time_vector.size(); i++){
+        printf("t[%i] = %f\n  ", i, time_vector[i] );
+    } */
+
     //printf("DataInterpolation::getSlicesTimesIndices::interp=%d\n", interp);
     if ((interp != alconst::undefined_interp) && (interp != CLOSEST_INTERP && interp != PREVIOUS_INTERP && interp != LINEAR_INTERP))
     {
@@ -111,20 +139,23 @@ int DataInterpolation::getSlicesTimesIndices(double requested_time, const std::v
 
     int closest;
 
-    for (size_t i = 0; i < time_vector.size(); i++)
+    // First sample that is not below the requested time (see the note about the
+    // trailing invalid run done in increasing_prefix_size).
+    const size_t nb_valid = increasing_prefix_size(time_vector);
+    const std::vector<double>::const_iterator begin = time_vector.begin();
+    const std::vector<double>::const_iterator sup_it = std::lower_bound(begin, begin + nb_valid, requested_time);
+    if (sup_it != begin + nb_valid)
     {
-        if (time_vector[i] >= requested_time)
+        slice_sup = (int)(sup_it - begin);
+        if (interp != CLOSEST_INTERP)
         {
-            slice_sup = i;
-            if (interp != CLOSEST_INTERP)
-            {
-                if (slice_sup == 0 && time_vector.size() > 1)
-                    slice_sup = 1;
-            }
-            if (slice_sup > 0)
-                slice_inf = slice_sup - 1;
-            break;
+            if (slice_sup == 0 && time_vector.size() > 1)
+                slice_sup = 1;
         }
+        if (slice_sup > 0)
+            slice_inf = slice_sup - 1;
+        else
+            slice_inf = slice_sup;
     }
     //printf("DataInterpolation::getSlicesTimesIndices::slice_inf=%d\n", slice_inf);
     //printf("DataInterpolation::getSlicesTimesIndices::slice_sup=%d\n", slice_sup);
@@ -213,6 +244,13 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
             *result = data_str;
             break;
         }
+
+        case alconst::complex_data:
+        {
+            std::complex<double> *data_cplx = (std::complex<double> *)y_slices[SLICE_INF];
+            *result = data_cplx;
+            break;
+        }
         }
         return;
     }
@@ -275,7 +313,7 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
         *result = (void *)data_double;
         break;
     }
-
+ 
     case alconst::char_data:
     {
         char *data_str = (char *)y_slices[SLICE_INF];
@@ -286,6 +324,19 @@ void DataInterpolation::interpolate(int datatype, int shape, std::map<std::strin
         }
         char* p = (char*) *result;
         p = data_str;
+        break;
+    }
+
+    case alconst::complex_data:
+    {
+        std::complex<double> *data_cplx = (std::complex<double> *)y_slices[SLICE_INF];
+        std::complex<double> *next_slice_data_cplx = (std::complex<double> *)y_slices[SLICE_SUP];
+        if (interpolation_factor != 0)
+        {
+            for (size_t i = 0; i < shape; i++)
+                data_cplx[i] = data_cplx[i] + (next_slice_data_cplx[i] - data_cplx[i]) * interpolation_factor;
+        }
+        *result = (void *)data_cplx;
         break;
     }
     }
@@ -375,6 +426,9 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
     int start = getSlicesTimesIndices(tmin, time_vector, times_indices, interp);
     std::vector<void *> interpolation_results;
     std::map<std::string, double> slices_times;
+    // Both keys are filled at each iteration when interp is LINEAR, and only
+    // SLICE_INF is ever read otherwise, so the map can be reused across points.
+    std::map<std::string, void *> y_slices;
 
     void *slice1;
     void *slice2;
@@ -403,6 +457,14 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
         slice1 = (char *)malloc(time_slice_shape);
         if (interp == LINEAR_INTERP)
             slice2 = (char *)malloc(time_slice_shape);
+        break;
+    }
+
+    case alconst::complex_data:
+    {
+        slice1 = (std::complex<double> *)malloc(time_slice_shape * sizeof(std::complex<double>));
+        if (interp == LINEAR_INTERP)
+            slice2 = (std::complex<double> *)malloc(time_slice_shape * sizeof(std::complex<double>));
         break;
     }
     }
@@ -456,8 +518,6 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
         }
 
         //printf("slices_times[SLICE_INF]=%f, slices_times[SLICE_SUP]=%f\n", slices_times[SLICE_INF], slices_times[SLICE_SUP]);
-
-        std::map<std::string, void *> y_slices;
 
         switch (datatype)
         {
@@ -540,6 +600,32 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             interpolation_result = (char*) malloc(sizeof(char)*time_slice_shape);
             break;
         }
+
+        case alconst::complex_data:
+        {
+            int offset = requested_index - start;
+            if (offset < 0) {
+                throw ALBackendException("Unexpected offset<0 when interpolating with resampling", LOG); 
+            }
+            int n = time_slice_shape;
+            std::complex<double> *data_cplx = (std::complex<double> *)data;
+            memcpy(slice1, data_cplx + offset * n, n * sizeof(std::complex<double>));
+            y_slices[SLICE_INF] = slice1;
+
+            if (interp == LINEAR_INTERP)
+            {
+                if (offset < time_vector.size()) {
+                    memcpy(slice2, data_cplx + (offset + 1) * n, n * sizeof(std::complex<double>));
+                    y_slices[SLICE_SUP] = slice2;
+                }
+                else {
+                    y_slices[SLICE_SUP] = slice1;
+                }
+            }
+
+            interpolation_result = (std::complex<double>*) malloc(sizeof(std::complex<double>)*time_slice_shape);
+            break;
+        }
         }
 
         void *interpolation_result_tmp;
@@ -549,7 +635,13 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             double *p = (double*)interpolation_result_tmp;
             printf("interpolation_result[%d] = %f\n", j, p[j]);
          }*/
-        memcpy(interpolation_result, interpolation_result_tmp, time_slice_shape*sizeof(double));
+        size_t element_size = sizeof(double);
+        if (datatype == alconst::integer_data) element_size = sizeof(int);
+        else if (datatype == alconst::char_data) element_size = sizeof(char);
+        else if (datatype == alconst::complex_data) element_size = sizeof(std::complex<double>);
+
+        memcpy(interpolation_result, interpolation_result_tmp, time_slice_shape*element_size);
+
         interpolation_results.push_back(interpolation_result);
         nb_slices++;
 
@@ -601,6 +693,18 @@ int DataInterpolation::interpolate_with_resampling(double tmin, double tmax, std
             char *q = (char *)interpolation_results[i];
             char *r = (char *)*result;
             memcpy(r + i * time_slice_shape, q, time_slice_shape * sizeof(char));
+            free(q);
+        }
+    }
+    else if (datatype == alconst::complex_data)
+    {
+
+        *result = (void *)malloc(sizeof(std::complex<double>) * interpolation_results.size() * time_slice_shape);
+        for (int i = 0; i < interpolation_results.size(); i++)
+        {
+            std::complex<double> *q = (std::complex<double> *)interpolation_results[i];
+            std::complex<double> *r = (std::complex<double> *)*result;
+            memcpy(r + i * time_slice_shape, q, time_slice_shape * sizeof(std::complex<double>));
             free(q);
         }
     }

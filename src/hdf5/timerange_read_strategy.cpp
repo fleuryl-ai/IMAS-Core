@@ -1,0 +1,519 @@
+#include "timerange_read_strategy.h"
+#include "data_interpolation.h"
+
+TimeRangeReadStrategy::TimeRangeReadStrategy(std::shared_ptr<PanzerDB> panzer_db, std::shared_ptr<ReadIndex> read_index)
+    : IReadStrategy(std::move(panzer_db), std::move(read_index)) {}
+
+void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int *size) {
+    refresh_index_if_needed();
+
+    int homogeneous_time = getHomogeneousTime();
+    time_basis_vector = getTimeValues(ctx, homogeneous_time);
+
+    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+      ArraystructContext* arrctx = static_cast<ArraystructContext*>(ctx);
+      if (panzer_db_ptr) panzer_db_ptr->setCurrentArrayIndex(arrctx->getIndex());
+    }
+
+    if (ctx->getTimed()) {
+
+        std::map<std::string, int> times_indices;
+
+        OperationContext *opCtx = ctx->getOperationContext();
+        DataInterpolation data_interpolation_component;
+        if (opCtx->time_range.dtime.size() != 0)
+            { // resampling
+                
+                void *result = nullptr;
+                // We want the total number of slices for the new time basis, so we pass -1 as the index
+                *size = data_interpolation_component.resample_timebasis(opCtx->time_range.tmin, opCtx->time_range.tmax,
+                                                            opCtx->time_range.dtime, -1,
+                                                            time_basis_vector, &result);
+            }
+            else
+            {
+                double tmin;
+                double tmax;
+                if (opCtx->time_range.dtime.size() <= 1)
+                {
+                    tmin = opCtx->time_range.tmin;
+                    tmax = opCtx->time_range.tmax;
+                }
+                else
+                {
+                    tmin = opCtx->time_range.dtime[0];
+                    tmax = opCtx->time_range.dtime.back();
+                }
+                int time_range_tmin_index;
+                int time_range_tmax_index;
+                data_interpolation_component.getTimeRangeIndices(tmin, 
+                                                                 tmax, 
+                                                                 opCtx->time_range.dtime,
+                                                                 time_basis_vector, 
+                                                                 &time_range_tmin_index, 
+                                                                 &time_range_tmax_index, 
+                                                                 size, 
+                                                                 opCtx->time_range.interpolation_method);
+            }
+    } else {
+        std::string aos_path_token = getPath(ctx, false);
+        auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);
+        *size = shapes.empty() ? 0 : shapes[0]; 
+    }
+    
+}
+
+void TimeRangeReadStrategy::endAction(Context *ctx) {
+    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+        // In read mode, panzer_db_ptr->endArray() is not necessary because array_stack is not used.
+    } else if (ctx->getType() == CTX_OPERATION_TYPE) {
+        // Nothing to close: the shared engine is flushed/closed by RAII when the
+        // read session is reset (HDF5Reader_v2) or at its destruction.
+    }
+  else{
+  }
+}
+
+int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std::string &timebasename,
+                                        int *datatype, void **data, int *dim, int *size) {
+
+    DEBUG_PRINT("--> Entering read_ND_Data for dataset: " << dataset_name);
+    refresh_index_if_needed();
+
+    OperationContext *opctx = nullptr;
+    if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+        opctx = static_cast<ArraystructContext*>(ctx)->getOperationContext();
+    } else {
+        opctx = static_cast<OperationContext*>(ctx);
+    }
+
+    const int homogeneous_time = getHomogeneousTime();
+    const std::string clean_dataset_name = cleanFlatPath(dataset_name);
+    bool is_homogeneous_time_basis_dataset =
+        (homogeneous_time == 1 && clean_dataset_name == "time");
+    bool is_time_dataset = isTimebaseDataset(
+        ctx, dataset_name, timebasename, homogeneous_time);
+    //bool is_time_basis_dataset = is_homogeneous_time_basis_dataset || is_time_dataset;
+    bool is_inhomogeneous_time_basis_dataset = is_time_dataset && !is_homogeneous_time_basis_dataset;
+    bool resampling = opctx->time_range.dtime.size() >= 1;
+    bool homogeneous_time_basis_dataset_with_resampling = resampling && is_homogeneous_time_basis_dataset;
+    bool inhomogeneous_time_basis_dataset_with_resampling = resampling && is_inhomogeneous_time_basis_dataset;
+    
+    DataInterpolation data_interpolation_component;
+
+    if (dataset_name == "ids_properties/homogeneous_time" && opctx->time_range.dtime.size() != 0)
+    {
+        int *d = (int *)*data;
+        *d = 1;
+        return 1;
+    }
+    
+    if (homogeneous_time_basis_dataset_with_resampling)
+    {
+        DEBUG_PRINT("Handling homogeneous_time_basis_dataset_with_resampling");
+        std::vector<int> ctx_indices;
+        int dynamic_index = -1;
+        ctx_indices = getIndices(ctx, &dynamic_index);
+        DEBUG_PRINT("dynamic_index: " << dynamic_index);
+        double tmin;
+        double tmax;
+        if (opctx->time_range.dtime.size() <= 1)
+        {
+                tmin = opctx->time_range.tmin;
+                tmax = opctx->time_range.tmax;
+        }
+         else
+        {
+                tmin = opctx->time_range.dtime[0];
+                tmax = opctx->time_range.dtime.back();
+        }
+        DEBUG_PRINT("tmin: " << tmin << ", tmax: " << tmax << ", dtime size: " << opctx->time_range.dtime.size());
+        *dim = 1;
+        size[*dim - 1] = data_interpolation_component.resample_timebasis(tmin, tmax,
+                                                            opctx->time_range.dtime, dynamic_index,
+                                                            time_basis_vector, data);
+        
+        DEBUG_PRINT("resample_timebasis result size: " << size[*dim - 1]);
+        
+        return 1;
+    }
+    else if (inhomogeneous_time_basis_dataset_with_resampling)
+    { // in this case, no value is returned
+        return 0;
+    }
+
+    bool is_dynamic = timebasename.compare("") != 0 ? true : false;
+    std::vector<int> ctx_indices;
+        // We get the indices without forcing the time index (it will be handled by readInterpolatedData)
+    int dynamic_index = -1;
+    ctx_indices = getIndices(ctx, &dynamic_index);
+
+    DEBUG_PRINT("is_dynamic=" << is_dynamic << ", dynamic_index=" << dynamic_index);
+
+    if (dynamic_index == -1 && !is_dynamic)
+    {
+        int status = read_dataset_globally(ctx, dataset_name, datatype, data, dim, size, timebasename);
+        // If data is static, we read it globally and we are done.
+        return status;
+    }
+
+    int time_min_index;
+    int time_max_index;
+    int range;
+
+    double tmin;
+    double tmax;
+
+    std::map<std::string, int> times_indices;
+    double requested_time; // requested time for time range with dtime !=-1 (resampling)
+    int slice_index;
+
+    // Resolve the time base of the node being read. With homogeneous_time = 0 the
+    // base can sit on the AoS element itself (reflectometer_profile/channel[]/
+    // n_e/time): it then changes from one element to the next and must be
+    // re-resolved per node instead of keeping the AoS-level vector. Passing
+    // timebasename is what lets getTimeValues find that element-local base —
+    // without it the resolution yields nothing and the whole read is dropped
+    // (to_improve.md point 19). Elsewhere the base is per-AoS, so the cached
+    // member stays authoritative: re-resolving it on every node of a global walk
+    // costs ~1,6 us of path sanitising per node (measured: +25 % on the cp
+    // TIMERANGE walk).
+    const bool per_element_timebase =
+        homogeneous_time == 0 && !timebasename.empty() && !isTimedContext(ctx);
+    if (per_element_timebase || time_basis_vector.empty()) {
+        time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename, dataset_name);
+        DEBUG_PRINT("Loaded time_basis_vector on demand, size: " << time_basis_vector.size());
+    }
+
+    if (opctx->time_range.dtime.size() <= 1)
+        {
+                tmin = opctx->time_range.tmin;
+                tmax = opctx->time_range.tmax;
+        }
+    else
+        {
+                tmin = opctx->time_range.dtime[0];
+                tmax = opctx->time_range.dtime.back();
+        }
+
+        data_interpolation_component.getTimeRangeIndices(tmin, tmax, opctx->time_range.dtime,
+                                                             time_basis_vector, &time_min_index, &time_max_index, &range, opctx->time_range.interpolation_method);
+
+        DEBUG_PRINT("Time range params: tmin=" << tmin << ", tmax=" << tmax);
+        DEBUG_PRINT("Time basis size: " << time_basis_vector.size());
+        DEBUG_PRINT("Calculated indices: time_min_index=" << time_min_index << ", time_max_index=" << time_max_index << ", range=" << range);
+
+        
+        
+        // The element's own time base (homogeneous_time = 0, no timed ancestor):
+        // that base is stored as a single array, so the signal path below would
+        // re-emit the whole array once per requested time. Cut it to the window
+        // instead — that is what the AL expects from a time node.
+        if (is_inhomogeneous_time_basis_dataset && !resampling &&
+            !isTimedContext(ctx) && *datatype == alconst::double_data)
+        {
+            if (time_min_index == -1 || time_max_index == -1) return 0;
+            const size_t nb = (size_t)(time_max_index - time_min_index + 1);
+            double* tb_out = (double*)malloc(nb * sizeof(double));
+            if (!tb_out) throw ALBackendException("Memory allocation failed", LOG);
+            for (size_t k = 0; k < nb; ++k)
+                tb_out[k] = time_basis_vector[(size_t)time_min_index + k];
+            *data = tb_out;
+            *dim = 1;
+            size[0] = (int)nb;
+            return 1;
+        }
+
+        if (dynamic_index == -1 &&
+            (*datatype == alconst::double_data ||
+             *datatype == alconst::integer_data ||
+             *datatype == alconst::complex_data))
+        {
+            // FIX (gaps, homogeneous_time=1): a standalone dynamic signal is read
+            // slice by slice instead of as one concatenated buffer. The previous
+            // approach sliced the global buffer by element offset, so a missing
+            // slice (gap) both shifted the later values AND allowed reads past the
+            // end (garbage). readInterpolatedData resolves every requested time to
+            // the nearest available slice (closest / previous / linear).
+            //
+            // Strings keep the legacy path below (out of scope for this fix).
+            std::string full_path = buildFullPath(ctx, dataset_name);
+            const char* cpath = full_path.c_str();
+            int interp_mode = opctx->time_range.interpolation_method;
+
+            // Requested time list:
+            //  - explicit resample grid (dtime.size() > 1)
+            //  - step resampling (dtime.size() == 1) : tmin, tmin+dt, ... <= tmax
+            //  - no resampling : original grid points within [tmin, tmax]
+            std::vector<double> requested_times;
+            const auto& dtime = opctx->time_range.dtime;
+            if (dtime.size() > 1) {
+                requested_times = dtime;
+            } else if (dtime.size() == 1 && dtime[0] > 0.0) {
+                for (double ti = opctx->time_range.tmin; ti <= tmax + 1e-12; ti += dtime[0])
+                    requested_times.push_back(ti);
+            } else {
+                if (time_min_index == -1 || time_max_index == -1) return 0;
+                for (int idx = time_min_index; idx <= time_max_index; ++idx)
+                    requested_times.push_back(time_basis_vector[idx]);
+            }
+            if (requested_times.empty()) return 0;
+
+            // Probe one slice to learn the per-slice shape/dim.
+            uint64_t probe_ndim = 0;
+            uint64_t probe_shape[6] = {0};
+            void* probe_buf = nullptr;
+            int probe_status = panzer_db_ptr->readInterpolatedData(
+                cpath, requested_times[0], time_basis_vector,
+                interp_mode, *datatype, &probe_ndim, probe_shape, &probe_buf, true);
+            if (probe_status != 0 || probe_buf == nullptr) {
+                if (probe_buf) free(probe_buf);
+                return 0;
+            }
+            size_t per_slice_count = 1;
+            for (size_t d = 0; d < probe_ndim; ++d) per_slice_count *= (size_t)probe_shape[d];
+
+            size_t elem_bytes = 0;
+            if (*datatype == alconst::double_data)      elem_bytes = sizeof(double);
+            else if (*datatype == alconst::integer_data) elem_bytes = sizeof(int);
+            else if (*datatype == alconst::complex_data) elem_bytes = sizeof(std::complex<double>);
+            if (elem_bytes == 0) { free(probe_buf); return 0; }
+
+            size_t nb = requested_times.size();
+            void* out_buf = malloc(nb * per_slice_count * elem_bytes);
+            if (!out_buf) { free(probe_buf); return 0; }
+            char* out_ptr = (char*)out_buf;
+
+            // The probe above already resolved requested_times[0]; keep its payload
+            // instead of reading that same slice a second time as k = 0.
+            memcpy(out_ptr, probe_buf, per_slice_count * elem_bytes);
+            free(probe_buf);
+
+            // Fill the output buffer: one resolved slice per requested time.
+            for (size_t k = 1; k < nb; ++k) {
+                uint64_t ndim_k = 0;
+                uint64_t shape_k[6] = {0};
+                void* slice_buf = nullptr;
+                int st = panzer_db_ptr->readInterpolatedData(
+                    cpath, requested_times[k], time_basis_vector,
+                    interp_mode, *datatype, &ndim_k, shape_k, &slice_buf, true);
+                if (st != 0 || slice_buf == nullptr) {
+                    if (slice_buf) free(slice_buf);
+                    free(out_buf);
+                    return 0;
+                }
+                memcpy(out_ptr + k * per_slice_count * elem_bytes,
+                       slice_buf, per_slice_count * elem_bytes);
+                free(slice_buf);
+            }
+
+            // AL convention: spatial dims first, then the time dim appended at the
+            // end with the number of slices.
+            *data = out_buf;
+            *dim = (int)probe_ndim + 1;
+            for (size_t d = 0; d < probe_ndim; ++d) size[d] = (int)probe_shape[d];
+            size[probe_ndim] = (int)nb;
+            return 1;
+        }
+
+        if (dynamic_index == -1) {
+            // No dynamic index found: we read the whole dataset (global behavior)
+            // then we slice/resample according to the time range
+            void* full_data = nullptr;
+            int full_dim = 0;
+            int full_size[6] = {0};
+            
+            int status = read_dataset_globally(ctx, dataset_name, datatype, &full_data, &full_dim, full_size, timebasename);
+            DEBUG_PRINT("read_dataset_globally status: " << status << ", full_dim: " << full_dim << ", full_size[0]: " << (full_dim > 0 ? full_size[0] : -1));
+            if (status == 0 || full_data == nullptr) return 0;
+
+            if (opctx->time_range.dtime.size() != 0) {
+                 // Resampling
+
+                // Since interpolate_with_resampling frees the data buffer it receives,
+                // we must create a new buffer containing only the relevant time range
+                // from the full dataset.
+                int stop_idx = time_max_index;
+                // For linear interpolation, we need the next point as well
+                if (opctx->time_range.interpolation_method == alconst::linear_interp && stop_idx < (int)time_basis_vector.size() - 1) {
+                    stop_idx++;
+                }
+
+                if (time_min_index == -1 || stop_idx == -1 || time_min_index > stop_idx) {
+                    free(full_data);
+                    return 0;
+                }
+
+                size_t element_size_bytes = 0;
+                if (*datatype == alconst::double_data) element_size_bytes = sizeof(double);
+                else if (*datatype == alconst::integer_data) element_size_bytes = sizeof(int);
+                else if (*datatype == alconst::char_data) element_size_bytes = sizeof(char);
+                else if (*datatype == alconst::complex_data) element_size_bytes = sizeof(std::complex<double>);
+
+                size_t slice_size_elements = 1;
+                for(int i=0; i<full_dim-1; ++i) slice_size_elements *= full_size[i];
+
+                size_t count = stop_idx - time_min_index + 1;
+                size_t data_for_interp_bytes = count * slice_size_elements * element_size_bytes;
+                void* data_for_interp = malloc(data_for_interp_bytes);
+                if (!data_for_interp) { free(full_data); throw ALBackendException("Memory allocation failed", LOG); }
+
+                char* src_ptr = (char*)full_data + (time_min_index * slice_size_elements * element_size_bytes);
+                memcpy(data_for_interp, src_ptr, data_for_interp_bytes);
+                free(full_data);
+
+                // Also slice the time vector to match the data buffer
+                std::vector<double> time_vector_for_interp(time_basis_vector.begin() + time_min_index, time_basis_vector.begin() + stop_idx + 1);
+
+                 void* resampled_data = nullptr;
+                 int nb_slices = data_interpolation_component.interpolate_with_resampling(
+                     opctx->time_range.tmin, opctx->time_range.tmax, opctx->time_range.dtime,
+                     *datatype, full_size, full_dim, data_for_interp, time_vector_for_interp, &resampled_data,
+                     opctx->time_range.interpolation_method
+                 );
+                 
+                 *data = resampled_data;
+                 *dim = full_dim;
+                 for(int i=0; i<full_dim; ++i) size[i] = full_size[i];
+                 size[full_dim-1] = nb_slices;
+                 return 1;
+            } else {
+                 // No resampling, just slicing [time_min_index, time_max_index]
+                 if (time_min_index == -1 || time_max_index == -1) {
+                     DEBUG_PRINT("Invalid time indices: " << time_min_index << ", " << time_max_index);
+                     free(full_data);
+                     return 0;
+                 }
+                 int count = time_max_index - time_min_index + 1;
+                 DEBUG_PRINT("Slicing data: from index " << time_min_index << " to " << time_max_index << " (count=" << count << ")");
+                 if (count <= 0) {
+                     free(full_data);
+                     return 0;
+                 }
+                 
+                 size_t element_size_bytes = 0;
+                 if (*datatype == alconst::double_data) element_size_bytes = sizeof(double);
+                 else if (*datatype == alconst::integer_data) element_size_bytes = sizeof(int);
+                 else if (*datatype == alconst::char_data) element_size_bytes = sizeof(char);
+                 else if (*datatype == alconst::complex_data) element_size_bytes = sizeof(std::complex<double>);
+                 
+                 size_t slice_size_elements = 1;
+                 for(int i=0; i<full_dim-1; ++i) slice_size_elements *= full_size[i];
+                 DEBUG_PRINT("Elements per slice: " << slice_size_elements);
+                 
+                 size_t offset_elements = time_min_index * slice_size_elements;
+                 size_t count_elements = count * slice_size_elements;
+                 
+                 void* sliced_data = malloc(count_elements * element_size_bytes);
+                 if (!sliced_data) {
+                     free(full_data);
+                     throw ALBackendException("Memory allocation failed in TimeRangeReadStrategy", LOG);
+                 }
+                 
+                 char* src_ptr = (char*)full_data;
+                 memcpy(sliced_data, src_ptr + offset_elements * element_size_bytes, count_elements * element_size_bytes);
+                 
+                 free(full_data);
+                 *data = sliced_data;
+                 *dim = full_dim;
+                 for(int i=0; i<full_dim; ++i) size[i] = full_size[i];
+                 size[full_dim-1] = count;
+                 DEBUG_PRINT("Final size[0] for sliced data: " << size[0]);
+                 
+                 return 1;
+            }
+        }
+        else {
+            DEBUG_PRINT("Dynamic index for time-dependent read: " << dynamic_index);
+        
+            std::vector<uint64_t> indices(ctx_indices.begin(), ctx_indices.end());                                                     
+            int interp_mode;
+
+            if (opctx->time_range.dtime.size() != 0) {
+                // Resampling case: calculate the requested time for this specific index
+                if (opctx->time_range.dtime.size() == 1) {
+                    requested_time = opctx->time_range.tmin + dynamic_index * opctx->time_range.dtime[0];
+                } else {
+                    requested_time = opctx->time_range.dtime[dynamic_index];
+                }
+                interp_mode = opctx->time_range.interpolation_method;
+            } else {
+                // No resampling: get the value at the specific grid point
+                slice_index = time_min_index + dynamic_index;
+                DEBUG_PRINT("No resampling. slice_index = " << time_min_index << " + " << dynamic_index << " = " << slice_index);
+                if (slice_index >= time_basis_vector.size() || slice_index < 0) {
+                    return 0; // Index is out of the valid range for the time basis
+                }
+                requested_time = time_basis_vector[slice_index];
+                interp_mode = alconst::closest_interp; // Use closest to pick the exact value at the grid point
+            }
+
+            DEBUG_PRINT("Requesting interpolated data at time=" << requested_time << " with interp_mode=" << interp_mode);
+            // Get root name of the AoS hierarchy
+            std::string aos_path;
+            if (ctx->getType() == CTX_ARRAYSTRUCT_TYPE) {
+                aos_path = getPath(static_cast<ArraystructContext*>(ctx));
+            }
+            std::string root_name = aos_path;
+            size_t pos = aos_path.find('/');
+            if (pos != std::string::npos) {
+                root_name = aos_path.substr(0, pos);
+            }
+
+            uint64_t ndim_out = 0;
+            uint64_t shape_out[6] = {0};
+            void* data_out = nullptr;
+            //const char* full_path = "A/0/B/0/C/0/D/0/tensor";
+            std::string full_path = buildFullPath(ctx, dataset_name);
+            const char* c_full_path = full_path.c_str();
+
+            // --- METADATA HANDLING ---
+            std::map<std::string, std::string> meta = panzer_db_ptr->readMetadata(full_path);
+            if (!meta.empty()) {
+                DEBUG_PRINT("Loaded " << meta.size() << " metadata entries for " << full_path);
+            }
+
+            int res = panzer_db_ptr->readInterpolatedData(
+                c_full_path,
+                requested_time,
+                time_basis_vector,
+                interp_mode,
+                *datatype,
+                &ndim_out,
+                shape_out,
+                &data_out,
+                !isTimedContext(ctx) // expect_time_dim
+            );
+
+            DEBUG_PRINT("readInterpolatedData result: " << res);
+
+            if (res == 0) {
+                *data = data_out;
+                *dim = ndim_out;
+                for (size_t i = 0; i < ndim_out; ++i) size[i] = (int)shape_out[i];
+                return 1;
+            }
+        } 
+            
+    return 0; 
+}
+
+std::vector<int> TimeRangeReadStrategy::getIndices(Context *ctx, int *dynamic_index) {
+    std::vector<int> indices;
+    if (ctx->getType() != CTX_ARRAYSTRUCT_TYPE) {
+        return indices;
+    }
+
+    ArraystructContext *arrCtx = dynamic_cast<ArraystructContext *>(ctx);
+    while (arrCtx != nullptr) {
+        if (arrCtx->getTimed()) {
+            indices.push_back(arrCtx->getIndex());
+            *dynamic_index = arrCtx->getIndex();
+        } else {
+            indices.push_back(arrCtx->getIndex());
+        }
+        arrCtx = arrCtx->getParent();
+    }
+    std::reverse(indices.begin(), indices.end());
+    return indices;
+}
