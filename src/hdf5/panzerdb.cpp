@@ -127,12 +127,31 @@ std::string panzer_file_name(hid_t file_id) {
 }
 
 // Identity token of an open object; opaque, only compared with H5Otoken_cmp.
-bool panzer_object_token(hid_t obj_id, H5O_token_t& out) {
+/*bool panzer_object_token(hid_t obj_id, H5O_token_t& out) {
     if (obj_id < 0) return false;
     H5O_info2_t info;
     if (H5Oget_info3(obj_id, &info, H5O_INFO_BASIC) < 0) return false;
     out = info.token;
     return true;
+}*/
+
+// Identity token of an open object; opaque, only compared with H5Otoken_cmp.
+bool panzer_object_token(hid_t obj_id, H5O_token_t& out) {
+#if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+    H5O_info2_t info;
+    if (H5Oget_info3(obj_id, &info, H5O_INFO_BASIC) < 0) {
+        return false;
+    }
+    out = info.token;
+    return true;
+#else
+    H5O_info_t info;
+    if (H5Oget_info(obj_id, &info) < 0) {
+        return false;
+    }
+    out = info.addr;
+    return true;
+#endif
 }
 
 // True when obj_id is the very object the parked token was taken from. HDF5

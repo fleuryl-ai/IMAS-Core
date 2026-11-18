@@ -829,12 +829,8 @@ int HDF5Reader::read_ND_Data(Context *ctx, std::string &att_name, std::string &t
             // printf("NOT setting time range size to :%d\n", time_range_size);
         }
 
-<<<<<<< HEAD
-        data_set->readData(current_arrctx_indices, datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data,
-                           fullReadBufferingAllowed(ctx, timed_AOS_index, is_dynamic));
-=======
-        data_set->readData(current_arrctx_indices, *datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data);
->>>>>>> github_v2/develop
+        data_set->readData(current_arrctx_indices, *datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data,
+        fullReadBufferingAllowed(ctx, timed_AOS_index, is_dynamic));
         data_set->selection_reader->getSize(size, slice_mode, is_dynamic);
     }
     else
@@ -923,12 +919,8 @@ int HDF5Reader::read_ND_Data(Context *ctx, std::string &att_name, std::string &t
         }
 
         data_set->selection_reader = std::move(hsSelectionReader);
-<<<<<<< HEAD
-        data_set->readData(current_arrctx_indices, datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data,
-                           fullReadBufferingAllowed(ctx, timed_AOS_index, is_dynamic));
-=======
-        data_set->readData(current_arrctx_indices, *datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data);
->>>>>>> github_v2/develop
+        data_set->readData(current_arrctx_indices, *datatype, *dim, slice_mode, is_dynamic, isTimed, timed_AOS_index, slice_index, data,
+        fullReadBufferingAllowed(ctx, timed_AOS_index, is_dynamic));
         data_set->selection_reader->getSize(size, slice_mode, is_dynamic);
     }
 
@@ -968,13 +960,8 @@ int HDF5Reader::read_ND_Data(Context *ctx, std::string &att_name, std::string &t
         // printf("read_ND_Data, Taking the next slide to make the linear interpolation, slice_sup=%d\n", slice_sup);
         hsSelectionReader.setHyperSlabs(slice_mode, is_dynamic, isTimed, slice_sup, timed_AOS_index, current_arrctx_indices);
         int buffer = hsSelectionReader.allocateBuffer(&next_slice_data, slice_mode, is_dynamic, isTimed, slice_sup);
-<<<<<<< HEAD
-        if (datatype != alconst::char_data)
-            status = H5Dread(dataset_id, hsSelectionReader.dtype_id, hsSelectionReader.memspace, hsSelectionReader.dataspace, H5P_DEFAULT, next_slice_data);
-=======
         if (*datatype != alconst::char_data)
-            status = H5Dread(dataset_id, H5Dget_type(dataset_id), hsSelectionReader.memspace, hsSelectionReader.dataspace, H5P_DEFAULT, next_slice_data);
->>>>>>> github_v2/develop
+            status = H5Dread(dataset_id, hsSelectionReader.dtype_id, hsSelectionReader.memspace, hsSelectionReader.dataspace, H5P_DEFAULT, next_slice_data);
         else
             status = H5Dread(dataset_id, hsSelectionReader.dtype_id, hsSelectionReader.memspace, hsSelectionReader.dataspace, H5P_DEFAULT, (char **)&next_slice_data);
 

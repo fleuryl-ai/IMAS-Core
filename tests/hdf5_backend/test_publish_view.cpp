@@ -29,6 +29,19 @@
 #include <filesystem>
 #include <stdexcept>
 
+#if !H5_VERSION_GE(1, 12, 0) || defined(H5_USE_110_API)
+typedef H5O_info_t H5O_info2_t;
+#define H5O_INFO_BASIC 0
+
+inline herr_t H5Oget_info3(hid_t loc_id, H5O_info2_t* oinfo, unsigned) {
+    return H5Oget_info(loc_id, oinfo);
+}
+
+inline herr_t H5Oget_info_by_name3(hid_t loc_id, const char* name, H5O_info2_t* oinfo, unsigned, hid_t lapl_id) {
+    return H5Oget_info_by_name(loc_id, name, oinfo, lapl_id);
+}
+#endif
+
 namespace fs = std::filesystem;
 
 static constexpr double INVALID_F64 = -9.0e40;
@@ -166,8 +179,13 @@ static std::vector<std::string> rootLinks(hid_t fid, const char* ignore) {
 // Prints the published tree (name, kind, shape, key attributes) so that a
 // failure below is readable straight from the test log.
 static void dumpNode(hid_t fid, const char* name) {
-    H5O_info2_t oinfo;
-    if (H5Oget_info_by_name3(fid, name, &oinfo, H5O_INFO_BASIC, H5P_DEFAULT) < 0) return;
+    #if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+        H5O_info2_t oinfo;
+        if (H5Oget_info_by_name3(fid, name, &oinfo, H5O_INFO_BASIC, H5P_DEFAULT) < 0) return;
+    #else
+        H5O_info_t oinfo;
+        if (H5Oget_info_by_name(fid, name, &oinfo, H5P_DEFAULT) < 0) return;
+    #endif
     std::string line = "    " + std::string(name);
     if (oinfo.type == H5O_TYPE_DATASET) {
         hid_t dset = H5Dopen2(fid, name, H5P_DEFAULT);
@@ -253,6 +271,10 @@ static bool findLine(const std::vector<std::string>& lines, const std::string& p
 }
 
 int main() {
+    #if !H5_VERSION_GE(1, 10, 0)
+        std::cout << "[SKIP] VDS view publishing requires HDF5 >= 1.10\n";
+        return 0;
+    #endif
     const std::string filename = "test_publish_view.h5";
     const char* V = "imas_view";
     double g[2][2] = {{11.0, 12.0}, {21.0, 22.0}};   // A[a][b]

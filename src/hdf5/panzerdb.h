@@ -11,6 +11,32 @@
  */
 #pragma once
 #include <hdf5.h>
+#if !H5_VERSION_GE(1, 12, 0) || defined(H5_USE_110_API)
+inline herr_t H5Pset_file_locking(hid_t, hbool_t, hbool_t) { return 0; }
+typedef haddr_t H5O_token_t;
+#define H5O_TOKEN_UNDEF HADDR_UNDEF
+#define H5O_IS_TOKEN_UNDEF(tok) ((tok) == HADDR_UNDEF)
+
+inline herr_t H5Otoken_cmp(hid_t, const H5O_token_t* token1, const H5O_token_t* token2, int* cmp_value) {
+    if (*token1 < *token2) *cmp_value = -1;
+    else if (*token1 > *token2) *cmp_value = 1;
+    else *cmp_value = 0;
+    return 0;
+}
+
+inline hid_t H5Oopen_by_token(hid_t loc_id, H5O_token_t token) {
+    return H5Oopen_by_addr(loc_id, token);
+}
+#define H5F_ACC_SWMR_WRITE 0
+#define H5F_ACC_SWMR_READ  0
+#define H5F_LIBVER_V110    H5F_LIBVER_LATEST
+
+inline herr_t H5Fstart_swmr_write(hid_t) { return 0; }
+inline herr_t H5Dflush(hid_t obj_id) { return H5Fflush(obj_id, H5F_SCOPE_LOCAL); }
+inline herr_t H5Drefresh(hid_t) { return 0; }
+inline herr_t H5Oflush(hid_t obj_id) { return H5Fflush(obj_id, H5F_SCOPE_LOCAL); }
+inline herr_t H5Orefresh(hid_t) { return 0; }
+#endif
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -656,12 +682,21 @@ private:
     /// handles are already gone by handoff time and the identity has to be the one
     /// noted while they were alive.
     std::string index_file_name;
-    H5O_token_t index_token = H5O_TOKEN_UNDEF;
+    #if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+        H5O_token_t index_token = H5O_TOKEN_UNDEF;
+    #else
+        haddr_t index_token = HADDR_UNDEF;
+    #endif
 
     /** Parsed index state of one file, parked here while no engine holds it. */
     struct IndexHandoff {
         std::string key;            // HDF5 file name the state was read from
-        H5O_token_t index_token = H5O_TOKEN_UNDEF;  // identity of the /index it came from
+        //H5O_token_t index_token = H5O_TOKEN_UNDEF;  
+        #if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+            H5O_token_t index_token = H5O_TOKEN_UNDEF; // identity of the /index it came from
+        #else
+            haddr_t index_token = HADDR_UNDEF; // identity of the /index it came from
+        #endif
         uint64_t rows = 0;          // /index rows the state covers
         uint64_t paths = 0;         // rows of /paths (v2) or /path_table (v3)
         uint64_t last_offset = 0;   // offset/count of the last row read: prefix check

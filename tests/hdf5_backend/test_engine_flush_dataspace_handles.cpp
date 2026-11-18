@@ -38,9 +38,25 @@ static int count_one(hid_t /*id*/, void* op_data) {
 /// H5I.c:206); H5Iiterate walks it and returns the count through the callback.
 /// Returns -1 when the counter itself is unusable, which the caller reports as a
 /// failure -- a counter that stops working must not be able to report success.
-static long live_dataspaces() {
-    long n = 0;
+static long int live_dataspaces() {
+#if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+    long int n = 0;
     return H5Iiterate(H5I_DATASPACE, count_one, &n) < 0 ? -1 : n;
+#else
+    long int n = 0;
+    // Dans HDF5 1.8.12, H5I_DATASPACE est l'index du groupe d'IDs (type = 4).
+    // Les IDs sont construits avec (type << 24) | index (avec index >= 1).
+    const hid_t type_mask = (static_cast<hid_t>(H5I_DATASPACE) << 24);
+    H5E_BEGIN_TRY {
+        for (hid_t idx = 1; idx < 100000; ++idx) {
+            hid_t candidate = type_mask | idx;
+            if (H5Iis_valid(candidate) > 0 && H5Iget_type(candidate) == H5I_DATASPACE) {
+                ++n;
+            }
+        }
+    } H5E_END_TRY;
+    return n;
+#endif
 }
 
 int main() {

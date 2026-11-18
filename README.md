@@ -80,6 +80,8 @@ See [Building from Source](docs/source/user_guide/installation.rst) for detailed
 - **[Backends Guide](docs/source/user_guide/backends_guide.rst)** - Available data backends
 - **[URIs Guide](docs/source/user_guide/uris_guide.rst)** - Data entry URI documentation
 - **[Configuration](docs/source/user_guide/configuration.rst)** - Configuration options
+- **[HDF5 Backend v2 Developer Guide, v2.1](developer_guide_v2.1.md)** - Backend v2 architecture (AL ↔ PanzerDB, read strategies, on-disk format)
+- **[PanzerDB Engine Guide, v1](developer_guide_v2.md)** - Storage-engine API reference (superseded overall by the v2.1 guide)
 - **[FAQ](docs/source/faq.rst)** - Frequently asked questions
 - **[Troubleshooting](docs/source/troubleshooting.rst)** - Troubleshooting
 

@@ -16,6 +16,14 @@
 #include <stdexcept>
 #include <vector>
 
+#if !H5_VERSION_GE(1, 10, 0)
+#define H5D_VIRTUAL H5D_CHUNKED
+
+inline herr_t H5Pset_virtual(hid_t, hid_t, const char*, const char*, hid_t) {
+    return -1;
+}
+#endif
+
 namespace imas {
 namespace view {
 namespace {
@@ -230,77 +238,89 @@ std::vector<hsize_t> computeDims(uint64_t count, PanzerDB::Leaf::ShapeView shape
 bool createVDS(hid_t file_id, hid_t view_root, const PanzerDB::Leaf& leaf,
                const std::string& source_filename,
                const std::string& raw_prefix) {
-    std::string fullPath = std::string(leaf.path);
-    auto segs = splitPath(fullPath);
-    if (segs.empty()) return false;
-    std::string name = segs.back();
-    segs.pop_back();                             // segs = parent segments
-    if (segs.empty() && (name == "index")) name = "index_node";  // collision guard
+    #if !H5_VERSION_GE(1, 10, 0)
+    (void)file_id;
+    (void)view_root;
+    (void)leaf;
+    (void)source_filename;
+    (void)raw_prefix;
+    
+    return false;
+    #else
+        // ... code existant de createVDS (avec H5D_VIRTUAL, H5Pset_virtual, etc.) ...
+    
+        std::string fullPath = std::string(leaf.path);
+        auto segs = splitPath(fullPath);
+        if (segs.empty()) return false;
+        std::string name = segs.back();
+        segs.pop_back();                             // segs = parent segments
+        if (segs.empty() && (name == "index")) name = "index_node";  // collision guard
 
-    if (leaf.count == 0) return false;           // nothing to map
+        if (leaf.count == 0) return false;           // nothing to map
 
-    auto dt = static_cast<PanzerDB::DataType>(leaf.flags >> 4);
-    const char* raw = dataRawName(dt, leaf.block);
-    if (!raw) return false;
+        auto dt = static_cast<PanzerDB::DataType>(leaf.flags >> 4);
+        const char* raw = dataRawName(dt, leaf.block);
+        if (!raw) return false;
 
-    // 1. Parent group
-    hid_t parent = ensureGroups(view_root, segs);
-    const bool parent_is_loc = (parent == view_root);
+        // 1. Parent group
+        hid_t parent = ensureGroups(view_root, segs);
+        const bool parent_is_loc = (parent == view_root);
 
-    // 2. Source dataset type
-    //    raw_prefix is empty for root-level data, "magnetics/" etc. otherwise.
-    std::string full_raw = raw_prefix + raw;
-    hid_t src = H5Dopen2(file_id, full_raw.c_str(), H5P_DEFAULT);
-    if (src < 0) { if (!parent_is_loc) H5Gclose(parent); return false; }
-    hid_t src_type = H5Dget_type(src);
-    H5Dclose(src);
+        // 2. Source dataset type
+        //    raw_prefix is empty for root-level data, "magnetics/" etc. otherwise.
+        std::string full_raw = raw_prefix + raw;
+        hid_t src = H5Dopen2(file_id, full_raw.c_str(), H5P_DEFAULT);
+        if (src < 0) { if (!parent_is_loc) H5Gclose(parent); return false; }
+        hid_t src_type = H5Dget_type(src);
+        H5Dclose(src);
 
-    // 3. Target dataspace (the VDS shape)
-    std::vector<hsize_t> dims = computeDims(leaf.count, leaf.shape_span());
-    hid_t vspace;
-    if (dims.empty()) vspace = H5Screate(H5S_SCALAR);
-    else vspace = H5Screate_simple((int)dims.size(), dims.data(), nullptr);
-    hid_t vsel = H5Scopy(vspace);
+        // 3. Target dataspace (the VDS shape)
+        std::vector<hsize_t> dims = computeDims(leaf.count, leaf.shape_span());
+        hid_t vspace;
+        if (dims.empty()) vspace = H5Screate(H5S_SCALAR);
+        else vspace = H5Screate_simple((int)dims.size(), dims.data(), nullptr);
+        hid_t vsel = H5Scopy(vspace);
 
-    // 4. Source selection: a single contiguous block [offset, offset+count)
-    hsize_t src_extent[1] = { (hsize_t)(leaf.offset + leaf.count) };
-    hid_t srcspace = H5Screate_simple(1, src_extent, nullptr);
-    hid_t srcsel = H5Scopy(srcspace);
-    hsize_t start[1] = { (hsize_t)leaf.offset };
-    hsize_t stride[1] = { 1 };
-    hsize_t cnt[1]    = { (hsize_t)leaf.count };
-    hsize_t blk[1]    = { 1 };
-    H5Sselect_hyperslab(srcsel, H5S_SELECT_SET, start, stride, cnt, blk);
+        // 4. Source selection: a single contiguous block [offset, offset+count)
+        hsize_t src_extent[1] = { (hsize_t)(leaf.offset + leaf.count) };
+        hid_t srcspace = H5Screate_simple(1, src_extent, nullptr);
+        hid_t srcsel = H5Scopy(srcspace);
+        hsize_t start[1] = { (hsize_t)leaf.offset };
+        hsize_t stride[1] = { 1 };
+        hsize_t cnt[1]    = { (hsize_t)leaf.count };
+        hsize_t blk[1]    = { 1 };
+        H5Sselect_hyperslab(srcsel, H5S_SELECT_SET, start, stride, cnt, blk);
 
-    // 5. DCPL with VIRTUAL layout + the one source mapping
-    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
-    H5Pset_layout(dcpl, H5D_VIRTUAL);
-    H5Pset_virtual(dcpl, vsel, source_filename.c_str(), full_raw.c_str(), srcsel);
+        // 5. DCPL with VIRTUAL layout + the one source mapping
+        hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+        H5Pset_layout(dcpl, H5D_VIRTUAL);
+        H5Pset_virtual(dcpl, vsel, source_filename.c_str(), full_raw.c_str(), srcsel);
 
-    // 6. Create the VDS dataset
-    hid_t vds = H5Dcreate2(parent, name.c_str(), src_type, vspace,
-                           H5P_DEFAULT, dcpl, H5P_DEFAULT);
+        // 6. Create the VDS dataset
+        hid_t vds = H5Dcreate2(parent, name.c_str(), src_type, vspace,
+                            H5P_DEFAULT, dcpl, H5P_DEFAULT);
 
-    if (vds >= 0) {
-        // 7. Attributes (metadata that h5ls cannot infer)
-        setStrAttr(vds, "datatype", dtypeString(dt));
-        setU64Attr(vds, "n_elements", leaf.count);
-        uint64_t prod = productShape(leaf.shape_span());
-        uint64_t tdim = leaf.ndim == 0
-                     ? (leaf.count > 1 ? leaf.count : 1)
-                     : (leaf.count >= prod && leaf.count % prod == 0 ? leaf.count / prod : 1);
-        if (tdim > 1) setU64Attr(vds, "time_dim", tdim);
-        setStrAttr(vds, "schema", PanzerDB::stripIndices(fullPath));
-        H5Dclose(vds);
-    }
+        if (vds >= 0) {
+            // 7. Attributes (metadata that h5ls cannot infer)
+            setStrAttr(vds, "datatype", dtypeString(dt));
+            setU64Attr(vds, "n_elements", leaf.count);
+            uint64_t prod = productShape(leaf.shape_span());
+            uint64_t tdim = leaf.ndim == 0
+                        ? (leaf.count > 1 ? leaf.count : 1)
+                        : (leaf.count >= prod && leaf.count % prod == 0 ? leaf.count / prod : 1);
+            if (tdim > 1) setU64Attr(vds, "time_dim", tdim);
+            setStrAttr(vds, "schema", PanzerDB::stripIndices(fullPath));
+            H5Dclose(vds);
+        }
 
-    // 8. Cleanup temporary ids
-    H5Pclose(dcpl);
-    H5Sclose(srcsel);  H5Sclose(srcspace);
-    H5Sclose(vsel);    H5Sclose(vspace);
-    H5Tclose(src_type);
-    if (!parent_is_loc) H5Gclose(parent);
-    return vds >= 0;
+        // 8. Cleanup temporary ids
+        H5Pclose(dcpl);
+        H5Sclose(srcsel);  H5Sclose(srcspace);
+        H5Sclose(vsel);    H5Sclose(vspace);
+        H5Tclose(src_type);
+        if (!parent_is_loc) H5Gclose(parent);
+        return vds >= 0;
+    #endif
 }
 
 void createNodeGroup(hid_t view_root, const std::vector<std::string>& segs) {
@@ -996,8 +1016,16 @@ PublishStats publishImpl(const std::string& filename, const PublishOptions& opti
 bool describeObject(hid_t file, const std::string& path, std::string& body, bool& isGroup) {
     hid_t obj = H5Oopen(file, path.c_str(), H5P_DEFAULT);
     if (obj < 0) return false;
-    H5O_info2_t info;
-    const bool haveInfo = (H5Oget_info3(obj, &info, H5O_INFO_BASIC) >= 0);
+    #if H5_VERSION_GE(1, 12, 0) && !defined(H5_USE_110_API)
+        H5O_info2_t info;
+        if (H5Oget_info3(obj, &info, H5O_INFO_BASIC) < 0) return false;
+        const bool haveInfo = (H5Oget_info3(obj, &info, H5O_INFO_BASIC) >= 0);
+    #else
+        H5O_info_t info;
+        if (H5Oget_info(obj, &info) < 0) return false;
+        const bool haveInfo = (H5Oget_info(obj, &info) >= 0);
+    #endif              
+    
     isGroup = haveInfo && info.type == H5O_TYPE_GROUP;
 
     if (isGroup) {
