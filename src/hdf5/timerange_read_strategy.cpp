@@ -58,9 +58,9 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
     } else {
         std::string aos_path_token = getPath(ctx, false);
         auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);
-        *size = shapes.empty() ? 0 : shapes[0]; 
+        *size = shapes.empty() ? 0 : shapes[0];
     }
-    
+
 }
 
 void TimeRangeReadStrategy::endAction(Context *ctx) {
@@ -89,28 +89,50 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
 
     const int homogeneous_time = getHomogeneousTime();
     const std::string clean_dataset_name = cleanFlatPath(dataset_name);
+    // The homogeneous time basis is the IDS top-level "time" node, read from the
+    // root OperationContext. The same clean name "time" also matches a nested,
+    // dynamic per-occurrence "time" child (profiles_1d/time) that is read inside
+    // a timed AoS context and must stay a 0-D scalar, not be resampled to 1-D.
+    // Gating on !isTimedContext keeps the resampling branch exclusive to the
+    // top-level basis.
     bool is_homogeneous_time_basis_dataset =
-        (homogeneous_time == 1 && clean_dataset_name == "time");
+        (homogeneous_time == 1 && clean_dataset_name == "time" && !isTimedContext(ctx));
+    // The IDS top-level time basis is exposed as a single shared time, whether the
+    // time is homogeneous or inhomogeneous; it is read from the root OperationContext
+    // (never inside a timed AoS). This is the node that must be resampled to the new
+    // time grid. A nested dynamic "time" child (profiles_1d/time, flux.time) is read
+    // inside a timed AoS context; it is element-local and must keep its declared
+    // shape (0-D / per-occurrence), not be resampled.
+    bool is_top_level_time_basis = (clean_dataset_name == "time" && !isTimedContext(ctx));
     bool is_time_dataset = isTimebaseDataset(
         ctx, dataset_name, timebasename, homogeneous_time);
     //bool is_time_basis_dataset = is_homogeneous_time_basis_dataset || is_time_dataset;
     bool is_inhomogeneous_time_basis_dataset = is_time_dataset && !is_homogeneous_time_basis_dataset;
     bool resampling = opctx->time_range.dtime.size() >= 1;
-    bool homogeneous_time_basis_dataset_with_resampling = resampling && is_homogeneous_time_basis_dataset;
-    bool inhomogeneous_time_basis_dataset_with_resampling = resampling && is_inhomogeneous_time_basis_dataset;
+    bool time_basis_dataset_with_resampling = resampling && is_top_level_time_basis;
+    bool nested_time_dataset_with_resampling =
+        resampling && clean_dataset_name == "time" && isTimedContext(ctx);
     
     DataInterpolation data_interpolation_component;
 
-    if (dataset_name == "ids_properties/homogeneous_time" && opctx->time_range.dtime.size() != 0)
+    // dataset_name is a flattened path ('/' -> '&'), so compare against the
+    // normalised form to cover both 'ids_properties/homogeneous_time' and
+    // 'ids_properties&homogeneous_time'.
+    if (clean_dataset_name == "ids_properties&homogeneous_time" && opctx->time_range.dtime.size() != 0)
     {
-        int *d = (int *)*data;
+        // After resampling the IDS is reported homogeneous: serve a single INT_0D 1.
+        int *d = (int *)malloc(sizeof(int));
+        if (!d) throw ALBackendException("Memory allocation failed", LOG);
         *d = 1;
+        *data = d;
+        *dim = 0;
+        if (size) size[0] = 1;
         return 1;
     }
     
-    if (homogeneous_time_basis_dataset_with_resampling)
+    if (time_basis_dataset_with_resampling)
     {
-        DEBUG_PRINT("Handling homogeneous_time_basis_dataset_with_resampling");
+        DEBUG_PRINT("Handling time_basis_dataset_with_resampling");
         std::vector<int> ctx_indices;
         int dynamic_index = -1;
         ctx_indices = getIndices(ctx, &dynamic_index);
@@ -137,8 +159,9 @@ int TimeRangeReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name,
         
         return 1;
     }
-    else if (inhomogeneous_time_basis_dataset_with_resampling)
-    { // in this case, no value is returned
+    else if (nested_time_dataset_with_resampling)
+    { // element-local time of a timed AoS occurrence: not part of the shared
+       // time grid, so no resampled value is produced (the AL stores the default)
         return 0;
     }
 
