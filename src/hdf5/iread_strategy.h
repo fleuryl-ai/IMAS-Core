@@ -1509,10 +1509,20 @@ public:
             }
             
             size_t n_time_slices = (spatial_product > 0) ? (total_elements / spatial_product) : 1;
-            
+
+            // A time-dependent N-D signal keeps its time axis even when a single
+            // slice is stored (dictionary dim = spatial dims + 1); this mirrors the
+            // 0-D branch rule (want_1d). A static (time-independent) N-D array stays
+            // at leaf_rank, exactly as stored on disk.
+            const bool want_time_dim = (expected_dim == (int)leaf_rank + 1) ||
+                shouldPromoteTimeScalarOnSlice(ctx, timebasename, actual_datatype);
+
             if (n_time_slices > 1) {
                 *dim = (int)(leaf_rank + 1); // ✅ +1 for time dimension
                 size[leaf_rank] = (int)n_time_slices;
+            } else if (want_time_dim) {
+                *dim = (int)(leaf_rank + 1); // single slice: keep the time axis (size 1)
+                size[leaf_rank] = 1;
             } else {
                 *dim = (int)leaf_rank; // No time dimension if only 1 slice
             }
