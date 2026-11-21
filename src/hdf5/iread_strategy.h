@@ -16,6 +16,7 @@
 #include <set>
 #include <map>
 #include <unordered_set>
+#include <cctype>
 
 // Sentinel for the cached ids_properties&homogeneous_time flag (valid values: -1, 0, 1)
 constexpr int HOMOG_TIME_UNRESOLVED = -2;
@@ -1294,14 +1295,53 @@ public:
                 const ReadIndex::TimeRange range = (target_time_index == -1)
                     ? ReadIndex::TimeRange{by_name->begin(), by_name->end()}
                     : ReadIndex::equal_time(*by_name, static_cast<uint64_t>(target_time_index));
+
+                // Split a path into its named parts, dropping AoS instance
+                // indices (pure-numeric segments).  Used by the name-suffix
+                // candidate check below.
+                auto named_parts = [](const std::string& s) {
+                    std::vector<std::string> parts;
+                    std::string token;
+                    auto flush = [&]() {
+                        if (!token.empty() &&
+                            !std::all_of(token.begin(), token.end(),
+                                         [](unsigned char c) { return std::isdigit(c); }))
+                            parts.push_back(token);
+                        token.clear();
+                    };
+                    for (char c : s) {
+                        if (c == '/' || c == '&') flush();
+                        else token += c;
+                    }
+                    flush();
+                    return parts;
+                };
+                const auto wanted = named_parts(dataset_name);
+
                 for (auto it = range.first; it != range.second; ++it) {
                     const auto* leaf = *it;
 
                     // Check if path starts with context prefix (if any)
                     if (!context_prefix.empty()) {
-                        if (leaf->path.compare(0, context_prefix.size(), context_prefix) == 0) {
-                            sorted_leaves.push_back(leaf);
+                        if (leaf->path.compare(0, context_prefix.size(), context_prefix) != 0) {
+                            continue;
                         }
+                        // The candidate must be the requested node itself, not a
+                        // deeper subtree member under this context.  A bare prefix
+                        // match also accepts sibling-subtree leaves: reading
+                        // ".../node/2/readback/0/repository" matches
+                        // ".../node/2/readback/0/library/0/repository", or reading
+                        // ".../ion/1/density_fit&source" matches ".../ion/1/state/0/
+                        // density_fit&source".  A missing/empty node then serves a
+                        // wrong value instead of reading empty, corrupting the
+                        // round-trip on nested AoS.  Keep the candidate only when,
+                        // beyond the context prefix, its named parts (AoS instance
+                        // indices dropped) are exactly the requested dataset name.
+                        const std::string rest(leaf->path.substr(context_prefix.size()));
+                        if (named_parts(rest) != wanted) {
+                            continue;
+                        }
+                        sorted_leaves.push_back(leaf);
                     } else if (leaf->parent_path.empty()) {
                         // TOP-LEVEL QUERY (record root): only accept leaves
                         // whose own parent is also the record root.  Rejecting
