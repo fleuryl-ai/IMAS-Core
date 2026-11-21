@@ -768,12 +768,12 @@ hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative
     else
         *IDS_group_id = openHDF5Group(ctx->getDataobjectName().c_str(), file_id);
 
-    if (*IDS_group_id < 0) {
-        char error_message[200];
-        sprintf(error_message, "Unable to open group for IDS: %s\n", ctx->getDataobjectName().c_str());
-        H5Eprint2(H5E_DEFAULT, stderr);
-        throw ALBackendException(error_message, LOG);
-    }
+    // A group that cannot be opened is a legitimate "occurrence not found" on the
+    // read path. Mirror the reference IMAS-Core: leave *IDS_group_id == -1 here and
+    // do NOT raise. The callers (HDF5Reader/HDF5Writer::open_ids_group) store the
+    // group id only when >= 0, so the AL/HLI then turns the resulting empty read
+    // into a DataEntryException. Raising here instead leaks a raw backend exception
+    // for what is a normal not-found case.
 }
 
 void HDF5Utils::showStatus(hid_t file_id) {

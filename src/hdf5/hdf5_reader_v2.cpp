@@ -82,6 +82,11 @@ void HDF5Reader_v2::close_group(OperationContext *ctx)
 void HDF5Reader_v2::beginReadArraystructAction(ArraystructContext *ctx, int *size)
 {
     prepare_strategy(ctx);
+    if (read_strategy == nullptr) {
+        // Group for this context was not opened (occurrence not in the file): empty AoS.
+        *size = 0;
+        return;
+    }
     read_strategy->beginReadArraystructAction(ctx, size);
 }
 
@@ -161,7 +166,14 @@ void HDF5Reader_v2::prepare_strategy(Context *ctx) {
     }
 
     if (gid == -1) {
-        throw ALBackendException("No HDF5 group ID found for this context", LOG);
+        // Mirror the base (v1) reader: an occurrence that is not in the file simply has
+        // no leaves to read, so there is no active strategy for this context. The entry
+        // points (read_ND_Data / beginReadArraystructAction) treat read_strategy == null
+        // as "no data" (they return 0 / an empty AoS), which the AL then maps to a default
+        // value -- exactly how the reference IMAS-Core reports a missing occurrence. Raising
+        // here instead leaks a raw backend exception for a normal not-found read.
+        read_strategy = nullptr;
+        return;
     }
 
     // 3. Select/Initialize
@@ -173,6 +185,11 @@ int HDF5Reader_v2::read_ND_Data(Context *ctx, std::string &dataset_name, std::st
                                  int *datatype, void **data, int *dim, int *size) {
   
   prepare_strategy(ctx);
+
+  // Group for this context was not opened (occurrence not in the file): no data.
+  if (read_strategy == nullptr) {
+      return 0;
+  }
 
   std::string dataset_name_copy = dataset_name;
   std::string timebasename_copy = timebasename;
