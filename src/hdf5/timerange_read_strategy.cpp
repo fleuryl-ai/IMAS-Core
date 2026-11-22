@@ -56,7 +56,38 @@ void TimeRangeReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, 
                                                                  opCtx->time_range.interpolation_method);
             }
     } else {
-        std::string aos_path_token = getPath(ctx, false);
+        // Nested non-timed AoS.  When a resampled grid is in effect and the parent
+        // chain carries a timed (dynamic) AoS, the current index of that AoS is a
+        // VIRTUAL resampled index (0..n_resampled-1) that has no stored slice at
+        // most positions.  The reference (v1) reader resolves the requested time to
+        // the nearest stored occurrence and reads the size from that one (the inner
+        // static AoS is identical for every occurrence -- only the outer timed AoS
+        // is resampled).  Mirror that here.  (hdf5_reader.cpp, base reader, TIMERANGE)
+        int64_t override_timed_index = -1;
+        OperationContext *opCtx0 = ctx->getOperationContext();
+        if (opCtx0 && opCtx0->time_range.dtime.size() != 0) {
+            std::vector<std::string> chain_names;
+            std::vector<int> chain_indices;
+            std::vector<bool> chain_timed;
+            collectAosChain(ctx, chain_names, chain_indices, &chain_timed);
+            // Nearest timed ancestor = last timed segment (root-first chain).
+            int resampled_index = -1;
+            for (size_t j = chain_names.size(); j-- > 0;)
+                if (chain_timed[j]) { resampled_index = chain_indices[j]; break; }
+            if (resampled_index >= 0 && !time_basis_vector.empty()) {
+                double requested_time =
+                    (opCtx0->time_range.dtime.size() == 1)
+                        ? (opCtx0->time_range.tmin + resampled_index * opCtx0->time_range.dtime[0])
+                        : opCtx0->time_range.dtime[resampled_index];
+                std::map<std::string, int> times_indices;
+                DataInterpolation di;
+                int stored_slice = di.getSlicesTimesIndices(
+                    requested_time, time_basis_vector, times_indices,
+                    opCtx0->time_range.interpolation_method);
+                if (stored_slice >= 0) override_timed_index = stored_slice;
+            }
+        }
+        std::string aos_path_token = getPath(ctx, false, override_timed_index);
         auto shapes = panzer_db_ptr->getAOSShape(aos_path_token);
         *size = shapes.empty() ? 0 : shapes[0];
     }
