@@ -385,7 +385,7 @@ class HDF5Reader {
      * @throws ALBackendException when the master file is not open or H5Literate fails.
      */
     virtual void get_occurrences(const char* ids_name, int** occurrences_list, int* size, hid_t master_file_id);
-    void list_filled_paths(const char* dataobjectname, char*** path_list, int* size, hid_t file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative_file_path);
+    virtual void list_filled_paths(const char* dataobjectname, char*** path_list, int* size, hid_t file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative_file_path);
 
     /**
      * @brief Opens the IDS file and group for reading, caching the handle per operation.

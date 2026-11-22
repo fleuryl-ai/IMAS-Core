@@ -105,6 +105,19 @@ class HDF5Reader_v2 : public HDF5Reader {
     void beginReadArraystructAction(ArraystructContext * ctx, int *size) override;
 
     /**
+     * @brief Lists the filled (data) nodes of the IDS as logical IMAS paths.
+     *
+     * In the PanzerDB layout the first level of the group holds only the physical
+     * columns (data_*), index and path tables, so the base class' "list the group
+     * links" assumption does not hold. This override enumerates the logical leaves
+     * from the /index cache instead: AoS meta-nodes are dropped, occurrence indices
+     * are stripped, and the result is de-duplicated and sorted — the same set of
+     * logical paths the base class yields for a legacy (v1) group.
+     * @return An empty list (&size == 0) when the IDS group does not exist.
+     */
+    void list_filled_paths(const char* dataobjectname, char*** path_list, int* size, hid_t file_id, std::unordered_map < std::string, hid_t > &opened_IDS_files, std::string & files_directory, std::string & relative_file_path) override;
+
+    /**
      * @brief Closes the current read (delegates endAction of the active strategy).
      */
     void endAction(Context * ctx) override;

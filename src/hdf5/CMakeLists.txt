@@ -293,6 +293,10 @@ al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling_vector)
 # Currently RED on the v2 backend: inner AoS size is 0 at resampled occurrences
 # that have no stored slice at that index (v1 serves the stored size).
 al_add_hdf5_test(test_al_timerange_resampled_nested_static_aos)
+# list_filled_paths must return IMAS logical paths (stripped of occurrence
+# indices), the same set under v1 and v2 storage; v2 enumerates the /index
+# leaves (the group's first level holds only physical columns there).
+al_add_hdf5_test(test_al_list_filled_paths)
 al_add_hdf5_test(test_al_timerange_root_string)
 al_add_hdf5_test(test_al_timerange_simple)
 

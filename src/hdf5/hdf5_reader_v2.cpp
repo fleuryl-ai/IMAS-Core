@@ -2,7 +2,9 @@
 
 #include "al_backend.h"
 #include "al_defs.h"
+#include "al_utilities.h"
 #include <algorithm>
+#include <set>
 #include <vector>
 #include <cstring>
 #include <complex>
@@ -88,6 +90,79 @@ void HDF5Reader_v2::beginReadArraystructAction(ArraystructContext *ctx, int *siz
         return;
     }
     read_strategy->beginReadArraystructAction(ctx, size);
+}
+
+void HDF5Reader_v2::list_filled_paths(const char* dataobjectname, char*** path_list, int* size,
+                                      hid_t file_id, std::unordered_map<std::string, hid_t> &opened_IDS_files,
+                                      std::string &files_directory, std::string &relative_file_path)
+{
+    HDF5Utils hdf5_utils;
+    // Temporary context so the existing group-opening logic can be reused.
+    OperationContext ctx(NULL, dataobjectname, "", READ_OP);
+    hid_t gid = -1;
+    hdf5_utils.open_IDS_group(&ctx, file_id, opened_IDS_files, files_directory, relative_file_path, &gid);
+    if (gid <= 0) {
+        // Group does not exist => nothing is filled (the HLI reports an empty occurrence).
+        *size = 0;
+        return;
+    }
+
+    // In the PanzerDB layout the group's first level holds only physical columns
+    // ({data_raw,data_scalar,data_time}_*, index, path_table, list_spans), so the
+    // base class' "list the group links" assumption does not hold. Enumerate the
+    // logical leaves from the /index cache instead; the group handle stays owned
+    // by the caller (opened_IDS_files), so open PanzerDB with close_loc_id=false.
+    std::set<std::string> logical_paths;
+    {
+        PanzerDB db(gid, PanzerDB::OpenMode::READ, /*preserve_empty_nodes=*/false, /*close_loc_id_on_exit=*/false);
+        const auto& leaves = db.getLeaves();
+        for (const auto& leaf : leaves) {
+            // Node kind lives in the low 4 bits: 2 = static AoS meta-node, 3 = dynamic
+            // AoS meta-node. Both are containers, not data nodes: the base class only
+            // ever lists data nodes (the &AOS_SHAPE companions are skipped there).
+            if ((leaf.flags & 0xFULL) == 2 || (leaf.flags & 0xFULL) == 3) continue;
+
+            std::string path(leaf.path);  // zero-copy views: copy out before the DB dies
+            // Mirror the base class' DD-path conversion first ('&' flattening, "[]" removal).
+            path.erase(std::remove(path.begin(), path.end(), '['), path.end());
+            path.erase(std::remove(path.begin(), path.end(), ']'), path.end());
+            std::replace(path.begin(), path.end(), '&', '/');
+
+            // Occurrence indices: panzerdb instance paths carry them as numeric segments
+            // (e.g. "profiles_1d/0/ion/1/temperature"); strip them, and de-duplicate the
+            // per-occurrence leaves onto one logical path (e.g. "profiles_1d/ion/temperature").
+            std::vector<std::string> parts;
+            std::string token;
+            for (char c : path) {
+                if (c == '/') {
+                    parts.push_back(token);
+                    token.clear();
+                } else {
+                    token += c;
+                }
+            }
+            parts.push_back(token);
+            std::string logical;
+            bool first = true;
+            for (const auto& part : parts) {
+                if (part.empty()) continue;
+                bool numeric = true;
+                for (char c : part) {
+                    if (c < '0' || c > '9') { numeric = false; break; }
+                }
+                if (numeric) continue;
+                if (!first) logical += '/';
+                logical += part;
+                first = false;
+            }
+            if (!logical.empty()) logical_paths.insert(logical);
+        }
+    }
+
+    std::vector<std::string> variables;
+    variables.reserve(logical_paths.size());
+    for (const auto& p : logical_paths) variables.push_back(p);  // set already sorted
+    utilities::copy_stringvector_to_c_list(variables, path_list, size);
 }
 
 void HDF5Reader_v2::endAction(Context *ctx)
