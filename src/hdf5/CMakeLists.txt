@@ -287,6 +287,12 @@ al_add_hdf5_test(test_al_timerange_aos_string_list)
 al_add_hdf5_test(test_al_timerange_nested_dynamic_aos)
 al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling)
 al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling_vector)
+# Nested STATIC AoS (grid) under a resampled dynamic AoS (grids_ggd): the inner
+# AoS shape must come from a representative stored occurrence for every resampled
+# occurrence (IMAS-Python test_get_sample.py heterogeneous interp failures).
+# Currently RED on the v2 backend: inner AoS size is 0 at resampled occurrences
+# that have no stored slice at that index (v1 serves the stored size).
+al_add_hdf5_test(test_al_timerange_resampled_nested_static_aos)
 al_add_hdf5_test(test_al_timerange_root_string)
 al_add_hdf5_test(test_al_timerange_simple)
 
