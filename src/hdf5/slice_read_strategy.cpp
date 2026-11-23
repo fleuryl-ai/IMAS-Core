@@ -51,7 +51,7 @@ void SliceReadStrategy::beginReadArraystructAction(ArraystructContext *ctx, int 
         // step (to_improve.md point 24). It is also the base the data read settles on
         // (getTimeValues), so reading it adds nothing to the operation.
         if (getHomogeneousTime() == 1) {
-            const std::vector<double> homogeneous_base = getTimeValues(nullptr, 1);
+            const std::vector<double> & homogeneous_base = getTimeValues(nullptr, 1);
             if (!homogeneous_base.empty() &&
                 panzer_db_ptr->getDynamicAOSSize(aos_path) == homogeneous_base.size()) {
                 slice_idx = panzer_db_ptr->getTimeIndex("time", opCtx->getTime(), opCtx->getInterpmode());
@@ -123,7 +123,7 @@ int SliceReadStrategy::read_ND_Data(Context *ctx, std::string &dataset_name, std
         return status;
      }
 
-    std::vector<double> time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename, dataset_name);
+    const std::vector<double> & time_basis_vector = getTimeValues(ctx, homogeneous_time, timebasename, dataset_name);
 
     double time;
     int interp;

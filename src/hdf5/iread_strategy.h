@@ -496,12 +496,15 @@ public:
      * @param dataset_path Path of the node being read (flat, '&' separated). It is
      *        what a declared RELATIVE timebase anchors on: out of an AoS the base
      *        of "<signal>/data" is "<signal>/time", which no context carries.
-     * @return Vector of time values.
+     * @return A reference to the memoised base. The reference stays valid until the
+     *         engine index rebuilds or `time_values_cache` is cleared (refresh_index_if_needed
+     *         on the next operation); one getSlice visits hundreds of nodes, so a by-value
+     *         return would copy an N-slices-long vector on every node (to_improve.md point 30).
      */
-    std::vector<double> getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "",
+    const std::vector<double>& getTimeValues(Context *ctx, int homogeneous_time, const std::string& timebasename = "",
                                       const std::string& dataset_path = "") {
     refresh_index_if_needed();
-    std::vector<double> time_values;
+    static const std::vector<double> empty_time_values;
 
     std::string timebasename_copy = timebasename;
     if (!timebasename_copy.empty() && timebasename_copy[0] == '/') {
@@ -511,17 +514,18 @@ public:
     timebasename_copy = sanitize_path(ctx, timebasename_copy);
 
     if (homogeneous_time == 1) {
-        if (time_values_cache.count("HOMOGENEOUS_TIME")) {
-            return time_values_cache["HOMOGENEOUS_TIME"];
+        auto cached = time_values_cache.find("HOMOGENEOUS_TIME");
+        if (cached != time_values_cache.end()) {
+            return cached->second;
         }
-        time_values = panzer_db_ptr->getWholeDynamicSignal("time");
-        time_values_cache["HOMOGENEOUS_TIME"] = time_values;
-        return time_values;
+        auto& slot = time_values_cache["HOMOGENEOUS_TIME"];
+        slot = panzer_db_ptr->getWholeDynamicSignal("time");
+        return slot;
     }
 
     // --- Logic for homogeneous_time == 0 ---
     if (ctx == nullptr) {
-        return time_values; // Return empty vector
+        return empty_time_values; // Return empty vector
     }
 
     ArraystructContext *arrCtx = dynamic_cast<ArraystructContext*>(ctx);
@@ -553,11 +557,11 @@ public:
                 if (!cached->second.empty()) return cached->second;
                 continue;
             }
-            std::vector<double> found = panzer_db_ptr->getWholeDynamicSignal(candidate);
-            time_values_cache[root_key] = found;
-            if (!found.empty()) return found;
+            auto& slot = time_values_cache[root_key];
+            slot = panzer_db_ptr->getWholeDynamicSignal(candidate);
+            if (!slot.empty()) return slot;
         }
-        return time_values;  // nothing declared resolved to a base
+        return empty_time_values;  // nothing declared resolved to a base
     }
 
     // Find the "timed" parent to build the timebase path
@@ -604,23 +608,23 @@ public:
             if (it != time_values_cache.end())
                 return it->second;
 
+            auto& slot = time_values_cache[key];
             for (const std::string& cand : candidates) {
-                time_values = panzer_db_ptr->getWholeDynamicSignal(buildFullPath(ctx, cand));
-                if (!time_values.empty()) {
-                    time_values_cache[key] = time_values;
-                    return time_values;
-                }
+                slot = panzer_db_ptr->getWholeDynamicSignal(buildFullPath(ctx, cand));
+                if (!slot.empty()) return slot;
             }
 
             // (c) Last resort: a common time base at the root of the IDS.
-            time_values = panzer_db_ptr->getWholeDynamicSignal(base_name);
-            if (!time_values.empty())
-                return time_values;
-            time_values_cache[key] = {};   // remember the miss, but answer empty
+            const auto& last = panzer_db_ptr->getWholeDynamicSignal(base_name);
+            if (!last.empty()) {
+                slot = last;               // memoise, else the empty slot would shadow it
+                return slot;
+            }
+            // slot already holds the (empty) value of the last candidate: remember the miss
 
-            return time_values;            // no base resolved -> caller reports unavailable
+            return slot;                   // no base resolved -> caller reports unavailable
         }
-        return {}; // No timebase found
+        return empty_time_values; // No timebase found
     }
 
     // Filter to keep ONLY leaves corresponding to the exact path
@@ -710,15 +714,15 @@ public:
     }
 
     // Read values in time_index order
+    auto& slot = time_values_cache[cache_key];
     for (const auto& [time_idx, leaf_ptr] : time_leaves_map) {
         if (leaf_ptr->count > 0) {
             std::vector<double> temp_data(leaf_ptr->count);
             panzer_db_ptr->readTensor(*leaf_ptr, temp_data.data());
-            time_values.insert(time_values.end(), temp_data.begin(), temp_data.end());
+            slot.insert(slot.end(), temp_data.begin(), temp_data.end());
         }
     }
-    time_values_cache[cache_key] = time_values;
-    return time_values;
+    return slot;
 }
 
     // =================================================================================

@@ -2077,5 +2077,65 @@ erreur de forme `control_surface` avec les modifications reverdies, le deuxième
 - Le `restoreTimeContext()` O(lignes) côté **APPEND** (point 25 prop. 3) n'est pas traité ici :
   il est hors de la voie READ de ce charge et n'est pas dans les symboles chauds re-mesurés.
 
+## 30. `getSlice` en V2 : la base de temps mémoïsée est **copiée par valeur** à chaque nœud visité — mesuré et corrigé (2026-11-23)
+
+**Le symptôme.** `getSlice` répété sur un fichier v2 écrit par `putSlice`, `core_profiles` :
+`8000×2000` → 1,16 ms/appel ; `80000×2000` → **4,96 ms/appel** (pire 358 ms) — ×4,3 en
+passant de 8 k à 80 k tranches, alors que le coût des lectures physiques par appel est
+identique (1 chunk payload ~395 o + 1-2 nœuds de B-tree dans les deux cas).
+
+**Dispositif.** Harnais `IMAS-Cpp/layout_performance_impact_V1_V2` (`buildpaths -m get-slice -N 10 -R 10`,
+`IMAS_AL_DISABLE_VALIDATE=1`) sur `tree_8000x2000_slice_v2` et `tree_80000x2000_slice_v2` ;
+`perf record` (75 % du CPU dans `__memmove_avx512`), `LD_PRELOAD` de comptage de mémoïsé
+(`getWholeDynamicSignal`, `IReadStrategy::getTimeValues`, `getLeaves`, `restoreTimeContext`,
+`build_indexes`), `strace -T` sur `pread64`. libal : `IMAS-Cpp/build/_deps/al-core-src@main`
+(`d5925f6`), build du 2026-11-23.
+
+**Base mesurée** — 100 appels répétés, par appel de `getSlice` :
+
+| grandeur | 8000×2000 | 80000×2000 |
+|---|---|---|
+| temps moyen (avant) | ~1,15 ms | **4,93 ms** |
+| mouvement mémoire ≥ 64 Ko (avant) | 18,1 Mo | **181 Mo** (~197 o/feuille) |
+| `getTimeValues` / `getSlice` | 2682 | 2682 (identique) |
+| temps au calme (après) | ~0,99 ms | **~0,80 ms** |
+| digest TOTAL (avant = après) | `a0499697f3d1d26d` | `cc85a5734e6669ed` |
+
+**La cause.** `IReadStrategy::getTimeValues` renvoyait `std::vector<double>` **par valeur**
+: la branche temps-homogène exécutait `return time_values_cache["HOMOGENEOUS_TIME"];` — une
+copie de la base de temps mémoïsée (N tranches × 8 o) **à chaque appel**, et un `getSlice`
+en fait ~298 (un par nœud visité, quantités + erreurs + `time` + `ip`). `PanzerDB::
+getWholeDynamicSignal` de même (`return cached->second;`, la cache n'est mise qu'une fois
+mais chaque consommateur recopie). 298 × 640 Ko = **190 Mo par appel** à 80 k — exactement
+les 181 Mo mesurés (et 298 × 64 Ko ≈ 19 Mo, les 18,1 Mo mesurés à 8 k). Le downstream
+(`readInterpolatedData`) acceptait déjà `const std::vector<double>&` : les copies étaient
+purement signatures.
+
+**Ce qui n'était pas en cause.** La taille des chunks / le chunk-cache : le nombre et la
+taille des `pread64` par appel sont les mêmes aux deux géométries ; le temps `sys` est plat
+(0,21 → 0,24 s sur 100 appels). Le seuil à 80 k était purement arithmétique : la copie est
+linéaire en N, l'IO quasi constante.
+
+**Le correctif.** Les deux mémos renvoient désormais `const std::vector<double>&` :
+- `PanzerDB::getWholeDynamicSignal` renvoie l'élément de `whole_signals` (miss → élément
+  vide mémoïsé ; build → `std::move` dans le map, renvoi de l'élément). La référence reste
+  valide tant que l'état d'index ne change pas (`whole_signals` est vidé avec lui).
+- `IReadStrategy::getTimeValues` renvoie toujours depuis `time_values_cache` (ou un vide
+  statique) : le build d'une base passe une seule fois dans le slot du map, les hits
+  renvoient le slot. Le cache est vidé par `refresh_index_if_needed()` à chaque changement
+  d'indice, donc aucun élément ne survit à un rebuild.
+- Côté appelants, `slice_read_strategy.cpp` lie `const std::vector<double> &` au lieu de
+  copier dans un local ; `PanzerDB::getTimeIndex` lie de même. Un piège a été corrigé en
+  route : dans la branche élément (base par candidat), le `slot` vide pré-inséré aurait
+  masqué le fallback `base_name` au prochain appel — la valeur trouvée est désormais mémorisée
+  dans le slot avant renvoi.
+
+**Après.** Même harnais, mêmes arbres : état au calme 80 k **~0,80 ms** (vs 4,93), soit le
+niveau 8 k — le coût « par appel » ne croit plus avec le nombre de tranches. Les premiers
+appels de chaque point temporel (4-14 ms) et l'ouverture du processus (~0,4 s à 80 k,
+décodage d'index + `restoreTimeContext`) restent : ce sont des coûts de premier contact,
+pas de répétition. Digests bit-à-bit identiques ; ctest `129/130` (l'échec unique est
+`example-cpp-test_core_profiles_get`, préexistant et indépendant — données de tir requises).
+
 
 

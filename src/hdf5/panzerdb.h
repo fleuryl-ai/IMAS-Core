@@ -1495,13 +1495,18 @@ public:
     /**
       * @brief Reads a whole dynamic (time-evolving) double signal into memory.
       * @param dataset_name The full path of the signal (outside an AoS instance).
-      * @return The concatenated time series, or an empty vector if not found.
+      * @return A reference to the concatenated time series, or an empty vector if not
+      *         found. The reference is valid until the decoded index state rebuilds
+      *         (whole_signals is cleared with it): callers must consume it within the
+      *         current operation, they must not keep it across operations.
       * @note Memoised for as long as the decoded index state is unchanged, because
       *       reading such a signal touches every chunk of the raw dataset when it was
       *       written slice by slice (see whole_signals). Const for that reason only:
-      *       it fills a cache, it changes nothing on the file.
+      *       it fills a cache, it changes nothing on the file. Returns a reference
+      *       (to_improve.md point 30) because a by-value copy of an N-slices-long
+      *       vector on every caller dominated repeated getSlice cost at 80 000 slices.
       */
-    std::vector<double> getWholeDynamicSignal(const std::string& dataset_name) const;
+    const std::vector<double>& getWholeDynamicSignal(const std::string& dataset_name) const;
 
 
 

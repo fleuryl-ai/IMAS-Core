@@ -3856,7 +3856,7 @@ int64_t PanzerDB::getTimeIndex(const std::string& timebase_path, double requeste
     // like when a slice-wise write left one row per time step — decompresses a whole
     // chunk per step: the cost of one getSlice then grows with the number of slices in
     // the file, which is the defect measured in to_improve.md point 24.
-    std::vector<double> time_values = getWholeDynamicSignal(timebase_path);
+    const std::vector<double>& time_values = getWholeDynamicSignal(timebase_path);
 
     if (time_values.empty()) {
         return -1; // Timebase not found, or found but empty.
@@ -5042,7 +5042,7 @@ void PanzerDB::advanceTimebase(const std::string& timebase_name, uint64_t n_step
 
 
 // Retrieve a whole dynamic signal that is not inside an AoS
-std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) const {
+const std::vector<double>& PanzerDB::getWholeDynamicSignal(const std::string& dataset_name) const {
 
     // 1. Access the in-memory index
     const auto& leaves = getLeaves();
@@ -5076,7 +5076,7 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
     }
 
     if (target_leaves.empty()) {
-        return {};
+        return whole_signals[dataset_name]; // empty miss, memoised like a hit
     }
 
     // 3. Sort by Time Index
@@ -5102,8 +5102,9 @@ std::vector<double> PanzerDB::getWholeDynamicSignal(const std::string& dataset_n
         }
     }
 
-    whole_signals[dataset_name] = full_signal;
-    return full_signal;
+    auto& stored = whole_signals[dataset_name];
+    stored = std::move(full_signal);
+    return stored;
 }
 
 std::string PanzerDB::stripIndices(const std::string& path) {
