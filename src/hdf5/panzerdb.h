@@ -1266,7 +1266,10 @@ public:
 
      /**
       * @brief Gets the effective size of an Array of Structures.
-      * For static AoS, it returns the declared size. For dynamic AoS, it returns the number of time steps written.
+      * For static AoS: max(declared size, element instances materialized in /index).
+      * For dynamic AoS: max(exclusive end of the time range over data leaves, element
+      * instances materialized in /index) — the instance count keeps empty elements,
+      * which carry no data leaf and would otherwise size the AoS to 0.
       * @param level_name The full path to the AoS meta-node (e.g., "profiles_1d" or "profiles_1d/0/ion").
       * @return A vector containing the size of the AoS.
       */

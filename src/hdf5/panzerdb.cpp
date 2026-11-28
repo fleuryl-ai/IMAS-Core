@@ -3782,28 +3782,12 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
     return shapes; // Return empty vector if AoS not found
   }
 
-  // NEW LOGIC FOR DYNAMIC AoS
-  if (aos_root_leaf->flags == 3) { // flags == 3 indicates dynamic AoS
-    // Use the exclusive end of the time range computed over ALL descendant
-    // data leaves (any depth) at cache build time. Looking at direct children
-    // only would miss leaves behind nested static AoS (e.g. time_slice/ggd/
-    // theta/values) where no direct child carries a time index.
-    auto it = max_time_at_dynamic_root.find(std::string_view(level_name));
-    if (it != max_time_at_dynamic_root.end()) {
-      shapes.push_back(static_cast<size_t>(it->second));
-    } else {
-      // No data leaves found under this dynamic AoS. Size is 0.
-      shapes.push_back(0);
-    }
-
-    return shapes;
-  }
-
-  // OLD LOGIC (kept for static AoS)
-  // 2. Scan children to find maximum index of real instances
+  // Highest numeric index among the direct children ("level_name/K/..." or
+  // "level_name/K"), or -1 if no element instance is materialized. This is the
+  // evidence the writer left for EMPTY elements too: they are recorded in
+  // /index (kind-2 meta rows) even when they carry no value, while data leaves
+  // exist only for the filled ones.
   long long max_index = -1;
-  
-  // OPTIMISATION: Utiliser parent_lookup pour ne parcourir que les enfants directs
   auto it_children = parent_lookup.find(std::string_view(level_name));
   if (it_children != parent_lookup.end()) {
     for (size_t idx : it_children->second) {
@@ -3826,19 +3810,33 @@ std::vector<size_t> PanzerDB::getAOSShape(const std::string& level_name) const {
     }
   }
 
-  // If instances found (max_index >= 0), size is max_index + 1.
-  // Otherwise, use size declared in AoS meta-node.
-  if (max_index >= 0) {
-    shapes.push_back(static_cast<size_t>(max_index + 1));
-  } else {
-    // If no indexed child found, rely on declared size
-    // in the AoS meta-node itself.
-    if (!aos_root_leaf->shape_span().empty()) {
-      shapes.push_back(aos_root_leaf->shape[0]);
-    } else {
-      shapes.push_back(0); // Case where even meta-node has no shape (should not happen for an AoS)
-    }
+  const size_t instances = (max_index >= 0) ? (size_t)(max_index + 1) : 0;
+
+  if (aos_root_leaf->flags == 3) { // dynamic AoS
+    // The exclusive end of the time range over all descendant data leaves
+    // (computed at cache build time; direct children alone would miss leaves
+    // behind nested static AoS, e.g. time_slice/ggd/theta/values where no
+    // direct child carries a time index).
+    const size_t time_size = [&]() {
+      auto it = max_time_at_dynamic_root.find(std::string_view(level_name));
+      return (it != max_time_at_dynamic_root.end()) ? (size_t)it->second : (size_t)0;
+    }();
+    // A dynamic AoS whose elements hold no value has no data leaf at all, so
+    // the time-based size is 0 even though the writer recorded one row per
+    // element (pulse 65782: core_profiles/profiles_2d occ 2/3 — 86 080
+    // instances stored, read as 0 before this). Count the recorded instances.
+    shapes.push_back((instances > time_size) ? instances : time_size);
+    return shapes;
   }
+
+  // Static AoS: the meta row carries the declared size (contract: kind 2 —
+  // "no raw data, size in shape[0]"). Children exist only for the filled
+  // elements, so a sparsely filled AoS reads shorter than declared (pulse
+  // 65782: calorimetry/group — 19 declared, only element 0 filled, read as 1
+  // before this). The declared size is the floor; instances found on disk
+  // (e.g. appended elements) can extend it.
+  const size_t declared = aos_root_leaf->shape_span().empty() ? 0 : (size_t)aos_root_leaf->shape[0];
+  shapes.push_back((declared > instances) ? declared : instances);
   return shapes;
 }
 

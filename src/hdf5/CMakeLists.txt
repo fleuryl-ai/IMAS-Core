@@ -99,6 +99,9 @@ al_add_hdf5_test(test_engine_write_read_string_complex)
 al_add_hdf5_test(test_engine_write_read_listofstrings)
 al_add_hdf5_test(test_engine_write_read_root_scalar)
 al_add_hdf5_test(test_engine_empty_aos_getshape)
+# getAOSShape must give the declared size of an AoS even when many of its
+# elements carry no value (calorimetry group 19->1, profiles_2d 86080->0).
+al_add_hdf5_test(test_engine_aos_empty_elements_shape)
 al_add_hdf5_test(test_engine_group_constructor)
 al_add_hdf5_test(test_engine_write_read_dynamic_aos)
 al_add_hdf5_test(test_engine_write_read_dynamic_put_slice)
@@ -293,6 +296,9 @@ al_add_hdf5_test(test_al_timerange_nested_dynamic_aos_resampling_vector)
 # Currently RED on the v2 backend: inner AoS size is 0 at resampled occurrences
 # that have no stored slice at that index (v1 serves the stored size).
 al_add_hdf5_test(test_al_timerange_resampled_nested_static_aos)
+# Declared size of a static AoS whose elements are not all filled
+# (pulse 65782: calorimetry group 19 -> read back 1 before the fix).
+al_add_hdf5_test(test_al_sparse_static_aos_size)
 # list_filled_paths must return IMAS logical paths (stripped of occurrence
 # indices), the same set under v1 and v2 storage; v2 enumerates the /index
 # leaves (the group's first level holds only physical columns there).

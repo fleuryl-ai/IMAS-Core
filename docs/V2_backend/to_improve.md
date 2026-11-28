@@ -2139,3 +2139,80 @@ pas de répétition. Digests bit-à-bit identiques ; ctest `129/130` (l'échec u
 
 
 
+
+## 33. `getAOSShape` dimensionnait un AoS sur les feuilles qui portent des valeurs : les éléments vides s'étaient volatilisés à la lecture — mesuré et corrigé (2026-11-28)
+
+**Le symptôme.** Campagne de fidélité du tir 65782 (IMAS-Cpp `benchmark_get_65782/`,
+`rapport_get_v1v2_2026-11-27.md`) : 4 lignes de `get()` où la lecture 2.0 materialise moins
+de nœuds que la lecture 1.0, toutes sur des AoS dont les éléments ne sont pas tous remplis :
+
+| ligne | AoS (kind) | éléments stockés | lu en 1.0 | lu en 2.0 (avant) |
+|---|---|---|---|---|
+| `calorimetry/group` occ 0 | statique (2) | 19 (déclaré), seul l'él. 0 rempli | 19 | **1** |
+| `core_profiles/profiles_2d` occ 2 | dynamique (3) | 86 080, aucun rempli | 86 080 | **0** |
+| `core_profiles/profiles_2d` occ 3 | dynamique (3) | 1 | 1 | **0** |
+| `equilibrium/grids_ggd` occ 2 | dynamique (3) | 1 | 1 | **0** |
+
+**Dispositif.** Décodage direct de `/index` + `/path_table` (7 colonnes, layout v3) des
+fichiers réels, probe C++ `PanzerDB::getAOSShape` sur les mêmes fichiers, tests de
+référence écrits pour l'occasion.
+
+**Base mesurée** — ce que les fichiers v2 stockent (le writer n'avait rien perdu) :
+- `calorimetry.h5` : 17 lignes au total ; meta `group` kind=2 avec **shape[0]=19** ; sous
+  `group/` seulement `group/0/name` (donnée), `group/0/component` (kind=2, shape 6),
+  `group/0/component/0/name` — aucune ligne pour les éléments 1..18, et **aucune ligne
+  `group/0`** (les feuilles de l'élément 0 pendent directement de la meta).
+- `core_profiles_2.h5` : 1 893 779 lignes ; meta `profiles_2d` kind=3 ; **86 080 enfants**
+  (un par instance, kind=2, `time_index=0`) ; **zéro ligne de données** sous `profiles_2d/`.
+- `core_profiles_3.h5` / `equilibrium_2.h5` : 1 instance stockée, zéro ligne de données.
+
+**La cause.** `PanzerDB::getAOSShape` (panzerdb.cpp) — appelé par
+`GlobalReadStrategy::beginReadArraystructAction` pour **chaque** AoS lu (`*size =
+shapes[0]`) — ne comptait que l'évidence des valeurs :
+- branche statique : `max_index + 1` sur les enfants indexés ; la taille déclarée
+  `shape[0]` n'était consultée que si **aucun** enfant indexé n'existait. Pour `group`, un
+  unique enfant indexé (`group/0/component`) → 1, alors que le contrat du Leaf kind=2 est
+  « no raw data, size in shape[0] » (19).
+- branche dynamique : `max_time_at_dynamic_root`, qui compte **uniquement les lignes de
+  données** (`(leaf.flags & 0xF) != 0 → continue` dans `rebuildDynamicRootTimeIndex`) →
+  aucune ligne de données ⇒ pas de clé ⇒ « No data leaves found under this dynamic AoS.
+  Size is 0. » — les 86 080 lignes d'instances présentes dans `/index` n'étaient jamais
+  comptées.
+
+Les tests existants ne pouvaient pas voir le défaut : dans `test_engine_empty_aos_getshape`
+chaque élément a une feuille et le `max_index` retombe exactement sur la taille déclarée.
+
+**Ce qui n'était pas en cause.** Le writer : les éléments vides sont bien stockés (lignes
+d'instances ou taille déclarée). Le layout du fichier : aucune anomalie. Le lecteur de
+valeurs (`readDataByIndex`) : `group/0/name` se lit correctement, seul le dimensionnement
+était faux.
+
+**Le correctif** (panzerdb.cpp, `getAOSShape` ; sémantique des feuilles inchangée) :
+- branche statique : `max(shape[0] déclaré, max_index + 1)` — le déclaré est le plancher
+  (contrat kind=2), les instances trouvées peuvent l'étendre ;
+- branche dynamique : `max(max_time_at_dynamic_root, max_index + 1 des enfants)` — le
+  comptage d'instances prend le relais quand aucune feuille de données n'existe ;
+  les cas sains (occ 0 : 86 080 via la base temps, occ 0/1 equilibrium) sont inchangés
+  car les deux termes y coïncident.
+
+**Après** (mesuré sur les vrais fichiers 65782, même libal, probe `getAOSShape`) :
+
+| ligne | avant | après |
+|---|---|---|
+| `calorimetry/group` occ 0 | 1 | **19** (v1 : 19) |
+| `core_profiles/profiles_2d` occ 2 | 0 | **86 080** (v1 : 86 080) |
+| `core_profiles/profiles_2d` occ 3 | 0 | **1** (v1 : 1) |
+| `equilibrium/grids_ggd` occ 2 | 0 | **1** (v1 : 1) |
+| contrôle `core_profiles/profiles_2d` occ 0 | 86 080 | **86 080** |
+
+**Tests de référence** (câblés dans `src/hdf5/CMakeLists.txt`) :
+- `tests/hdf5_backend/test_engine_aos_empty_elements_shape.cpp` — moteur PanzerDB :
+  AoS statique 19 éléments dont 1 rempli (attendu 19 + valeur de l'élément 0) et AoS
+  dynamique 5 éléments vides (attendu 5, et 2 pour les enfants vides) ; le cas dynamique
+  échouait (0) avant le correctif.
+- `tests/hdf5_backend/test_al_sparse_static_aos_size.cpp` — write/read AL (chemin HLI) :
+  `calorimetry`-like, `group` 19 éléments dont seul `group[0].name` rempli ; phases v1
+  (référence) et v2, attendu 19 dans les deux.
+
+À faire : relancer la campagne de fidélité 65782 en lecture 2.0 (les 55 digests) pour
+fermer les 4 lignes restantes.
